@@ -223,30 +223,30 @@ class ExplainReport:
     def render(self) -> str:
         """Return a human-readable text report."""
         lines = [
-            f"╔══════════════════════════════════════════════════════",
-            f"║  PDM Memory Explain Report",
-            f"╠══════════════════════════════════════════════════════",
+            "╔══════════════════════════════════════════════════════",
+            "║  PDM Memory Explain Report",
+            "╠══════════════════════════════════════════════════════",
             f"║  ID:              {self.memory_id}",
             f"║  Fact:            {self.compressed_fact[:80]}{'…' if len(self.compressed_fact) > 80 else ''}",
             f"║  Drawer:          {self.drawer}",
             f"║  Source:          {self.source}",
             f"║  Tags:            {', '.join(self.intent_tags)}",
             f"║  Domain:          {self.domain}",
-            f"╠──────────────────────────────────────────────────────",
-            f"║  Pressure Components:",
+            "╠──────────────────────────────────────────────────────",
+            "║  Pressure Components:",
             f"║    p_magnitude:    {self.p_magnitude:.2f}",
             f"║    V coefficient:  {self.v_coefficient:.4f}  ({self.retrieval_count} retrievals)",
             f"║    Decay factor:   {self.decay_factor:.4f}  ({self.days_since_retrieved:.1f}d since retrieved, T½={self.half_life_days}d)",
             f"║    Intent weight:  {self.intent_weight if self.intent_weight is not None else 'n/a (no query)'}",
             f"║    Quality:        {self.quality:.2f}",
-            f"║    ─────────────────────────────",
+            "║    ─────────────────────────────",
             f"║    P_effective:    {self.p_effective:.2f}",
             f"║    Eff. spike:     {self.effective_spike:.2f}",
         ]
         if self.coupling_score is not None:
             lines += [
-                f"╠──────────────────────────────────────────────────────",
-                f"║  Resonance (TAS coupling):",
+                "╠──────────────────────────────────────────────────────",
+                "║  Resonance (TAS coupling):",
                 f"║    coupling_score:     {self.coupling_score:.4f}",
                 f"║    tag_overlap:        {self.tag_overlap:.4f}",
                 f"║    domain_match:       {self.domain_match:.4f}",

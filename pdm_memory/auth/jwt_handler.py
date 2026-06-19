@@ -104,7 +104,8 @@ class JWTAuth:
     def _decode_exp(token: str) -> Optional[float]:
         """Decode the 'exp' claim from a JWT without validating the signature."""
         try:
-            import base64, json
+            import base64
+            import json
             parts = token.split(".")
             if len(parts) != 3:
                 return None

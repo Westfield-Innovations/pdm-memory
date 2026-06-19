@@ -1,9 +1,6 @@
 """Tests for SQLiteDriver — CRUD, decay, drawers, privacy mode."""
 
-import os
-import tempfile
 import pytest
-from datetime import datetime, timezone
 
 from pdm_memory.storage.sqlite_driver import SQLiteDriver
 from pdm_memory.core.signature import SignatureRecord

@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +95,7 @@ class MemorySync:
         """Send local records to cloud."""
         try:
             local_records = self._local.list(user=user, limit=10_000)
-            local_ids = {r.id for r in local_records}
+            {r.id for r in local_records}
 
             for i in range(0, len(local_records), batch_size):
                 batch = local_records[i : i + batch_size]

@@ -16,7 +16,7 @@ import math
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 from pdm_memory.core.math import (
     DOMAIN_HALF_LIVES,

@@ -1,6 +1,5 @@
 """Tests for PDM core math formulas — verifies parity with companion_api/pdm/kernel.py"""
 
-import math
 import pytest
 from pdm_memory.core.math import (
     calculate_effective_spike,
@@ -13,7 +12,6 @@ from pdm_memory.core.math import (
     infer_domain,
     infer_regime,
     DOMAIN_HALF_LIVES,
-    DEFAULT_HALF_LIFE,
     DECAY_DELETE_THRESHOLD,
 )
 

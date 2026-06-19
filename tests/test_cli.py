@@ -1,7 +1,5 @@
 """Tests for CLI commands via argparse."""
 
-import pytest
-import sys
 from unittest.mock import patch
 from io import StringIO
 

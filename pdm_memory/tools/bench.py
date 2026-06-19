@@ -18,7 +18,6 @@ Usage:
 from __future__ import annotations
 
 import json
-import math
 import random
 import time
 from dataclasses import dataclass, field, asdict
@@ -178,7 +177,8 @@ def run_benchmark(
     Returns:
         BenchmarkReport with all metrics.
     """
-    import os, tempfile
+    import os
+    import tempfile
     random.seed(seed)
 
     from pdm_memory import Memory
@@ -272,7 +272,7 @@ def run_benchmark(
 
 
 def main() -> None:
-    import argparse, sys
+    import argparse
 
     parser = argparse.ArgumentParser(
         description="PDM Benchmark Harness — PDM vs baseline keyword RAG"
