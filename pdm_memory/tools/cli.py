@@ -138,12 +138,11 @@ def cmd_sync(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    # Parser for root/global options
     parser = argparse.ArgumentParser(
         prog="pdm-cli",
         description="PDM Memory CLI — inspect and manage local memory stores",
     )
-
-    # Global options
     parser.add_argument(
         "--store", default="./pdm_memory.db",
         help="Path to SQLite .db file (default: ./pdm_memory.db)"
@@ -153,37 +152,48 @@ def main() -> None:
         help="User identifier to scope queries (default: default)"
     )
 
+    # Parent parser for subparsers to inherit store/user without overriding with defaults
+    sub_parent_parser = argparse.ArgumentParser(add_help=False)
+    sub_parent_parser.add_argument(
+        "--store", default=argparse.SUPPRESS,
+        help="Path to SQLite .db file"
+    )
+    sub_parent_parser.add_argument(
+        "--user", default=argparse.SUPPRESS,
+        help="User identifier to scope queries"
+    )
+
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
     subparsers.required = True
 
     # list-memories
-    p_list = subparsers.add_parser("list-memories", help="List stored memories")
+    p_list = subparsers.add_parser("list-memories", parents=[sub_parent_parser], help="List stored memories")
     p_list.add_argument("--min-pressure", type=float, default=0.0, metavar="P")
     p_list.add_argument("--limit", type=int, default=50)
     p_list.add_argument("--drawer", type=str, default=None)
     p_list.set_defaults(func=cmd_list)
 
     # explain
-    p_explain = subparsers.add_parser("explain", help="Explain a specific memory's pressure")
+    p_explain = subparsers.add_parser("explain", parents=[sub_parent_parser], help="Explain a specific memory's pressure")
     p_explain.add_argument("memory_id", help="Memory UUID (or first 8 chars)")
     p_explain.add_argument("--query", type=str, default=None, help="Optional query for resonance breakdown")
     p_explain.set_defaults(func=cmd_explain)
 
     # decay
-    p_decay = subparsers.add_parser("decay", help="Trigger a decay pass")
+    p_decay = subparsers.add_parser("decay", parents=[sub_parent_parser], help="Trigger a decay pass")
     p_decay.add_argument("--dry-run", action="store_true", help="Preview without writing")
     p_decay.set_defaults(func=cmd_decay)
 
     # stats
-    p_stats = subparsers.add_parser("stats", help="Show store statistics")
+    p_stats = subparsers.add_parser("stats", parents=[sub_parent_parser], help="Show store statistics")
     p_stats.set_defaults(func=cmd_stats)
 
     # drawers
-    p_drawers = subparsers.add_parser("drawers", help="List all drawers")
+    p_drawers = subparsers.add_parser("drawers", parents=[sub_parent_parser], help="List all drawers")
     p_drawers.set_defaults(func=cmd_drawers)
 
     # sync
-    p_sync = subparsers.add_parser("sync", help="Sync local store with AZUS cloud")
+    p_sync = subparsers.add_parser("sync", parents=[sub_parent_parser], help="Sync local store with AZUS cloud")
     p_sync.add_argument("--direction", choices=["push", "pull", "bidirectional"], default="push")
     p_sync.add_argument("--token", type=str, default=None, help="JWT access token")
     p_sync.add_argument("--cloud-url", type=str, default="https://api.azus.ai")
