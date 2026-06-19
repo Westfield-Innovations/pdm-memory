@@ -1,0 +1,50 @@
+MIT License with Patent Scope Clause
+
+Copyright (c) 2026 Westfield Innovations LLC
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+─────────────────────────────────────────────
+PATENT SCOPE CLAUSE (Additional Terms)
+─────────────────────────────────────────────
+
+The above MIT license grant covers the software source code in this repository.
+It does not grant any license to patents held or applied for by Westfield
+Innovations LLC, including but not limited to patents covering the following
+methods and systems embodied in the Pressure-Driven Memory (PDM) system:
+
+  1. Pressure-based memory retrieval and ranking (threshold-driven recall).
+  2. Resonance retrieval via threshold-adjustment search (TAS).
+  3. Temporal deformation geometry for deadline-aware memory pressure.
+  4. Validation coefficient computation for memory signal quality.
+  5. Incremental decay without a scheduler (time-delta-based decay on read).
+
+The license granted by this file permits you to:
+  ✓ Use this SDK (pdm-memory) in your applications.
+  ✓ Distribute applications that incorporate this SDK.
+  ✓ Modify this SDK for your own use or contribution back to this repository.
+
+This license does NOT permit you to:
+  ✗ Reimplement the patented PDM algorithms independently (outside this SDK).
+  ✗ Use the patent claims of PDM to build a competing product.
+  ✗ Sub-license the patent rights granted herein to third parties.
+
+Use of the SDK constitutes acceptance of these additional terms.
+For commercial licensing inquiries beyond the scope described above,
+contact: legal@westfieldinnovations.com
