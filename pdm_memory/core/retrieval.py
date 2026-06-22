@@ -12,9 +12,10 @@ Three-phase search:
 
 from __future__ import annotations
 
+import re
 import math
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -28,10 +29,13 @@ from pdm_memory.core.math import (
     calculate_v,
     infer_domain,
     infer_regime,
+    calculate_incremental_decay,
 )
 from pdm_memory.core.signature import MemoryHit, SignatureRecord
 
 logger = logging.getLogger(__name__)
+
+WORD_PATTERN = re.compile(r"\b[a-zA-Z]{3,}\b")
 
 # ---------------------------------------------------------------------------
 # TAS constants (mirrors threshold_search/engine.py)
@@ -316,8 +320,6 @@ class RetrievalEngine:
         Apply Task 1.4 incremental decay on read.
         Mutates a copy of the record (does not touch storage).
         """
-        from pdm_memory.core.math import calculate_incremental_decay
-
         if rec.created_at is None:
             return rec
 
@@ -334,8 +336,7 @@ class RetrievalEngine:
             rec.decay_rate,
         )
         # Return a shallow copy with updated pressure (don't write to DB here)
-        import dataclasses
-        return dataclasses.replace(
+        return replace(
             rec,
             p_magnitude=new_p,
             effective_spike=new_spike,
@@ -352,8 +353,7 @@ class RetrievalEngine:
     @staticmethod
     def _tokenize_query(query: str) -> List[str]:
         """Extract meaningful tokens from a query string for tag matching."""
-        import re
-        words = re.findall(r"\b[a-zA-Z]{3,}\b", query.lower())
+        words = WORD_PATTERN.findall(query.lower())
         stopwords = {
             "the", "and", "for", "how", "what", "that", "this", "with",
             "are", "was", "not", "can", "will", "from", "have", "been",

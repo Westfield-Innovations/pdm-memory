@@ -520,6 +520,7 @@ class Memory:
     def _apply_reinforcement(self, hits: List[MemoryHit]) -> None:
         """Write retrieval reinforcement back to storage for all hits."""
         now = datetime.now(tz=timezone.utc)
+        batch_updates: List[tuple[str, dict]] = []
         for hit in hits:
             try:
                 rec = self._storage.get(hit.id, user=self._user)
@@ -532,12 +533,20 @@ class Memory:
                 new_spike = calculate_effective_spike(
                     new_p, rec.t_persistence, rec.phase_privilege
                 )
-                self._storage.update(
+                batch_updates.append((
                     hit.id,
-                    p_magnitude=new_p,
-                    effective_spike=new_spike,
-                    retrieval_count=(rec.retrieval_count or 0) + 1,
-                    last_retrieved=now,
-                )
+                    {
+                        "p_magnitude": new_p,
+                        "effective_spike": new_spike,
+                        "retrieval_count": (rec.retrieval_count or 0) + 1,
+                        "last_retrieved": now,
+                    }
+                ))
             except Exception as e:
-                logger.warning("[PDM] reinforcement failed for %s: %s", hit.id, e)
+                logger.warning("[PDM] reinforcement check failed for %s: %s", hit.id, e)
+
+        if batch_updates:
+            try:
+                self._storage.update_batch(batch_updates)
+            except Exception as e:
+                logger.warning("[PDM] reinforcement batch update failed: %s", e)

@@ -101,6 +101,7 @@ class SQLiteDriver(BaseStorage):
         self._local = threading.local()
         # Initialise schema on startup
         conn = self._conn()
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(_SCHEMA)
         conn.commit()
         logger.debug("[PDM-SQLite] Opened %s (store_raw=%s)", db_path, store_raw)
@@ -117,6 +118,9 @@ class SQLiteDriver(BaseStorage):
                 check_same_thread=False,
             )
             self._local.conn.row_factory = sqlite3.Row
+            # Optimise connection performance pragmas
+            self._local.conn.execute("PRAGMA synchronous=NORMAL")
+            self._local.conn.execute("PRAGMA temp_store=MEMORY")
         return self._local.conn
 
     def close(self) -> None:
@@ -212,6 +216,29 @@ class SQLiteDriver(BaseStorage):
             values,
         )
         self._conn().commit()
+
+    def update_batch(self, updates: List[tuple[str, dict]]) -> None:
+        if not updates:
+            return
+        conn = self._conn()
+        for memory_id, fields in updates:
+            if not fields:
+                continue
+            fields_copy = dict(fields)
+            if "intent_tags" in fields_copy:
+                fields_copy["intent_tags"] = json.dumps(fields_copy["intent_tags"])
+            if "metadata" in fields_copy:
+                fields_copy["metadata"] = json.dumps(fields_copy["metadata"])
+            if "last_retrieved" in fields_copy and isinstance(fields_copy["last_retrieved"], datetime):
+                fields_copy["last_retrieved"] = fields_copy["last_retrieved"].isoformat()
+
+            set_clause = ", ".join(f"{k} = ?" for k in fields_copy)
+            values = list(fields_copy.values()) + [memory_id]
+            conn.execute(
+                f"UPDATE pdm_signatures SET {set_clause} WHERE id = ?",
+                values,
+            )
+        conn.commit()
 
     def delete(self, memory_id: str, user: str = "default") -> None:
         self._conn().execute(

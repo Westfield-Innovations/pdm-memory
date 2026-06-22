@@ -60,6 +60,14 @@ class BaseStorage(ABC):
         """
         ...
 
+    def update_batch(self, updates: List[tuple[str, dict]]) -> None:
+        """
+        Update multiple signatures in a batch.
+        Default implementation loops and calls update().
+        """
+        for memory_id, fields in updates:
+            self.update(memory_id, **fields)
+
     @abstractmethod
     def delete(self, memory_id: str, user: str = "default") -> None:
         """
