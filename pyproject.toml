@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pdm-memory"
-version = "0.1.1"
+version = "0.1.2"
 description = "Pressure-Driven Memory (PDM) — persistent, resonance-based memory for AI apps."
 readme = "README.md"
 license = { file = "LICENSE" }

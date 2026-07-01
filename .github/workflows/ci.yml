@@ -70,6 +70,7 @@ jobs:
 
     permissions:
       id-token: write  # Required for OIDC trusted publishing
+      contents: read   # Required to checkout the repository
 
     steps:
       - uses: actions/checkout@v4
