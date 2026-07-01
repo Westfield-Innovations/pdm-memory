@@ -1,5 +1,4 @@
 from unittest.mock import MagicMock
-import pytest
 from pdm_memory import Memory
 from pdm_memory.core.signature import MemoryHit
 from pdm_memory.integrations.gemini_adapter import wrap_gemini
