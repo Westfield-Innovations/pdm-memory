@@ -15,13 +15,11 @@ from __future__ import annotations
 import re
 import math
 import logging
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import List, Optional
 
 from pdm_memory.core.math import (
-    DOMAIN_HALF_LIVES,
-    DEFAULT_HALF_LIFE,
     P_MAX,
     calculate_decay_factor,
     calculate_intent_weight,
@@ -29,7 +27,7 @@ from pdm_memory.core.math import (
     calculate_v,
     infer_domain,
     infer_regime,
-    calculate_incremental_decay,
+    resolve_half_life,
 )
 from pdm_memory.core.signature import MemoryHit, SignatureRecord
 
@@ -173,14 +171,18 @@ class RetrievalEngine:
         effective_regime = regime or (infer_regime(query_tags) if query_tags else None)
 
         for rec in records:
-            # Apply incremental decay at recall time (Task 1.4)
-            rec = self._apply_incremental_decay(rec, now)
-
-            # Compute live pressure
+            # Live pressure: ONE law — domain half-life × (1 - decay_factor).
+            # Do NOT mutate p_magnitude here (legacy incremental power-law removed).
             domain_key = rec.domain or infer_domain(rec.intent_tags)
-            half_life = DOMAIN_HALF_LIVES.get(domain_key, DEFAULT_HALF_LIFE)
-            days_since = self._days_since(rec.last_retrieved or rec.created_at, now)
-            decay = calculate_decay_factor(days_since, half_life)
+            half_life = resolve_half_life(domain_key)
+            days_since_touch = self._days_since(rec.last_retrieved or rec.created_at, now)
+            days_since_created = self._days_since(rec.created_at, now)
+            decay = calculate_decay_factor(
+                days_since_touch,
+                half_life,
+                days_since_created=days_since_created,
+                t_persistence=rec.t_persistence,
+            )
             v = calculate_v(rec.validation_prediction_correct, rec.validation_prediction_total)
             i_weight = calculate_intent_weight(rec.intent_tags, query)
             p_eff = calculate_p_effective(
@@ -309,37 +311,6 @@ class RetrievalEngine:
             domain_match=round(domain_match, 4),
             regime_match=round(regime_match, 4),
             pressure_proximity=round(pressure_proximity, 4),
-        )
-
-    @staticmethod
-    def _apply_incremental_decay(
-        rec: SignatureRecord,
-        now: datetime,
-    ) -> SignatureRecord:
-        """
-        Apply Task 1.4 incremental decay on read.
-        Mutates a copy of the record (does not touch storage).
-        """
-        if rec.created_at is None:
-            return rec
-
-        created = rec.created_at
-        if created.tzinfo is None:
-            created = created.replace(tzinfo=timezone.utc)
-
-        days_elapsed = (now - created).total_seconds() / 86400.0
-        new_p, new_spike = calculate_incremental_decay(
-            rec.p_magnitude,
-            days_elapsed,
-            rec.t_persistence,
-            rec.phase_privilege,
-            rec.decay_rate,
-        )
-        # Return a shallow copy with updated pressure (don't write to DB here)
-        return replace(
-            rec,
-            p_magnitude=new_p,
-            effective_spike=new_spike,
         )
 
     @staticmethod

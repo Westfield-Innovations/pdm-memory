@@ -31,6 +31,33 @@ from pdm_memory.storage.base import BaseStorage
 
 logger = logging.getLogger(__name__)
 
+# Columns allowed in UPDATE — never take raw dict keys (SQL injection).
+# ``id`` and ``user`` are intentionally excluded (immutable ownership).
+_UPDATABLE_COLUMNS: frozenset[str] = frozenset(
+    {
+        "compressed_fact",
+        "compressed_fact_hash",
+        "source",
+        "p_magnitude",
+        "t_persistence",
+        "phase_privilege",
+        "effective_spike",
+        "intent_tags",
+        "question_regime",
+        "domain",
+        "drawer_domain",
+        "retrieval_count",
+        "last_retrieved",
+        "created_at",
+        "validation_prediction_total",
+        "validation_prediction_correct",
+        "decay_rate",
+        "t_deadline",
+        "urgency_rate",
+        "metadata",
+    }
+)
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS pdm_signatures (
     id                              TEXT PRIMARY KEY,
@@ -198,47 +225,84 @@ class SQLiteDriver(BaseStorage):
         ).fetchone()
         return self._row_to_record(row) if row else None
 
-    def update(self, memory_id: str, **fields) -> None:
-        if not fields:
+    def update(self, memory_id: str, user: str = "default", **fields) -> None:
+        """Update whitelisted columns for ``memory_id`` owned by ``user``."""
+        prepared = self._prepare_update_fields(fields)
+        if not prepared:
             return
-        # Serialise JSON fields
-        if "intent_tags" in fields:
-            fields["intent_tags"] = json.dumps(fields["intent_tags"])
-        if "metadata" in fields:
-            fields["metadata"] = json.dumps(fields["metadata"])
-        if "last_retrieved" in fields and isinstance(fields["last_retrieved"], datetime):
-            fields["last_retrieved"] = fields["last_retrieved"].isoformat()
 
-        set_clause = ", ".join(f"{k} = ?" for k in fields)
-        values = list(fields.values()) + [memory_id]
-        self._conn().execute(
-            f"UPDATE pdm_signatures SET {set_clause} WHERE id = ?",
+        set_clause = ", ".join(f"{col} = ?" for col in prepared)
+        values = list(prepared.values()) + [memory_id, user]
+        cur = self._conn().execute(
+            f"UPDATE pdm_signatures SET {set_clause} WHERE id = ? AND user = ?",
             values,
         )
         self._conn().commit()
+        if cur.rowcount == 0:
+            logger.warning(
+                "[PDM-SQLite] update(%s) affected 0 rows (missing or wrong user=%s)",
+                memory_id,
+                user,
+            )
 
-    def update_batch(self, updates: List[tuple[str, dict]]) -> None:
+    def update_batch(
+        self,
+        updates: List[tuple[str, dict]],
+        user: str = "default",
+    ) -> None:
+        """Batch-update with the same whitelist + user scope as :meth:`update`."""
         if not updates:
             return
         conn = self._conn()
         for memory_id, fields in updates:
-            if not fields:
+            prepared = self._prepare_update_fields(fields)
+            if not prepared:
                 continue
-            fields_copy = dict(fields)
-            if "intent_tags" in fields_copy:
-                fields_copy["intent_tags"] = json.dumps(fields_copy["intent_tags"])
-            if "metadata" in fields_copy:
-                fields_copy["metadata"] = json.dumps(fields_copy["metadata"])
-            if "last_retrieved" in fields_copy and isinstance(fields_copy["last_retrieved"], datetime):
-                fields_copy["last_retrieved"] = fields_copy["last_retrieved"].isoformat()
-
-            set_clause = ", ".join(f"{k} = ?" for k in fields_copy)
-            values = list(fields_copy.values()) + [memory_id]
-            conn.execute(
-                f"UPDATE pdm_signatures SET {set_clause} WHERE id = ?",
+            set_clause = ", ".join(f"{col} = ?" for col in prepared)
+            values = list(prepared.values()) + [memory_id, user]
+            cur = conn.execute(
+                f"UPDATE pdm_signatures SET {set_clause} WHERE id = ? AND user = ?",
                 values,
             )
+            if cur.rowcount == 0:
+                logger.warning(
+                    "[PDM-SQLite] update_batch(%s) affected 0 rows (user=%s)",
+                    memory_id,
+                    user,
+                )
         conn.commit()
+
+    @staticmethod
+    def _prepare_update_fields(fields: dict) -> dict:
+        """
+        Validate column names against whitelist and serialise JSON/datetime.
+
+        Raises:
+            ValueError: If any key is not an allowed column (blocks SQL injection).
+        """
+        if not fields:
+            return {}
+
+        unknown = set(fields) - _UPDATABLE_COLUMNS
+        if unknown:
+            raise ValueError(
+                f"Refusing to update non-whitelisted column(s): {sorted(unknown)}. "
+                f"Allowed: {sorted(_UPDATABLE_COLUMNS)}"
+            )
+
+        prepared: dict = {}
+        for col, value in fields.items():
+            if col == "intent_tags":
+                prepared[col] = json.dumps(value)
+            elif col == "metadata":
+                prepared[col] = json.dumps(value)
+            elif col in ("last_retrieved", "created_at", "t_deadline") and isinstance(
+                value, datetime
+            ):
+                prepared[col] = value.isoformat()
+            else:
+                prepared[col] = value
+        return prepared
 
     def delete(self, memory_id: str, user: str = "default") -> None:
         self._conn().execute(

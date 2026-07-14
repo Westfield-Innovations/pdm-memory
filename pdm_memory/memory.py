@@ -35,8 +35,12 @@ from typing import Any, Dict, List, Optional
 from pdm_memory.core.math import (
     DECAY_DELETE_THRESHOLD,
     calculate_effective_spike,
-    calculate_incremental_decay,
+    calculate_decay_factor,
+    calculate_intent_weight,
+    calculate_p_effective,
+    calculate_v,
     infer_domain,
+    resolve_half_life,
 )
 from pdm_memory.core.retrieval import RetrievalEngine
 from pdm_memory.core.signature import (
@@ -165,7 +169,9 @@ class Memory:
         pressure thresholds are lowered based on search_cost, then
         coupling scores rank memories by tag/domain/regime resonance.
 
-        Decay is applied incrementally at recall time — no scheduler needed.
+        Decay is applied at recall time via the canonical domain half-life
+        law (P_effective = P × … × (1 - decay_factor)). Stored p_magnitude
+        is not rewritten on read — no second power-law decay.
 
         Args:
             query:       The recall query / current context.
@@ -221,6 +227,7 @@ class Memory:
         new_spike = calculate_effective_spike(new_p, rec.t_persistence, rec.phase_privilege)
         self._storage.update(
             memory_id,
+            user=self._user,
             p_magnitude=new_p,
             effective_spike=new_spike,
             retrieval_count=(rec.retrieval_count or 0) + 1,
@@ -230,14 +237,15 @@ class Memory:
 
     def decay(self, dry_run: bool = False) -> Dict[str, int]:
         """
-        Manually trigger a decay pass over all memories.
+        Purge memories whose live ``P_effective`` is below the delete threshold.
 
-        In normal usage this is NOT necessary — decay runs automatically
-        at each recall() call.  Use this method to explicitly purge stale memories
-        or to run maintenance on a schedule without Celery.
+        Uses the SAME half-life law as ``recall()`` / ``explain()``. Does not
+        rewrite ``p_magnitude`` with a separate power-law (that caused double
+        decay). ``decayed`` stays in the return dict for API compat and is
+        always 0.
 
         Args:
-            dry_run: If True, compute what would be decayed but make no writes.
+            dry_run: If True, compute what would be deleted but make no writes.
 
         Returns:
             Dict with keys: decayed, deleted, skipped.
@@ -247,38 +255,43 @@ class Memory:
         counts = {"decayed": 0, "deleted": 0, "skipped": 0}
 
         for rec in records:
-            created = rec.created_at or now
-            if created.tzinfo is None:
-                created = created.replace(tzinfo=timezone.utc)
-            days_elapsed = (now - created).total_seconds() / 86400.0
-
-            new_p, new_spike = calculate_incremental_decay(
-                rec.p_magnitude,
-                days_elapsed,
-                rec.t_persistence,
-                rec.phase_privilege,
-                rec.decay_rate,
+            days_since_touch = self._days_since(
+                rec.last_retrieved or rec.created_at, now
+            )
+            days_since_created = self._days_since(rec.created_at, now)
+            domain = rec.domain or infer_domain(rec.intent_tags)
+            half_life = resolve_half_life(domain)
+            decay = calculate_decay_factor(
+                days_since_touch,
+                half_life,
+                days_since_created=days_since_created,
+                t_persistence=rec.t_persistence,
+            )
+            v = calculate_v(
+                rec.validation_prediction_correct,
+                rec.validation_prediction_total,
+            )
+            p_eff = calculate_p_effective(
+                rec.p_magnitude, v, decay, intent_weight=1.0, quality=0.80
             )
 
-            if new_p == rec.p_magnitude:
-                counts["skipped"] += 1
-                continue
-
-            if new_p < DECAY_DELETE_THRESHOLD:
+            if p_eff < DECAY_DELETE_THRESHOLD:
                 if not dry_run:
                     self._storage.delete(rec.id, user=self._user)
                 counts["deleted"] += 1
             else:
-                if not dry_run:
-                    self._storage.update(
-                        rec.id,
-                        p_magnitude=new_p,
-                        effective_spike=new_spike,
-                    )
-                counts["decayed"] += 1
+                counts["skipped"] += 1
 
         logger.info("[PDM] decay() %s | %s", "(dry_run)" if dry_run else "", counts)
         return counts
+
+    @staticmethod
+    def _days_since(dt: Optional[datetime], now: datetime) -> float:
+        if dt is None:
+            return 0.0
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (now - dt).total_seconds() / 86400.0)
 
     def explain(self, memory_id: str, query: Optional[str] = None) -> ExplainReport:
         """
@@ -299,26 +312,22 @@ class Memory:
         Raises:
             KeyError: If the memory is not found.
         """
-        from pdm_memory.core.math import (
-            DOMAIN_HALF_LIVES, DEFAULT_HALF_LIFE,
-            calculate_decay_factor, calculate_intent_weight,
-            calculate_p_effective, calculate_v,
-        )
-
         rec = self._storage.get(memory_id, user=self._user)
         if rec is None:
             raise KeyError(f"Memory '{memory_id}' not found for user '{self._user}'.")
 
         now = datetime.now(tz=timezone.utc)
-        last_r = rec.last_retrieved or rec.created_at
-        if last_r and last_r.tzinfo is None:
-            last_r = last_r.replace(tzinfo=timezone.utc)
-        days_since = (now - last_r).total_seconds() / 86400.0 if last_r else 0.0
+        days_since = self._days_since(rec.last_retrieved or rec.created_at, now)
+        days_since_created = self._days_since(rec.created_at, now)
 
-        from pdm_memory.core.math import infer_domain
         domain = rec.domain or infer_domain(rec.intent_tags)
-        half_life = DOMAIN_HALF_LIVES.get(domain, DEFAULT_HALF_LIFE)
-        decay = calculate_decay_factor(days_since, half_life)
+        half_life = resolve_half_life(domain)
+        decay = calculate_decay_factor(
+            days_since,
+            half_life,
+            days_since_created=days_since_created,
+            t_persistence=rec.t_persistence,
+        )
         v = calculate_v(rec.validation_prediction_correct, rec.validation_prediction_total)
         i_weight = calculate_intent_weight(rec.intent_tags, query) if query else None
         p_eff = calculate_p_effective(
@@ -547,6 +556,6 @@ class Memory:
 
         if batch_updates:
             try:
-                self._storage.update_batch(batch_updates)
+                self._storage.update_batch(batch_updates, user=self._user)
             except Exception as e:
                 logger.warning("[PDM] reinforcement batch update failed: %s", e)

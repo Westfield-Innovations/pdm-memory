@@ -48,9 +48,41 @@ class TestSQLiteDriverCRUD:
     def test_update(self, driver):
         sig = make_sig()
         driver.save(sig)
-        driver.update(sig.id, p_magnitude=90.0)
+        driver.update(sig.id, user=sig.user, p_magnitude=90.0)
         updated = driver.get(sig.id, user=sig.user)
         assert updated.p_magnitude == pytest.approx(90.0)
+
+    def test_update_wrong_user_is_noop(self, driver):
+        """IDOR guard: Bob cannot mutate Alice's row by id alone."""
+        sig = make_sig(user="alice", p_magnitude=60.0)
+        driver.save(sig)
+        driver.update(sig.id, user="bob", p_magnitude=1.0)
+        assert driver.get(sig.id, user="alice").p_magnitude == pytest.approx(60.0)
+
+    def test_update_rejects_unknown_column(self, driver):
+        sig = make_sig()
+        driver.save(sig)
+        with pytest.raises(ValueError, match="non-whitelisted"):
+            driver.update(
+                sig.id,
+                user=sig.user,
+                **{"p_magnitude": 1, "x = 0; DROP TABLE pdm_signatures;--": "evil"},
+            )
+        # Original row intact
+        assert driver.get(sig.id, user=sig.user).p_magnitude == pytest.approx(60.0)
+
+    def test_update_batch_scoped_to_user(self, driver):
+        alice = make_sig(user="alice", text="alice mem", p_magnitude=50.0)
+        bob = make_sig(user="bob", text="bob mem", p_magnitude=50.0)
+        driver.save(alice)
+        driver.save(bob)
+        driver.update_batch(
+            [(alice.id, {"p_magnitude": 99.0}), (bob.id, {"p_magnitude": 11.0})],
+            user="alice",
+        )
+        assert driver.get(alice.id, user="alice").p_magnitude == pytest.approx(99.0)
+        # Bob's row must be untouched (wrong owner on batch)
+        assert driver.get(bob.id, user="bob").p_magnitude == pytest.approx(50.0)
 
     def test_delete(self, driver):
         sig = make_sig()
