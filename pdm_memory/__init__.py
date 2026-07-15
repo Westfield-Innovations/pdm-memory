@@ -22,5 +22,5 @@ See README.md for full documentation.
 from pdm_memory.memory import Memory
 from pdm_memory.core.signature import MemoryHit, DrawerInfo
 
-__version__ = "0.1.0"
+__version__ = "0.1.3"
 __all__ = ["Memory", "MemoryHit", "DrawerInfo", "__version__"]
