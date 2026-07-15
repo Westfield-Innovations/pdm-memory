@@ -79,6 +79,16 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Verify release tag matches package version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")"
+          echo "tag=$TAG package=$PKG"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::Release tag '$GITHUB_REF_NAME' does not match pyproject version '$PKG'. Retag the commit that bumps the version."
+            exit 1
+          fi
+
       - name: Build package
         run: |
           pip install build
