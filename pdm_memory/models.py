@@ -10,8 +10,8 @@ Keep these stable: they are part of the public API surface for tooling/CLI.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, List, Optional
 
 
 @dataclass(slots=True)
@@ -43,8 +43,6 @@ class TorsionReport:
             f"{self.drawer}/{self.domain}\n"
             f"  {self.explanation}"
         )
-from dataclasses import dataclass, field
-from typing import Any, List
 
 
 @dataclass(slots=True)

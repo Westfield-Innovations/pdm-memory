@@ -34,8 +34,7 @@ from pdm_memory.core.math import (
     resolve_half_life,
 )
 from pdm_memory.core.signature import MemoryHit, SignatureRecord
-from pdm_memory.models import TorsionReport
-from pdm_memory.models import AlignmentReport
+from pdm_memory.models import AlignmentReport, TorsionReport
 
 logger = logging.getLogger(__name__)
 
@@ -654,12 +653,6 @@ class RetrievalEngine:
         if len(cleaned) <= max_len:
             return cleaned
         return cleaned[: max_len - 1].rstrip() + "…"
-        stopwords = {
-            "the", "and", "for", "how", "what", "that", "this", "with",
-            "are", "was", "not", "can", "will", "from", "have", "been",
-            "should", "would", "could", "which", "when", "where",
-        }
-        return [w for w in words if w not in stopwords]
 
     # ------------------------------------------------------------------
     # Goal-Anchor Alignment (GAA)

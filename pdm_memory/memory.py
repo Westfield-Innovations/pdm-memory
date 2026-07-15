@@ -53,8 +53,7 @@ from pdm_memory.core.signature import (
     MemoryHit,
     SignatureRecord,
 )
-from pdm_memory.models import TorsionReport
-from pdm_memory.models import AlignmentReport
+from pdm_memory.models import AlignmentReport, TorsionReport
 from pdm_memory.storage.base import BaseStorage
 
 logger = logging.getLogger(__name__)
