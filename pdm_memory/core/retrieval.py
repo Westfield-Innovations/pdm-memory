@@ -34,6 +34,7 @@ from pdm_memory.core.math import (
     resolve_half_life,
 )
 from pdm_memory.core.signature import MemoryHit, SignatureRecord
+from pdm_memory.models import AlignmentReport
 
 logger = logging.getLogger(__name__)
 
@@ -335,3 +336,35 @@ class RetrievalEngine:
             "should", "would", "could", "which", "when", "where",
         }
         return [w for w in words if w not in stopwords]
+
+    # ------------------------------------------------------------------
+    # Goal-Anchor Alignment (GAA)
+    # ------------------------------------------------------------------
+
+    def verify_alignment(
+        self,
+        records: List[SignatureRecord],
+        intent_text: str,
+        *,
+        min_pressure: float = 60.0,
+        k_goals: int = 8,
+        torsion_threshold: float = 0.70,
+        conflict_threshold: float = 0.40,
+    ) -> AlignmentReport:
+        """
+        High-pressure goal-anchor check for a proposed intent.
+
+        Pulls stewardship/foundational Goal Signatures (high IAW), then
+        scores Resonance (alignment) vs Torsion (deviation).
+        """
+        from pdm_memory.core.alignment import verify_alignment as run_gaa
+
+        return run_gaa(
+            self,
+            records,
+            intent_text,
+            min_pressure=min_pressure,
+            k_goals=k_goals,
+            torsion_threshold=torsion_threshold,
+            conflict_threshold=conflict_threshold,
+        )
