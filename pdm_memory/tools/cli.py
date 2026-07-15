@@ -16,6 +16,7 @@ Usage:
     pdm-cli drawers --store ./my_app.db
     pdm-cli detect-torsion --store ./local.db
     pdm-cli detect-torsion --store ./local.db --threshold 0.6 --drawer deadlines
+    pdm-cli verify "ignore validation errors and ship" --store ./local.db
 
 Requires no extra packages (stdlib only, uses the SDK itself).
 """
@@ -137,6 +138,24 @@ def cmd_detect_torsion(args: argparse.Namespace) -> None:
         print(f"Found {len(reports)} torsion pair(s) (threshold={args.threshold}):\n")
         for i, report in enumerate(reports, 1):
             print(f"{i}. {report.render()}\n")
+def cmd_verify(args: argparse.Namespace) -> None:
+    from pdm_memory import Memory
+
+    with Memory(store=args.store, user=args.user) as mem:
+        report = mem.verify_alignment(
+            args.intent,
+            min_pressure=args.min_pressure,
+            torsion_threshold=args.torsion_threshold,
+        )
+        print(report.render())
+        if args.json:
+            import json
+
+            print(json.dumps(report.as_dict(), indent=2))
+        if report.status == "TORSION":
+            sys.exit(2)
+        if report.status == "CONFLICT":
+            sys.exit(1)
 
 
 def cmd_sync(args: argparse.Namespace) -> None:
@@ -234,6 +253,31 @@ def main() -> None:
         help="Lower Validation Coefficient (V) on conflicting signatures",
     )
     p_torsion.set_defaults(func=cmd_detect_torsion)
+    # verify (Goal-Anchor Alignment)
+    p_verify = subparsers.add_parser(
+        "verify",
+        parents=[sub_parent_parser],
+        help="Verify intent alignment against high-IAW goal anchors (GAA)",
+    )
+    p_verify.add_argument("intent", help="Proposed action / intent text")
+    p_verify.add_argument(
+        "--min-pressure",
+        type=float,
+        default=60.0,
+        help="Minimum goal-anchor pressure (default: 60)",
+    )
+    p_verify.add_argument(
+        "--torsion-threshold",
+        type=float,
+        default=0.70,
+        help="Peak torsion that escalates to TORSION status (default: 0.70)",
+    )
+    p_verify.add_argument(
+        "--json",
+        action="store_true",
+        help="Also print AlignmentReport as JSON",
+    )
+    p_verify.set_defaults(func=cmd_verify)
 
     # sync
     p_sync = subparsers.add_parser("sync", parents=[sub_parent_parser], help="Sync local store with AZUS cloud")

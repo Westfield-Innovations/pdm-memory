@@ -54,6 +54,7 @@ from pdm_memory.core.signature import (
     SignatureRecord,
 )
 from pdm_memory.models import TorsionReport
+from pdm_memory.models import AlignmentReport
 from pdm_memory.storage.base import BaseStorage
 
 logger = logging.getLogger(__name__)
@@ -239,6 +240,47 @@ class Memory:
             last_retrieved=datetime.now(tz=timezone.utc),
         )
         logger.debug("[PDM] reinforce(%s) Δp=+%.2f → P=%.1f", memory_id, delta, new_p)
+
+    def verify_alignment(
+        self,
+        intent_text: str,
+        *,
+        min_pressure: float = 60.0,
+        k_goals: int = 8,
+        torsion_threshold: float = 0.70,
+    ) -> AlignmentReport:
+        """
+        Goal-Anchor Alignment — final integrity gate before an agent ACT.
+
+        Retrieves high-pressure Goal Signatures from stewardship / foundational
+        drawers (ranked by IAW), then scores Resonance vs Torsion against
+        ``intent_text``.
+
+        Args:
+            intent_text: Proposed action / intent to validate.
+            min_pressure: Only consider goal anchors at/above this P.
+            k_goals: Max anchors to evaluate.
+            torsion_threshold: Peak torsion that escalates status to TORSION.
+
+        Returns:
+            AlignmentReport — use ``is_safe_to_act`` or ``status == "ALIGNED"``
+            before triggering ACT.
+        """
+        records = self._storage.list(user=self._user, limit=10_000)
+        report = self._engine.verify_alignment(
+            records,
+            intent_text,
+            min_pressure=min_pressure,
+            k_goals=k_goals,
+            torsion_threshold=torsion_threshold,
+        )
+        logger.debug(
+            "[PDM] verify_alignment status=%s score=%.3f torsion=%.3f",
+            report.status,
+            report.score,
+            report.torsion,
+        )
+        return report
 
     def decay(self, dry_run: bool = False) -> Dict[str, int]:
         """
