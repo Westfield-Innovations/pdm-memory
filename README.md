@@ -3,7 +3,7 @@
 [![PyPI](https://img.shields.io/pypi/v/pdm-memory)](https://pypi.org/project/pdm-memory/)
 [![Python](https://img.shields.io/pypi/pyversions/pdm-memory)](https://pypi.org/project/pdm-memory/)
 [![CI](https://github.com/westfield-innovations/pdm-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/westfield-innovations/pdm-memory/actions)
-[![License: MIT](https://img.shields.io/badge/License-MIT%2BPatent-blue)](LICENSE)
+[![License: Proprietary](https://img.shields.io/badge/License-Proprietary%20ELv2-blue)](LICENSE)
 
 Your LLM forgets everything between conversations. The standard fix — stuff a vector database into the context window — is expensive, slow, and retrieves **what matches words, not what matters**.
 
@@ -377,6 +377,16 @@ mem._engine = RetrievalEngine()
 
 ## 📄 License
 
-[MIT + Patent Scope Clause](LICENSE) — use the SDK freely; the PDM algorithm patents stay with Westfield Innovations LLC.
+Free to use **as-shipped** under a custom [Elastic License 2.0 (ELv2)](LICENSE)
+base from **Westfield Innovations LLC**.
 
-Built by **Westfield Innovations LLC** · [westfieldinnovations.com](https://westfieldinnovations.com)
+- Use the SDK as distributed: yes.
+- Modify / fork / redistribute altered **core** logic: **no**, without a
+  commercial license from Westfield Innovations LLC.
+- Extensions via defined plugin interfaces (e.g. `BaseStorage`): **permitted**.
+
+**Patent Pending** — U.S. App. No. **19/739,419** · **63/953,563** · **63/953,842**.
+
+If this software makes you money, send Carl a birthday card. He collects them.
+
+Built by **Westfield Innovations LLC** · [azus.ai](https://azus.ai) · [getdeepsignals.com](https://getdeepsignals.com)

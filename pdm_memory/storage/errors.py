@@ -1,3 +1,10 @@
+<<<<<<< Updated upstream
+=======
+# © 2026 Westfield Innovations LLC. Patent Pending.
+# U.S. App. No. 19/739,419 | 63/953,563 | 63/953,842
+# MODIFICATION PROHIBITED. USE AS SHIPPED.
+
+>>>>>>> Stashed changes
 """Cloud storage errors — fail fast, never pretend emptiness."""
 
 from __future__ import annotations

@@ -14,7 +14,7 @@ keywords = ["ai", "memory", "llm", "rag", "pressure-driven", "persistent-memory"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "License :: Other/Proprietary License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -50,8 +50,11 @@ dev = [
 pdm-cli = "pdm_memory.tools.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/westfield-innovations/pdm-memory"
+Homepage = "https://azus.ai"
+Documentation = "https://azus.ai"
 "Bug Tracker" = "https://github.com/westfield-innovations/pdm-memory/issues"
+Source = "https://github.com/westfield-innovations/pdm-memory"
+Repository = "https://github.com/westfield-innovations/pdm-memory"
 
 [tool.setuptools.packages.find]
 where = ["."]

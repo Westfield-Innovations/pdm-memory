@@ -1,3 +1,9 @@
+# © 2026 Westfield Innovations LLC. Patent Pending.
+# U.S. App. No. 19/739,419 | 63/953,563 | 63/953,842
+# AUTHORIZED EXTENSION POINT (Westfield OS) — implementing this interface
+# (e.g. BaseStorage) is PERMITTED. Core software modification remains
+# prohibited without a commercial license from Westfield Innovations LLC.
+
 """
 BaseStorage — Abstract interface for all PDM storage backends.
 
