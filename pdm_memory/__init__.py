@@ -23,12 +23,5 @@ from pdm_memory.memory import Memory
 from pdm_memory.core.signature import MemoryHit, DrawerInfo
 from pdm_memory.models import AlignmentReport, TorsionReport
 
-__version__ = "0.1.3"
-__all__ = [
-    "Memory",
-    "MemoryHit",
-    "DrawerInfo",
-    "AlignmentReport",
-    "TorsionReport",
-    "__version__",
-]
+__version__ = "0.1.5"
+__all__ = ["Memory", "MemoryHit", "DrawerInfo", "AlignmentReport", "__version__"]
