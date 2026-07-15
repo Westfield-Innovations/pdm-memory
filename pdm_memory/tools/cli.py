@@ -14,6 +14,8 @@ Usage:
     pdm-cli decay --store ./my_app.db --dry-run
     pdm-cli stats --store ./my_app.db
     pdm-cli drawers --store ./my_app.db
+    pdm-cli detect-torsion --store ./local.db
+    pdm-cli detect-torsion --store ./local.db --threshold 0.6 --drawer deadlines
     pdm-cli verify "ignore validation errors and ship" --store ./local.db
 
 Requires no extra packages (stdlib only, uses the SDK itself).
@@ -121,6 +123,21 @@ def cmd_drawers(args: argparse.Namespace) -> None:
             print(f"{d.domain:<35} {d.signature_count:>10} {d.avg_pressure:>15.1f}")
 
 
+def cmd_detect_torsion(args: argparse.Namespace) -> None:
+    from pdm_memory import Memory
+
+    with Memory(store=args.store, user=args.user) as mem:
+        reports = mem.detect_torsion(
+            drawer=args.drawer or None,
+            threshold=args.threshold,
+            apply_v_penalty=args.apply_v_penalty,
+        )
+        if not reports:
+            print("No torsion detected.")
+            return
+        print(f"Found {len(reports)} torsion pair(s) (threshold={args.threshold}):\n")
+        for i, report in enumerate(reports, 1):
+            print(f"{i}. {report.render()}\n")
 def cmd_verify(args: argparse.Namespace) -> None:
     from pdm_memory import Memory
 
@@ -217,6 +234,25 @@ def main() -> None:
     p_drawers = subparsers.add_parser("drawers", parents=[sub_parent_parser], help="List all drawers")
     p_drawers.set_defaults(func=cmd_drawers)
 
+    # detect-torsion
+    p_torsion = subparsers.add_parser(
+        "detect-torsion",
+        parents=[sub_parent_parser],
+        help="Detect Reverse Resonance (contradictory signature pairs)",
+    )
+    p_torsion.add_argument("--drawer", type=str, default=None, help="Limit to one drawer")
+    p_torsion.add_argument(
+        "--threshold",
+        type=float,
+        default=0.7,
+        help="Minimum torsion_score to report (default: 0.7)",
+    )
+    p_torsion.add_argument(
+        "--apply-v-penalty",
+        action="store_true",
+        help="Lower Validation Coefficient (V) on conflicting signatures",
+    )
+    p_torsion.set_defaults(func=cmd_detect_torsion)
     # verify (Goal-Anchor Alignment)
     p_verify = subparsers.add_parser(
         "verify",
