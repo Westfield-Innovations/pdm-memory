@@ -82,6 +82,19 @@ class TestMemoryDecay:
         after = mem._storage.get(mid, user="test_user")
         assert before.p_magnitude == after.p_magnitude
 
+    def test_recall_does_not_rewrite_stored_pressure(self, mem):
+        """Single decay law: live scoring must not mutate p_magnitude on read."""
+        mid = mem.save(
+            "User prefers metric units",
+            tags=["units", "preferences", "formatting"],
+            p_magnitude=80,
+            t_persistence=30,
+        )
+        before = mem._storage.get(mid, user="test_user").p_magnitude
+        mem.recall("format units", k=5, reinforce=False)
+        after = mem._storage.get(mid, user="test_user").p_magnitude
+        assert after == before
+
 
 class TestMemoryExplain:
     def test_explain_returns_report(self, mem):

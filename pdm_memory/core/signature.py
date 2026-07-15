@@ -52,8 +52,8 @@ class SignatureRecord:
     validation_prediction_total: int = 0
     validation_prediction_correct: int = 0
 
-    # Decay config
-    decay_rate: float = 0.9            # Multiplier per day past persistence
+    # Decay config (schema compat — NOT used by pressure decay; half-life is canonical)
+    decay_rate: float = 0.9            # Legacy field; ignored by P_effective / decay()
 
     # Optional: temporal deadline
     t_deadline: Optional[datetime] = None

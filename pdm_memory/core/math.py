@@ -4,17 +4,22 @@ PDM Core Math — Pure Python, zero external dependencies.
 All formulas are ported faithfully from companion_api/pdm/kernel.py
 and companion_api/pdm/models.py.  No Django, no ORM, no Celery.
 
-Formula reference:
+Formula reference (ONE canonical decay law):
   effective_spike = min(100, P_magnitude × (t_persistence/30) × phase_privilege)
   decay_factor    = 1 - exp(-λ × t)     where λ = ln2 / half_life
   V               = (correct + 1) / (total + 2)   [Laplace smoothing]
   P_effective     = P × V × (1 - decay_factor) × intent_weight × quality × comparator
-  incremental_decay: new_p = p * (decay_rate ** days_elapsed)   (no-scheduler version)
+
+  Grace: if days_since_created ≤ t_persistence → decay_factor = 0.
+  Surviving fraction = (1 - decay_factor) = exp(-λ × t).
+
+  Legacy power-law (p × decay_rate^days) is REMOVED — it double-penalized recall.
 """
 
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Dict, List, Optional
 
 
@@ -38,10 +43,10 @@ DEFAULT_HALF_LIFE: float = 30.0
 P_MAX: float = 100.0
 P_FLOOR: float = 0.0
 
-# Decay trigger — signatures below this are eligible for deletion
+# Decay trigger — signatures below this live P_eff are eligible for deletion
 DECAY_DELETE_THRESHOLD: float = 30.0
 
-# Default decay multiplier (10% pressure loss per cycle)
+# Kept for SignatureRecord/schema backward-compat only — NOT used by pressure decay.
 DEFAULT_DECAY_RATE: float = 0.9
 
 
@@ -71,28 +76,38 @@ def calculate_effective_spike(
     return min(P_MAX, max(P_FLOOR, raw))
 
 
+def resolve_half_life(domain: Optional[str]) -> float:
+    """Map knowledge domain → half-life days (canonical decay clock)."""
+    if not domain:
+        return DEFAULT_HALF_LIFE
+    return DOMAIN_HALF_LIVES.get(domain, DEFAULT_HALF_LIFE)
+
+
 def calculate_decay_factor(
     days_since_retrieved: float,
     half_life: float = DEFAULT_HALF_LIFE,
+    *,
+    days_since_created: Optional[float] = None,
+    t_persistence: float = 0.0,
 ) -> float:
     """
-    Exponential decay factor based on time since last retrieval.
+    Canonical exponential decay factor based on time since last retrieval.
 
     decay_factor = 1 - exp(-λ × t)   where λ = ln2 / half_life
 
+    Grace window: if ``days_since_created`` is provided and
+    ``days_since_created <= t_persistence``, returns 0.0 (no decay yet).
+
     A decay_factor close to 0 means the memory is fresh (little decay).
     A decay_factor close to 1 means the memory is very stale.
-
-    Args:
-        days_since_retrieved: Days since this memory was last accessed.
-        half_life:            Domain-specific half-life in days.
-
-    Returns:
-        decay_factor in [0, 1].
     """
+    if days_since_created is not None and days_since_created <= max(0.0, t_persistence):
+        return 0.0
+
+    days = max(0.0, float(days_since_retrieved))
     half_life = max(0.1, half_life)
     lam = math.log(2) / half_life
-    return 1.0 - math.exp(-lam * days_since_retrieved)
+    return 1.0 - math.exp(-lam * days)
 
 
 def calculate_v(correct: int, total: int) -> float:
@@ -169,8 +184,45 @@ def calculate_p_effective(
 
 
 # ---------------------------------------------------------------------------
-# Task 1.4: Incremental decay (no Celery — computed on every recall())
+# Maintenance projection of stored pressure (same half-life law as P_effective)
 # ---------------------------------------------------------------------------
+
+
+def calculate_half_life_pressure(
+    p_magnitude: float,
+    days_since_retrieved: float,
+    half_life: float,
+    t_persistence: float,
+    phase_privilege: float = 1.0,
+    *,
+    days_since_created: Optional[float] = None,
+) -> tuple[float, float]:
+    """
+    Project stored pressure after canonical half-life decay.
+
+    Uses the SAME law as live scoring:
+        new_p = p_magnitude × (1 - decay_factor) = p_magnitude × exp(-λ × t)
+
+    Prefer deleting by live ``P_effective`` over rewriting ``p_magnitude``.
+    This helper exists for maintenance tooling / tests that need a projected P.
+
+    Returns:
+        Tuple (projected_p_magnitude, new_effective_spike).
+    """
+    created_days = (
+        days_since_created
+        if days_since_created is not None
+        else days_since_retrieved
+    )
+    decay = calculate_decay_factor(
+        days_since_retrieved,
+        half_life,
+        days_since_created=created_days,
+        t_persistence=t_persistence,
+    )
+    new_p = max(P_FLOOR, min(P_MAX, p_magnitude * (1.0 - decay)))
+    new_spike = calculate_effective_spike(new_p, t_persistence, phase_privilege)
+    return round(new_p, 6), round(new_spike, 6)
 
 
 def calculate_incremental_decay(
@@ -179,38 +231,28 @@ def calculate_incremental_decay(
     t_persistence: float,
     phase_privilege: float = 1.0,
     decay_per_day: float = DEFAULT_DECAY_RATE,
+    half_life: float = DEFAULT_HALF_LIFE,
 ) -> tuple[float, float]:
     """
-    Compute decayed p_magnitude and effective_spike without a scheduler.
+    DEPRECATED alias for :func:`calculate_half_life_pressure`.
 
-    Decay only fires after t_persistence days.  If days_elapsed ≤ t_persistence,
-    the memory is within its guaranteed persistence window — no decay applied.
-
-    Formula:
-        If days_elapsed > t_persistence:
-            decayed_p = p_magnitude × decay_per_day^(days_elapsed - t_persistence)
-        else:
-            decayed_p = p_magnitude  (still in persistence window)
-
-    Args:
-        p_magnitude:    Current stored pressure.
-        days_elapsed:   Days since the memory was created (or last decayed).
-        t_persistence:  Guaranteed persistence window in days.
-        phase_privilege: Phase multiplier for effective_spike.
-        decay_per_day:  Multiplier per day past persistence (default 0.9 = 10% loss/day).
-
-    Returns:
-        Tuple (decayed_p_magnitude, new_effective_spike).
+    The old power-law ``p × decay_per_day^days`` double-counted with live
+    half-life scoring and is no longer applied. ``decay_per_day`` is ignored.
     """
-    if days_elapsed <= t_persistence:
-        new_p = p_magnitude
-    else:
-        days_past = days_elapsed - t_persistence
-        new_p = p_magnitude * (decay_per_day ** days_past)
-
-    new_p = max(0.0, min(P_MAX, new_p))
-    new_spike = calculate_effective_spike(new_p, t_persistence, phase_privilege)
-    return round(new_p, 6), round(new_spike, 6)
+    warnings.warn(
+        "calculate_incremental_decay is deprecated; use calculate_half_life_pressure "
+        "(canonical domain half-life). decay_per_day is ignored.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return calculate_half_life_pressure(
+        p_magnitude=p_magnitude,
+        days_since_retrieved=max(0.0, days_elapsed - max(0.0, t_persistence)),
+        half_life=half_life,
+        t_persistence=t_persistence,
+        phase_privilege=phase_privilege,
+        days_since_created=days_elapsed,
+    )
 
 
 # ---------------------------------------------------------------------------

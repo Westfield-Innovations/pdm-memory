@@ -50,23 +50,31 @@ class BaseStorage(ABC):
         ...
 
     @abstractmethod
-    def update(self, memory_id: str, **fields) -> None:
+    def update(self, memory_id: str, user: str = "default", **fields) -> None:
         """
         Update specific fields of an existing signature.
 
         Args:
             memory_id: The UUID string of the signature.
-            **fields:  Field names and new values to update.
+            user:      Owner filter (required to prevent cross-user IDOR).
+            **fields:  Whitelisted field names and new values to update.
         """
         ...
 
-    def update_batch(self, updates: List[tuple[str, dict]]) -> None:
+    def update_batch(
+        self,
+        updates: List[tuple[str, dict]],
+        user: str = "default",
+    ) -> None:
         """
         Update multiple signatures in a batch.
-        Default implementation loops and calls update().
+
+        Args:
+            updates: List of ``(memory_id, fields_dict)`` pairs.
+            user:    Owner filter applied to every row.
         """
         for memory_id, fields in updates:
-            self.update(memory_id, **fields)
+            self.update(memory_id, user=user, **fields)
 
     @abstractmethod
     def delete(self, memory_id: str, user: str = "default") -> None:

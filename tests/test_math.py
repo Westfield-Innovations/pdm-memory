@@ -7,6 +7,7 @@ from pdm_memory.core.math import (
     calculate_v,
     calculate_intent_weight,
     calculate_p_effective,
+    calculate_half_life_pressure,
     calculate_incremental_decay,
     calculate_temporal_geometry,
     infer_domain,
@@ -58,6 +59,18 @@ class TestDecayFactor:
         market_decay = calculate_decay_factor(7, DOMAIN_HALF_LIVES["market_signal"])
         fact_decay = calculate_decay_factor(7, DOMAIN_HALF_LIVES["core_fact"])
         assert market_decay > fact_decay
+
+    def test_persistence_grace(self):
+        # Within t_persistence → no decay regardless of touch age
+        assert calculate_decay_factor(
+            10, 30, days_since_created=10, t_persistence=30
+        ) == pytest.approx(0.0)
+
+    def test_past_grace_applies_half_life(self):
+        d = calculate_decay_factor(
+            30, 30, days_since_created=60, t_persistence=30
+        )
+        assert d == pytest.approx(0.5, abs=0.01)
 
 
 class TestValidationCoefficient:
@@ -124,26 +137,45 @@ class TestPEffective:
         assert p == 0.0
 
 
-class TestIncrementalDecay:
+class TestHalfLifePressure:
+    """Canonical decay: p_new = p × exp(-λt) after t_persistence grace."""
+
     def test_within_persistence(self):
-        # Only 10 days old, persistence=30 → no decay
-        new_p, _ = calculate_incremental_decay(80, 10, t_persistence=30)
+        new_p, _ = calculate_half_life_pressure(
+            80, days_since_retrieved=10, half_life=30, t_persistence=30,
+            days_since_created=10,
+        )
         assert new_p == pytest.approx(80.0)
 
-    def test_past_persistence(self):
-        # 35 days old, persistence=30 → 5 days past, decay_per_day=0.9
-        new_p, _ = calculate_incremental_decay(80, 35, t_persistence=30, decay_per_day=0.9)
-        expected = 80 * (0.9 ** 5)
-        assert new_p == pytest.approx(expected, rel=0.01)
+    def test_past_persistence_half_life(self):
+        # After grace, 30 days since touch @ half_life=30 → surviving = 0.5
+        new_p, _ = calculate_half_life_pressure(
+            80, days_since_retrieved=30, half_life=30, t_persistence=30,
+            days_since_created=60,
+        )
+        assert new_p == pytest.approx(40.0, abs=0.5)
 
     def test_delete_threshold(self):
-        # Very old memory → should drop below 30
-        new_p, _ = calculate_incremental_decay(35, 200, t_persistence=30, decay_per_day=0.9)
+        new_p, _ = calculate_half_life_pressure(
+            35, days_since_retrieved=200, half_life=30, t_persistence=30,
+            days_since_created=230,
+        )
         assert new_p < DECAY_DELETE_THRESHOLD
 
     def test_spike_recomputed(self):
-        _, new_spike = calculate_incremental_decay(80, 60, t_persistence=30)
+        _, new_spike = calculate_half_life_pressure(
+            80, days_since_retrieved=60, half_life=30, t_persistence=30,
+            days_since_created=90,
+        )
         assert new_spike >= 0.0
+
+    def test_legacy_incremental_alias_uses_half_life(self):
+        with pytest.warns(DeprecationWarning):
+            new_p, _ = calculate_incremental_decay(
+                80, days_elapsed=60, t_persistence=30, half_life=30
+            )
+        # grace 30 → decay days 30 → factor 0.5 → p=40
+        assert new_p == pytest.approx(40.0, abs=0.5)
 
 
 class TestTemporalGeometry:
