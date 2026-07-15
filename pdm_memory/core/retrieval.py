@@ -21,7 +21,7 @@ import math
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from pdm_memory.core.math import (
     P_MAX,
@@ -34,10 +34,42 @@ from pdm_memory.core.math import (
     resolve_half_life,
 )
 from pdm_memory.core.signature import MemoryHit, SignatureRecord
+from pdm_memory.models import TorsionReport
 
 logger = logging.getLogger(__name__)
 
 WORD_PATTERN = re.compile(r"\b[a-zA-Z]{3,}\b")
+# Standalone numerics only — reject Q3 / v2 / H1 bleed into factual torsion
+NUMBER_PATTERN = re.compile(r"(?<![A-Za-z])-?\d+(?:\.\d+)?(?![A-Za-z])")
+
+# Reverse Resonance — topic/contradiction gates (surgical, not N² fishing)
+_TOPIC_GATE: float = 0.35
+_SMALL_CLUSTER: int = 48
+_NEGATION_TOKENS: frozenset[str] = frozenset(
+    {
+        "not", "never", "no", "false", "isn't", "aren't", "wasn't", "weren't",
+        "cannot", "can't", "won't", "without", "none", "neither",
+    }
+)
+_ANTONYM_PAIRS: Tuple[Tuple[str, str], ...] = (
+    ("prefer", "avoid"),
+    ("likes", "hates"),
+    ("love", "hate"),
+    ("always", "never"),
+    ("enable", "disable"),
+    ("true", "false"),
+    ("yes", "no"),
+    ("increase", "decrease"),
+    ("allowed", "forbidden"),
+    ("required", "optional"),
+)
+_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "the", "and", "for", "how", "what", "that", "this", "with",
+        "are", "was", "not", "can", "will", "from", "have", "been",
+        "should", "would", "could", "which", "when", "where",
+    }
+)
 
 # ---------------------------------------------------------------------------
 # TAS constants (mirrors threshold_search/engine.py)
@@ -329,9 +361,295 @@ class RetrievalEngine:
     def _tokenize_query(query: str) -> List[str]:
         """Extract meaningful tokens from a query string for tag matching."""
         words = WORD_PATTERN.findall(query.lower())
-        stopwords = {
-            "the", "and", "for", "how", "what", "that", "this", "with",
-            "are", "was", "not", "can", "will", "from", "have", "been",
-            "should", "would", "could", "which", "when", "where",
-        }
-        return [w for w in words if w not in stopwords]
+        return [w for w in words if w not in _STOPWORDS]
+
+    # ------------------------------------------------------------------
+    # Torsion / Reverse Resonance
+    # ------------------------------------------------------------------
+
+    def detect_torsion(
+        self,
+        records: Sequence[SignatureRecord],
+        threshold: float = 0.7,
+    ) -> List[TorsionReport]:
+        """
+        Find Reverse Resonance pairs: high topic similarity + opposing facts/pressure.
+
+        Search space is limited to drawer/domain (or metadata ``cluster_id``) buckets.
+        Within a bucket, candidates come from a tag inverted index (shared intent tags).
+        Small buckets may also compare all pairs. Never runs blind global N².
+        """
+        if threshold < 0.0 or threshold > 1.0:
+            raise ValueError("threshold must be in [0.0, 1.0]")
+        if len(records) < 2:
+            return []
+
+        by_id: Dict[str, SignatureRecord] = {r.id: r for r in records if r.id}
+        clusters: Dict[str, List[SignatureRecord]] = {}
+        for rec in by_id.values():
+            key = self._torsion_cluster_key(rec)
+            clusters.setdefault(key, []).append(rec)
+
+        reports: List[TorsionReport] = []
+        seen_pairs: Set[Tuple[str, str]] = set()
+
+        for cluster_key, group in clusters.items():
+            if len(group) < 2:
+                continue
+            for a, b in self._torsion_candidate_pairs(group):
+                pair_key = (a.id, b.id) if a.id < b.id else (b.id, a.id)
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+
+                report = self._score_torsion_pair(a, b, cluster_key=cluster_key)
+                if report is not None and report.torsion_score >= threshold:
+                    reports.append(report)
+
+        reports.sort(key=lambda r: r.torsion_score, reverse=True)
+        return reports
+
+    def _torsion_candidate_pairs(
+        self,
+        group: Sequence[SignatureRecord],
+    ) -> Iterable[Tuple[SignatureRecord, SignatureRecord]]:
+        """Yield unordered unique pairs without full N² when the cluster is large."""
+        by_id = {r.id: r for r in group}
+        yielded: Set[Tuple[str, str]] = set()
+
+        def emit(id_a: str, id_b: str) -> Iterable[Tuple[SignatureRecord, SignatureRecord]]:
+            if id_a == id_b:
+                return
+            key = (id_a, id_b) if id_a < id_b else (id_b, id_a)
+            if key in yielded:
+                return
+            yielded.add(key)
+            yield (by_id[key[0]], by_id[key[1]])
+
+        tag_index: Dict[str, List[str]] = {}
+        for rec in group:
+            for tag in {t.lower() for t in (rec.intent_tags or []) if t}:
+                tag_index.setdefault(tag, []).append(rec.id)
+
+        for ids in tag_index.values():
+            if len(ids) < 2:
+                continue
+            for i in range(len(ids)):
+                for j in range(i + 1, len(ids)):
+                    yield from emit(ids[i], ids[j])
+
+        # Small clusters: also compare pairs with token overlap (no shared tags yet)
+        if len(group) <= _SMALL_CLUSTER:
+            token_cache = {r.id: set(self._tokenize_query(r.compressed_fact or "")) for r in group}
+            ids = [r.id for r in group]
+            for i in range(len(ids)):
+                for j in range(i + 1, len(ids)):
+                    ta, tb = token_cache[ids[i]], token_cache[ids[j]]
+                    if not ta or not tb:
+                        continue
+                    overlap = len(ta & tb) / max(len(ta), len(tb))
+                    if overlap >= 0.25:
+                        yield from emit(ids[i], ids[j])
+
+    def _score_torsion_pair(
+        self,
+        a: SignatureRecord,
+        b: SignatureRecord,
+        *,
+        cluster_key: str,
+    ) -> Optional[TorsionReport]:
+        topic = self._topic_similarity(a, b)
+        if topic < _TOPIC_GATE:
+            return None
+
+        kind, strength, detail = self._contradiction_signals(a, b, topic)
+        if strength <= 0.0:
+            return None
+
+        score = round(max(0.0, min(1.0, topic * strength)), 4)
+        explanation = self._humanize_torsion(a, b, kind=kind, detail=detail)
+        return TorsionReport(
+            signature_a_id=a.id,
+            signature_b_id=b.id,
+            signature_a_text=(a.compressed_fact or "")[:500],
+            signature_b_text=(b.compressed_fact or "")[:500],
+            drawer=(a.drawer_domain or b.drawer_domain or "general"),
+            domain=(a.domain or b.domain or "insight"),
+            torsion_score=score,
+            topic_similarity=round(topic, 4),
+            contradiction_strength=round(strength, 4),
+            explanation=explanation,
+            conflict_kind=kind,
+            cluster_key=cluster_key,
+        )
+
+    def _topic_similarity(self, a: SignatureRecord, b: SignatureRecord) -> float:
+        """Blend tag Jaccard, token Jaccard, and TAS tag-overlap coupling."""
+        tags_a = {t.lower() for t in (a.intent_tags or []) if t}
+        tags_b = {t.lower() for t in (b.intent_tags or []) if t}
+        if tags_a or tags_b:
+            tag_j = len(tags_a & tags_b) / max(len(tags_a | tags_b), 1)
+        else:
+            tag_j = 0.0
+
+        tok_a = set(self._tokenize_query(a.compressed_fact or ""))
+        tok_b = set(self._tokenize_query(b.compressed_fact or ""))
+        if tok_a and tok_b:
+            tok_j = len(tok_a & tok_b) / max(len(tok_a | tok_b), 1)
+        else:
+            tok_j = 0.0
+
+        # Reuse TAS tag component: treat A's tags (else tokens) as the "query"
+        query_tags = list(tags_a) if tags_a else list(tok_a)
+        if query_tags:
+            coupling = self._compute_coupling(
+                b,
+                query_tags=query_tags,
+                p_eff=float(b.p_magnitude or 0.0),
+                p_raw=float(b.p_magnitude or 0.0),
+                effective_domain=(a.domain or None),
+                effective_regime=infer_regime(list(tags_a)) if tags_a else None,
+                target_pressure=float(a.p_magnitude or 50.0),
+            )
+            coupling_tag = coupling.tag_overlap
+        else:
+            coupling_tag = 0.0
+        return max(0.0, min(1.0, 0.45 * tag_j + 0.35 * tok_j + 0.20 * coupling_tag))
+
+    def _contradiction_signals(
+        self,
+        a: SignatureRecord,
+        b: SignatureRecord,
+        topic: float,
+    ) -> Tuple[str, float, str]:
+        """Return (kind, strength, detail). Strength in [0, 1]."""
+        # Prefer structured deadline over numeric bleed from the same dates in text
+        if a.t_deadline is not None and b.t_deadline is not None:
+            da = a.t_deadline if a.t_deadline.tzinfo else a.t_deadline.replace(tzinfo=timezone.utc)
+            db = b.t_deadline if b.t_deadline.tzinfo else b.t_deadline.replace(tzinfo=timezone.utc)
+            delta_days = abs((da - db).total_seconds()) / 86400.0
+            if delta_days >= 1.0:
+                strength = min(1.0, 0.7 + delta_days / 20.0)
+                return (
+                    "deadline",
+                    strength,
+                    f"{da.date().isoformat()} vs {db.date().isoformat()}",
+                )
+
+        best_kind = "semantic"
+        best_strength = 0.0
+        best_detail = ""
+
+        # Numeric disagreement in otherwise similar facts
+        nums_a = self._standalone_numbers(a.compressed_fact or "")
+        nums_b = self._standalone_numbers(b.compressed_fact or "")
+        if nums_a and nums_b and nums_a != nums_b and topic >= 0.4:
+            strength = min(1.0, 0.5 + 0.5 * topic)
+            detail = f"{self._format_numbers(nums_a)} vs {self._format_numbers(nums_b)}"
+            if strength > best_strength:
+                best_kind, best_strength, best_detail = "factual", strength, detail
+
+        # Negation / antonym polarity on shared content
+        tok_a = set(self._tokenize_query(a.compressed_fact or ""))
+        tok_b = set(self._tokenize_query(b.compressed_fact or ""))
+        content_a = tok_a - _NEGATION_TOKENS
+        content_b = tok_b - _NEGATION_TOKENS
+        content_overlap = (
+            len(content_a & content_b) / max(len(content_a | content_b), 1)
+            if content_a or content_b
+            else 0.0
+        )
+        neg_a = bool(_NEGATION_TOKENS & set(WORD_PATTERN.findall((a.compressed_fact or "").lower())))
+        neg_b = bool(_NEGATION_TOKENS & set(WORD_PATTERN.findall((b.compressed_fact or "").lower())))
+        if neg_a != neg_b and content_overlap >= 0.28:
+            strength = min(1.0, 0.45 + 0.55 * content_overlap)
+            if strength > best_strength:
+                best_kind, best_strength, best_detail = (
+                    "polarity",
+                    strength,
+                    "one affirms, the other negates the shared topic",
+                )
+
+        text_blob_a = f"{' '.join(a.intent_tags or [])} {(a.compressed_fact or '')}".lower()
+        text_blob_b = f"{' '.join(b.intent_tags or [])} {(b.compressed_fact or '')}".lower()
+        for left, right in _ANTONYM_PAIRS:
+            a_has_l, a_has_r = left in text_blob_a, right in text_blob_a
+            b_has_l, b_has_r = left in text_blob_b, right in text_blob_b
+            crossed = (a_has_l and b_has_r) or (a_has_r and b_has_l)
+            if crossed and topic >= 0.35:
+                strength = min(1.0, 0.6 + 0.4 * topic)
+                if strength > best_strength:
+                    best_kind, best_strength, best_detail = (
+                        "polarity",
+                        strength,
+                        f"opposing cues '{left}' / '{right}'",
+                    )
+
+        # Opposing pressure vectors (weaker; needs solid topic match)
+        p_delta = abs(float(a.p_magnitude or 0.0) - float(b.p_magnitude or 0.0))
+        if topic >= 0.55 and p_delta >= 40.0:
+            strength = min(0.85, (p_delta / 100.0) * topic)
+            if strength > best_strength:
+                best_kind, best_strength, best_detail = (
+                    "pressure",
+                    strength,
+                    f"P={a.p_magnitude:.0f} vs P={b.p_magnitude:.0f}",
+                )
+
+        return best_kind, best_strength, best_detail
+
+    @staticmethod
+    def _torsion_cluster_key(rec: SignatureRecord) -> str:
+        meta = rec.metadata or {}
+        cluster_id = meta.get("cluster_id")
+        if cluster_id is not None and str(cluster_id).strip():
+            return f"cluster:{str(cluster_id).strip()}"
+        drawer = (rec.drawer_domain or "general").strip().lower() or "general"
+        domain = (rec.domain or "insight").strip().lower() or "insight"
+        return f"{drawer}|{domain}"
+
+    @staticmethod
+    def _humanize_torsion(
+        a: SignatureRecord,
+        b: SignatureRecord,
+        *,
+        kind: str,
+        detail: str,
+    ) -> str:
+        """Plain-English conflict line (Morning Brief style, English-only)."""
+        a_snip = RetrievalEngine._fact_preview(a.compressed_fact)
+        b_snip = RetrievalEngine._fact_preview(b.compressed_fact)
+        base = (
+            f"Conflict found between Signature A ({a_snip}) "
+            f"and Signature B ({b_snip})"
+        )
+        match kind:
+            case "deadline":
+                return f"{base}: deadlines disagree ({detail})."
+            case "factual":
+                return f"{base}: conflicting numeric/factual claims ({detail})."
+            case "polarity":
+                return f"{base}: opposing polarity on the same topic ({detail})."
+            case "pressure":
+                return f"{base}: opposing pressure vectors ({detail})."
+            case _:
+                return f"{base}: reverse resonance on a shared topic."
+
+    @staticmethod
+    def _standalone_numbers(text: str) -> set[str]:
+        """Extract numeric tokens that are not glued to letters (skip Q3, v2)."""
+        return set(NUMBER_PATTERN.findall(text))
+
+    @staticmethod
+    def _format_numbers(nums: set[str], limit: int = 3) -> str:
+        ordered = sorted(nums, key=lambda n: (len(n), n))[:limit]
+        return ", ".join(ordered)
+
+    @staticmethod
+    def _fact_preview(text: Optional[str], max_len: int = 72) -> str:
+        cleaned = " ".join((text or "").split())
+        if not cleaned:
+            return "empty"
+        if len(cleaned) <= max_len:
+            return cleaned
+        return cleaned[: max_len - 1].rstrip() + "…"

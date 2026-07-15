@@ -53,6 +53,7 @@ from pdm_memory.core.signature import (
     MemoryHit,
     SignatureRecord,
 )
+from pdm_memory.models import TorsionReport
 from pdm_memory.storage.base import BaseStorage
 
 logger = logging.getLogger(__name__)
@@ -297,6 +298,40 @@ class Memory:
             dt = dt.replace(tzinfo=timezone.utc)
         return max(0.0, (now - dt).total_seconds() / 86400.0)
 
+    def detect_torsion(
+        self,
+        drawer: Optional[str] = None,
+        threshold: float = 0.7,
+        *,
+        apply_v_penalty: bool = False,
+        limit: int = 10_000,
+    ) -> List[TorsionReport]:
+        """
+        Detect Reverse Resonance — high topic similarity with opposing facts/pressure.
+
+        Compares signatures within the same drawer/domain (or metadata ``cluster_id``),
+        not the full store N². Optional ``apply_v_penalty`` records a validation miss
+        on each involved signature so future ``P_effective`` drops via Laplace V.
+
+        Args:
+            drawer:    Limit to one drawer (``drawer_domain``). None = all drawers.
+            threshold: Minimum ``torsion_score`` to report (default 0.7).
+            apply_v_penalty: If True, write V penalty to storage for conflicting IDs.
+            limit:     Max signatures to load from storage.
+
+        Returns:
+            List of ``TorsionReport``, highest torsion first.
+        """
+        records = self._storage.list(
+            user=self._user,
+            limit=limit,
+            drawer=drawer,
+        )
+        reports = self._engine.detect_torsion(records, threshold=threshold)
+        if apply_v_penalty and reports:
+            self._apply_torsion_v_penalty(reports)
+        return reports
+
     def explain(self, memory_id: str, query: Optional[str] = None) -> ExplainReport:
         """
         Return a detailed explanation of why a memory has its current pressure.
@@ -529,6 +564,32 @@ class Memory:
             auth = JWTAuth(token=token)
             return CloudDriver(auth=auth, base_url=cloud_url, user=self._user)
         return None
+
+    def _apply_torsion_v_penalty(self, reports: List[TorsionReport]) -> None:
+        """Record a validation miss on each signature involved in high torsion."""
+        affected: set[str] = set()
+        for report in reports:
+            affected.add(report.signature_a_id)
+            affected.add(report.signature_b_id)
+
+        batch_updates: List[tuple[str, dict]] = []
+        for sig_id in affected:
+            rec = self._storage.get(sig_id, user=self._user)
+            if rec is None:
+                continue
+            new_total = int(rec.validation_prediction_total or 0) + 1
+            # correct unchanged → Laplace V decreases
+            batch_updates.append(
+                (
+                    sig_id,
+                    {"validation_prediction_total": new_total},
+                )
+            )
+        if batch_updates:
+            try:
+                self._storage.update_batch(batch_updates, user=self._user)
+            except Exception as e:
+                logger.warning("[PDM] torsion V penalty batch failed: %s", e)
 
     def _apply_reinforcement(self, hits: List[MemoryHit]) -> None:
         """Write retrieval reinforcement back to storage for all hits."""
