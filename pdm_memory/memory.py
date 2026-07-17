@@ -240,6 +240,67 @@ class Memory:
         )
         logger.debug("[PDM] reinforce(%s) Δp=+%.2f → P=%.1f", memory_id, delta, new_p)
 
+    def delete(self, memory_id: str) -> bool:
+        """
+        Hard-delete a signature from the local store.
+
+        Returns:
+            True if deleted, False if not found.
+        """
+        rec = self._storage.get(memory_id, user=self._user)
+        if rec is None:
+            logger.warning("[PDM] delete(%s): not found", memory_id)
+            return False
+        self._storage.delete(memory_id, user=self._user)
+        logger.debug("[PDM] delete(%s)", memory_id)
+        return True
+
+    def reconcile_torsion(
+        self,
+        signature_a_id: str,
+        signature_b_id: str,
+        reconciled_text: str,
+    ) -> str:
+        """
+        Replace a torsion pair with one authoritative signature.
+
+        Saves merged fact, then deletes both conflicting records.
+
+        Returns:
+            ID of the new reconciled signature.
+
+        Raises:
+            ValueError: Missing signatures or empty reconciled text.
+        """
+        rec_a = self._storage.get(signature_a_id, user=self._user)
+        rec_b = self._storage.get(signature_b_id, user=self._user)
+        if rec_a is None or rec_b is None:
+            raise ValueError("One or both signatures not found")
+        text = reconciled_text.strip()[:500]
+        if not text:
+            raise ValueError("reconciled_text cannot be empty")
+
+        tags = sorted({t for t in rec_a.intent_tags + rec_b.intent_tags if t})
+        drawer = rec_a.drawer_domain or rec_b.drawer_domain or "general"
+        p_mag = min(100.0, max(rec_a.p_magnitude, rec_b.p_magnitude) + 8.0)
+
+        new_id = self.save(
+            text,
+            tags=tags,
+            drawer=drawer,
+            p_magnitude=p_mag,
+            source="reconcile",
+        )
+        self.delete(signature_a_id)
+        self.delete(signature_b_id)
+        logger.info(
+            "[PDM] reconcile_torsion %s+%s → %s",
+            signature_a_id[:8],
+            signature_b_id[:8],
+            new_id[:8],
+        )
+        return new_id
+
     def verify_alignment(
         self,
         intent_text: str,

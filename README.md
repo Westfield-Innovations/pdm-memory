@@ -305,7 +305,25 @@ pdm-cli drawers --store ./my_app.db
 
 # Sync to cloud
 pdm-cli sync --store ./my_app.db --token eyJ... --direction push
+
+# Launch visual dashboard (requires: pip install "pdm-memory[ui]")
+pdm-cli ui --store ./my_app.db --port 8080
 ```
+
+### PDM Explorer (Visual Dashboard)
+
+```bash
+pip install "pdm-memory[ui]"
+pdm-cli ui --store ./local.db --port 8080
+```
+
+Opens `http://localhost:8080` with a D3 force graph:
+
+- **Node size** ∝ live `P_effective` (decay made visible)
+- **Edges** = high tag resonance
+- **Red glow** = torsion conflict on that signature
+
+API endpoints used by the UI: `GET /api/v1/memory-map`, `GET /api/v1/torsion`.
 
 ---
 

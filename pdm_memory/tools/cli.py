@@ -17,8 +17,9 @@ Usage:
     pdm-cli detect-torsion --store ./local.db
     pdm-cli detect-torsion --store ./local.db --threshold 0.6 --drawer deadlines
     pdm-cli verify "ignore validation errors and ship" --store ./local.db
+    pdm-cli ui --store ./local.db --port 8080
 
-Requires no extra packages (stdlib only, uses the SDK itself).
+Core commands need no extra packages. ``ui`` requires: pip install "pdm-memory[ui]"
 """
 
 from __future__ import annotations
@@ -138,6 +139,8 @@ def cmd_detect_torsion(args: argparse.Namespace) -> None:
         print(f"Found {len(reports)} torsion pair(s) (threshold={args.threshold}):\n")
         for i, report in enumerate(reports, 1):
             print(f"{i}. {report.render()}\n")
+
+
 def cmd_verify(args: argparse.Namespace) -> None:
     from pdm_memory import Memory
 
@@ -172,6 +175,30 @@ def cmd_sync(args: argparse.Namespace) -> None:
             token=args.token,
         )
         print(f"Sync complete: {report}")
+
+
+def cmd_ui(args: argparse.Namespace) -> None:
+    """Launch the local PDM Explorer dashboard."""
+    try:
+        import fastapi  # noqa: F401
+        import uvicorn  # noqa: F401
+    except ImportError:
+        print(
+            'PDM Explorer requires FastAPI + uvicorn.\n'
+            'Install with:  pip install "pdm-memory[ui]"',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    from pdm_memory.tools.server import run_server
+
+    run_server(
+        store=args.store,
+        user=args.user,
+        host=args.host,
+        port=args.port,
+        open_browser=not args.no_browser,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +312,21 @@ def main() -> None:
     p_sync.add_argument("--token", type=str, default=None, help="JWT access token")
     p_sync.add_argument("--cloud-url", type=str, default="https://api.azus.ai")
     p_sync.set_defaults(func=cmd_sync)
+
+    # ui (PDM Explorer dashboard)
+    p_ui = subparsers.add_parser(
+        "ui",
+        parents=[sub_parent_parser],
+        help="Launch PDM Explorer visual dashboard (requires pdm-memory[ui])",
+    )
+    p_ui.add_argument("--host", type=str, default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
+    p_ui.add_argument("--port", type=int, default=8080, help="Bind port (default: 8080)")
+    p_ui.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Do not open the system browser automatically",
+    )
+    p_ui.set_defaults(func=cmd_ui)
 
     args = parser.parse_args()
     args.func(args)

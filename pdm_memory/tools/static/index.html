@@ -1,0 +1,2195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PDM Explorer — Neural Map of Meaning</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+  <style>
+    :root {
+      --bg0: #05070c;
+      --bg1: #0a0e16;
+      --glass: rgba(18, 24, 36, 0.55);
+      --glass-border: rgba(255, 255, 255, 0.10);
+      --glass-highlight: rgba(255, 255, 255, 0.06);
+      --ink: #f2f4f8;
+      --muted: #8b93a7;
+      --neon: #39ff88;
+      --neon-dim: rgba(57, 255, 136, 0.18);
+      --blue: #4da3ff;
+      --danger: #ff3b5c;
+      --danger-glow: rgba(255, 59, 92, 0.65);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      height: 100%;
+      overflow: hidden;
+      color: var(--ink);
+      font-family: "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Display", system-ui, sans-serif;
+      background: var(--bg0);
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* Minimal depth — no grid, no shapes */
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      z-index: 0;
+      pointer-events: none;
+      background: radial-gradient(ellipse 80% 70% at 50% 45%, #0c1018 0%, var(--bg0) 72%);
+    }
+
+    #graph {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 1;
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    .signals circle.signal {
+      pointer-events: none;
+      fill: rgba(160, 210, 255, 0.85);
+    }
+
+    .signals circle.signal.hot {
+      fill: rgba(57, 255, 136, 0.9);
+    }
+
+    /* —— Liquid glass chrome —— */
+    .glass {
+      background: linear-gradient(
+        145deg,
+        rgba(255, 255, 255, 0.09) 0%,
+        rgba(255, 255, 255, 0.03) 40%,
+        rgba(10, 14, 22, 0.45) 100%
+      );
+      backdrop-filter: blur(28px) saturate(160%);
+      -webkit-backdrop-filter: blur(28px) saturate(160%);
+      border: 1px solid var(--glass-border);
+      box-shadow:
+        0 1px 0 rgba(255, 255, 255, 0.08) inset,
+        0 20px 50px rgba(0, 0, 0, 0.45),
+        0 0 0 0.5px rgba(0, 0, 0, 0.3);
+      border-radius: 18px;
+    }
+
+    header {
+      position: absolute;
+      top: 1.1rem;
+      left: 1.25rem;
+      right: 1.25rem;
+      z-index: 20;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      pointer-events: none;
+      min-height: 4.5rem;
+    }
+
+    header > * { pointer-events: auto; }
+
+    .brand.glass {
+      padding: 0.75rem 1.05rem 0.8rem;
+      max-width: 17.5rem;
+      flex-shrink: 0;
+      z-index: 2;
+    }
+
+    .brand .eyebrow {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 0.6rem;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--neon);
+      margin-bottom: 0.25rem;
+    }
+
+    .brand h1 {
+      font-size: clamp(1.15rem, 2vw, 1.45rem);
+      font-weight: 600;
+      letter-spacing: -0.03em;
+      line-height: 1.15;
+    }
+
+    .brand h1 span {
+      background: linear-gradient(120deg, #fff 20%, var(--neon) 90%);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
+
+    .brand p {
+      margin-top: 0.25rem;
+      font-size: 0.72rem;
+      font-weight: 400;
+      color: var(--muted);
+      line-height: 1.35;
+    }
+
+    .stats {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: nowrap;
+      justify-content: flex-end;
+      flex-shrink: 0;
+      margin-left: auto;
+      z-index: 2;
+    }
+
+    .stat.glass {
+      min-width: 5.4rem;
+      padding: 0.55rem 0.75rem;
+      border-radius: 14px;
+    }
+
+    .stat .label {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 0.62rem;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .stat .value {
+      margin-top: 0.2rem;
+      font-size: 1.25rem;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .stat .value.warn { color: var(--danger); text-shadow: 0 0 12px var(--danger-glow); }
+    .stat .value.ok { color: var(--neon); }
+
+    /* SVG graph styles */
+    .links path {
+      fill: none;
+      stroke-linecap: round;
+      transition: stroke-opacity 220ms ease, stroke 220ms ease;
+    }
+
+    .node { cursor: pointer; }
+
+    .node .life-wrap {
+      transition: opacity 280ms ease;
+    }
+
+    .node .life-wrap.decayed {
+      animation: node-breathe 4.8s ease-in-out infinite;
+    }
+
+    @keyframes node-breathe {
+      0%, 100% { opacity: var(--decay-opacity, 0.28); }
+      50% { opacity: min(1, calc(var(--decay-opacity, 0.28) * 1.45)); }
+    }
+
+    .node .orb {
+      stroke: rgba(255, 255, 255, 0.22);
+      stroke-width: 1.25px;
+      transition: opacity 220ms ease, filter 220ms ease;
+    }
+
+    .node .label {
+      font-family: "Inter", sans-serif;
+      font-size: 10.5px;
+      font-weight: 500;
+      fill: rgba(242, 244, 248, 0.92);
+      paint-order: stroke;
+      stroke: rgba(5, 7, 12, 0.85);
+      stroke-width: 3px;
+      stroke-linejoin: round;
+      pointer-events: none;
+      user-select: none;
+    }
+
+    .node .p-badge {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 8px;
+      font-weight: 500;
+      fill: rgba(255, 255, 255, 0.95);
+      pointer-events: none;
+    }
+
+    .node.torsion .halo {
+      fill: none;
+      stroke: var(--danger);
+      stroke-width: 2.5px;
+      opacity: 0.85;
+      filter: drop-shadow(0 0 6px var(--danger-glow));
+      animation: pulse-halo 1.6s ease-in-out infinite;
+    }
+
+    @keyframes pulse-halo {
+      0%, 100% { opacity: 0.45; stroke-width: 2px; }
+      50% { opacity: 1; stroke-width: 3.5px; }
+    }
+
+    .node.dimmed { opacity: 0.14; }
+    .node.dimmed .halo { animation: none; opacity: 0.15; }
+    .links path.dimmed { stroke-opacity: 0.04 !important; }
+    .links path.hot {
+      stroke: var(--neon) !important;
+      stroke-opacity: 0.85 !important;
+      filter: drop-shadow(0 0 4px rgba(57, 255, 136, 0.45));
+    }
+    .node.focus .orb {
+      stroke: #fff;
+      stroke-width: 2px;
+      filter: drop-shadow(0 0 10px rgba(255, 255, 255, 0.35));
+    }
+    .node.neighbor .orb {
+      stroke: var(--neon);
+      stroke-width: 1.75px;
+    }
+
+    /* Tooltip — liquid glass */
+    #tooltip {
+      position: absolute;
+      z-index: 40;
+      max-width: min(22rem, calc(100vw - 2rem));
+      padding: 0.9rem 1rem;
+      border-radius: 16px;
+      pointer-events: none;
+      opacity: 0;
+      transform: translateY(6px);
+      transition: opacity 140ms ease, transform 140ms ease;
+    }
+
+    #tooltip.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    #tooltip .tt-title {
+      font-size: 0.88rem;
+      font-weight: 500;
+      line-height: 1.4;
+      margin-bottom: 0.55rem;
+    }
+
+    #tooltip .tt-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+      margin-bottom: 0.55rem;
+    }
+
+    #tooltip .chip {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 0.65rem;
+      padding: 0.22rem 0.5rem;
+      border-radius: 999px;
+      background: var(--neon-dim);
+      color: var(--neon);
+      border: 1px solid rgba(57, 255, 136, 0.25);
+    }
+
+    #tooltip .chip.p {
+      background: rgba(77, 163, 255, 0.15);
+      color: var(--blue);
+      border-color: rgba(77, 163, 255, 0.3);
+    }
+
+    #tooltip .chip.danger {
+      background: rgba(255, 59, 92, 0.18);
+      color: var(--danger);
+      border-color: rgba(255, 59, 92, 0.35);
+    }
+
+    #tooltip .tt-tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.3rem;
+    }
+
+    #tooltip .tag {
+      font-size: 0.68rem;
+      padding: 0.15rem 0.4rem;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--muted);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    /* Side detail panel */
+    aside#detail {
+      position: absolute;
+      right: 1.25rem;
+      bottom: 1.25rem;
+      width: min(22rem, calc(100vw - 2rem));
+      max-height: min(44vh, 24rem);
+      overflow: auto;
+      z-index: 25;
+      padding: 1.1rem 1.15rem;
+      border-radius: 20px;
+    }
+
+    aside#detail.hidden { display: none; }
+
+    aside .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 0.65rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      padding: 0.25rem 0.55rem;
+      border-radius: 999px;
+      margin-bottom: 0.65rem;
+    }
+
+    aside .badge.clear {
+      background: var(--neon-dim);
+      color: var(--neon);
+      border: 1px solid rgba(57, 255, 136, 0.25);
+    }
+
+    aside .badge.torsion {
+      background: rgba(255, 59, 92, 0.18);
+      color: var(--danger);
+      border: 1px solid rgba(255, 59, 92, 0.35);
+      box-shadow: 0 0 16px var(--danger-glow);
+    }
+
+    aside h2 {
+      font-size: 1.05rem;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      line-height: 1.3;
+      margin-bottom: 0.45rem;
+    }
+
+    aside .meta {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 0.68rem;
+      color: var(--muted);
+      line-height: 1.55;
+      margin-bottom: 0.7rem;
+    }
+
+    aside .text {
+      font-size: 0.88rem;
+      line-height: 1.45;
+      color: rgba(242, 244, 248, 0.9);
+      margin-bottom: 0.75rem;
+    }
+
+    aside .tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.35rem;
+    }
+
+    aside .tag {
+      font-size: 0.7rem;
+      padding: 0.2rem 0.45rem;
+      border-radius: 7px;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      color: var(--muted);
+    }
+
+    .legend-row {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .swatch {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .swatch.link {
+      width: 16px;
+      height: 2px;
+      border-radius: 1px;
+      background: var(--neon);
+    }
+
+    .swatch.torsion {
+      background: var(--danger);
+      box-shadow: 0 0 10px var(--danger-glow);
+    }
+
+    .status.glass {
+      position: absolute;
+      left: 50%;
+      bottom: 1.25rem;
+      transform: translateX(-50%);
+      z-index: 20;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 0.68rem;
+      color: var(--muted);
+      padding: 0.45rem 1rem;
+      border-radius: 999px;
+      white-space: nowrap;
+      max-width: calc(100vw - 18rem);
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .empty {
+      position: absolute;
+      inset: 0;
+      z-index: 5;
+      display: grid;
+      place-items: center;
+      text-align: center;
+      pointer-events: none;
+    }
+
+    .empty.hidden { display: none; }
+
+    .empty .glass {
+      padding: 1.75rem 2rem;
+      border-radius: 22px;
+      max-width: 22rem;
+    }
+
+    .empty h2 {
+      font-size: 1.35rem;
+      font-weight: 600;
+      margin-bottom: 0.4rem;
+    }
+
+    .empty p { color: var(--muted); font-size: 0.88rem; line-height: 1.45; }
+
+    .hint {
+      position: absolute;
+      top: 6.1rem;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 15;
+      font-size: 0.7rem;
+      color: var(--muted);
+      opacity: 0.75;
+      pointer-events: none;
+      text-align: center;
+      white-space: nowrap;
+    }
+
+    /* Compact filter carousel — dead-center between brand & stats */
+    .toolbar {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      z-index: 3;
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+      width: auto;
+      max-width: min(28rem, calc(100% - 36rem));
+      padding: 0.28rem 0.35rem;
+      border-radius: 999px;
+      pointer-events: auto;
+    }
+
+    .toolbar.glass {
+      background: linear-gradient(
+        145deg,
+        rgba(255, 255, 255, 0.08) 0%,
+        rgba(255, 255, 255, 0.02) 45%,
+        rgba(10, 14, 22, 0.4) 100%
+      );
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      backdrop-filter: blur(22px) saturate(150%);
+      -webkit-backdrop-filter: blur(22px) saturate(150%);
+      box-shadow:
+        0 1px 0 rgba(255, 255, 255, 0.07) inset,
+        0 12px 32px rgba(0, 0, 0, 0.35);
+    }
+
+    .chip-track {
+      /* ~4 full chips + half of the 5th */
+      flex: 0 0 19.5rem;
+      width: 19.5rem;
+      min-width: 0;
+      overflow: hidden;
+      mask-image: linear-gradient(90deg, #000 0, #000 88%, transparent 100%);
+      -webkit-mask-image: linear-gradient(90deg, #000 0, #000 88%, transparent 100%);
+    }
+
+    .chip-rail {
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+      overflow-x: auto;
+      scroll-behavior: smooth;
+      scrollbar-width: none;
+      padding: 0.05rem 0;
+    }
+
+    .chip-rail::-webkit-scrollbar { display: none; }
+
+    .nav-arrow {
+      flex-shrink: 0;
+      width: 1.7rem;
+      height: 1.7rem;
+      border-radius: 50%;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--ink);
+      font-size: 0.95rem;
+      line-height: 1;
+      cursor: pointer;
+      display: grid;
+      place-items: center;
+      transition: background 140ms ease, border-color 140ms ease, opacity 140ms ease;
+    }
+
+    .nav-arrow:hover {
+      background: rgba(255, 255, 255, 0.14);
+      border-color: rgba(255, 255, 255, 0.28);
+    }
+
+    .nav-arrow:disabled {
+      opacity: 0.28;
+      cursor: default;
+    }
+
+    .chip-btn {
+      flex-shrink: 0;
+      font-family: "Inter", sans-serif;
+      font-size: 0.7rem;
+      font-weight: 500;
+      padding: 0.32rem 0.7rem;
+      border-radius: 999px;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      background: rgba(18, 24, 36, 0.45);
+      color: var(--muted);
+      cursor: pointer;
+      transition: color 140ms ease, border-color 140ms ease, background 140ms ease, box-shadow 140ms ease;
+      white-space: nowrap;
+    }
+
+    .chip-btn:hover {
+      color: var(--ink);
+      border-color: rgba(255, 255, 255, 0.22);
+    }
+
+    .chip-btn.active {
+      color: #0a0e16;
+      background: #fff;
+      border-color: #fff;
+      box-shadow: 0 0 18px rgba(255, 255, 255, 0.18);
+    }
+
+    .chip-btn.refresh {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 0.62rem;
+      letter-spacing: 0.04em;
+      flex-shrink: 0;
+      padding: 0.32rem 0.6rem;
+    }
+
+    .chip-btn .dot {
+      display: inline-block;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      margin-right: 0.3rem;
+      vertical-align: middle;
+    }
+
+    /* Legend bottom-left */
+    .legend.glass {
+      position: absolute;
+      left: 1.25rem;
+      bottom: 1.25rem;
+      z-index: 20;
+      padding: 0.75rem 0.95rem;
+      border-radius: 14px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 0.65rem;
+      color: var(--muted);
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+      max-height: min(38vh, 18rem);
+      overflow: auto;
+      max-width: 11.5rem;
+    }
+
+    /* Torsion feed — bottom-right corner */
+    #torsion-feed {
+      position: absolute;
+      top: auto;
+      right: 1.25rem;
+      left: auto;
+      bottom: 1.25rem;
+      z-index: 23;
+      width: min(22rem, calc(100vw - 15rem));
+      max-height: min(26vh, 12.5rem);
+      overflow: auto;
+      padding: 0.85rem 0.95rem;
+      border-radius: 16px;
+    }
+
+    #torsion-feed.hidden { display: none; }
+
+    #torsion-feed h3 {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 0.62rem;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--danger);
+      margin-bottom: 0.55rem;
+    }
+
+    .tor-item {
+      font-size: 0.75rem;
+      line-height: 1.35;
+      color: rgba(242, 244, 248, 0.85);
+      padding: 0.45rem 0;
+      border-top: 1px solid rgba(255, 255, 255, 0.06);
+      cursor: pointer;
+    }
+
+    .tor-item:first-of-type { border-top: none; }
+    .tor-item:hover { color: #fff; }
+    .tor-item .kind {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 0.62rem;
+      color: var(--danger);
+      margin-right: 0.35rem;
+    }
+
+    .node.filtered-out { opacity: 0.06 !important; pointer-events: none; }
+    .links path.filtered-out { stroke-opacity: 0.03 !important; }
+
+    .torsion-links path.torsion-bridge {
+      fill: none;
+      stroke: var(--danger);
+      stroke-width: 2.4px;
+      stroke-opacity: 0.9;
+      stroke-dasharray: 6 5;
+      filter: drop-shadow(0 0 6px var(--danger-glow));
+    }
+
+    /* Detail covers feed when open (same corner) */
+    aside#detail {
+      bottom: 1.25rem;
+      right: 1.25rem;
+      z-index: 26;
+    }
+
+    @media (max-width: 1100px) {
+      .brand p { display: none; }
+      .chip-track {
+        flex-basis: 15.5rem;
+        width: 15.5rem;
+      }
+      .stat.glass { min-width: 4.6rem; padding: 0.45rem 0.55rem; }
+      .stat .value { font-size: 1.05rem; }
+    }
+
+
+    /* Memory Console */
+    .console-bar {
+      position: absolute;
+      left: 50%;
+      bottom: 3.6rem;
+      transform: translateX(-50%);
+      z-index: 24;
+      display: flex;
+      align-items: center;
+      gap: 0.85rem;
+      padding: 0.55rem 0.85rem;
+      min-width: min(42rem, calc(100vw - 2rem));
+    }
+
+    .console-bar label {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 0.62rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    .console-bar input[type="search"] {
+      flex: 1;
+      min-width: 8rem;
+      border: 1px solid rgba(255,255,255,0.12);
+      background: rgba(0,0,0,0.25);
+      color: var(--ink);
+      border-radius: 999px;
+      padding: 0.42rem 0.85rem;
+      font-size: 0.78rem;
+      outline: none;
+    }
+
+    .console-bar input[type="search"]:focus {
+      border-color: rgba(77,163,255,0.45);
+    }
+
+    .console-bar input[type="range"] {
+      width: 9rem;
+      accent-color: var(--blue);
+    }
+
+    #projection-label {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 0.65rem;
+      color: var(--blue);
+      min-width: 3.5rem;
+      text-align: right;
+    }
+
+    #ctx-menu {
+      position: fixed;
+      z-index: 60;
+      min-width: 9rem;
+      padding: 0.35rem;
+      display: none;
+    }
+
+    #ctx-menu.visible { display: block; }
+
+    #ctx-menu button {
+      display: block;
+      width: 100%;
+      text-align: left;
+      border: none;
+      background: transparent;
+      color: var(--ink);
+      font-size: 0.78rem;
+      padding: 0.45rem 0.65rem;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+
+    #ctx-menu button:hover { background: rgba(255,255,255,0.08); }
+    #ctx-menu button.danger { color: var(--danger); }
+
+    aside#torsion-resolve {
+      position: absolute;
+      right: 1.25rem;
+      bottom: 1.25rem;
+      width: min(24rem, calc(100vw - 2rem));
+      max-height: min(50vh, 28rem);
+      overflow: auto;
+      z-index: 28;
+      padding: 1rem 1.1rem;
+    }
+
+    aside#torsion-resolve.hidden { display: none; }
+
+    aside#torsion-resolve h3 {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 0.65rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--danger);
+      margin-bottom: 0.55rem;
+    }
+
+    aside#torsion-resolve .fact {
+      font-size: 0.78rem;
+      line-height: 1.4;
+      padding: 0.45rem 0;
+      border-top: 1px solid rgba(255,255,255,0.06);
+      color: rgba(242,244,248,0.88);
+    }
+
+    aside#torsion-resolve .fact:first-of-type { border-top: none; }
+
+    aside#torsion-resolve .explain {
+      margin: 0.65rem 0;
+      font-size: 0.75rem;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+
+    aside#torsion-resolve textarea {
+      width: 100%;
+      min-height: 4.5rem;
+      margin: 0.55rem 0;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,0.12);
+      background: rgba(0,0,0,0.25);
+      color: var(--ink);
+      padding: 0.55rem 0.65rem;
+      font-family: inherit;
+      font-size: 0.78rem;
+      resize: vertical;
+    }
+
+    .console-btn {
+      border: 1px solid rgba(255,255,255,0.14);
+      background: rgba(255,255,255,0.08);
+      color: var(--ink);
+      border-radius: 999px;
+      padding: 0.38rem 0.75rem;
+      font-size: 0.72rem;
+      cursor: pointer;
+    }
+
+    .console-btn.primary {
+      background: rgba(77,163,255,0.22);
+      border-color: rgba(77,163,255,0.35);
+      color: #cfe4ff;
+    }
+
+    .console-btn:disabled { opacity: 0.45; cursor: default; }
+
+    .node.search-hit .life-wrap { filter: drop-shadow(0 0 8px rgba(77,163,255,0.55)); }
+    .node.search-dim { opacity: 0.07 !important; }
+    .links path.search-hit { stroke-opacity: 0.75 !important; stroke: var(--blue) !important; }
+    .links path.search-dim { stroke-opacity: 0.03 !important; }
+
+    .torsion-links path.torsion-bridge {
+      pointer-events: stroke;
+      cursor: pointer;
+    }
+
+    .node.reinforce-pulse .life-wrap circle.orb {
+      animation: reinforce-pop 520ms ease-out;
+    }
+
+    @keyframes reinforce-pop {
+      0% { transform: scale(1); }
+      40% { transform: scale(1.35); }
+      100% { transform: scale(1); }
+    }
+
+    .status.glass { bottom: 1.25rem; }
+
+    @media (prefers-reduced-motion: reduce) {
+      .node .life-wrap.decayed,
+      .signals circle.signal { animation: none !important; }
+      .node.torsion .halo { animation: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <svg id="graph"></svg>
+
+  <header>
+    <div class="brand glass">
+      <div class="eyebrow">AZUS · PDM Memory</div>
+      <h1>Neural Map of <span>Meaning</span></h1>
+      <p>Pressure · resonance · torsion — made visible.</p>
+    </div>
+
+    <div class="toolbar glass" id="toolbar">
+      <button type="button" class="chip-btn refresh" id="btn-refresh" title="Reload from store">↻</button>
+      <button type="button" class="nav-arrow" id="chip-prev" aria-label="Scroll filters left">‹</button>
+      <div class="chip-track">
+        <div class="chip-rail" id="chip-rail">
+          <button type="button" class="chip-btn active" data-drawer="__all__" id="chip-all">All</button>
+        </div>
+      </div>
+      <button type="button" class="nav-arrow" id="chip-next" aria-label="Scroll filters right">›</button>
+    </div>
+
+    <div class="stats">
+      <div class="stat glass">
+        <div class="label">Memories</div>
+        <div class="value" id="stat-count">—</div>
+      </div>
+      <div class="stat glass">
+        <div class="label">Avg P<sub>eff</sub></div>
+        <div class="value ok" id="stat-avg">—</div>
+      </div>
+      <div class="stat glass">
+        <div class="label">Torsion</div>
+        <div class="value" id="stat-torsion">—</div>
+      </div>
+      <div class="stat glass">
+        <div class="label">Links</div>
+        <div class="value" id="stat-links">—</div>
+      </div>
+    </div>
+  </header>
+
+  <div class="hint" id="hint">Click a node to focus resonance · Esc to clear</div>
+
+  <div class="empty hidden" id="empty">
+    <div class="glass">
+      <h2>Empty store</h2>
+      <p>Save memories with tags, then refresh. Larger orbs = higher live pressure.</p>
+    </div>
+  </div>
+
+  <div class="legend glass" id="legend">
+    <div class="legend-row"><span class="swatch" style="background:#4da3ff"></span> Size ∝ P<sub>effective</sub></div>
+    <div class="legend-row"><span class="swatch link"></span> Curve = tag resonance</div>
+    <div class="legend-row"><span class="swatch torsion"></span> Pulse = torsion conflict</div>
+  </div>
+
+  <div id="torsion-feed" class="glass hidden">
+    <h3>Torsion feed</h3>
+    <div id="torsion-list"></div>
+  </div>
+
+  <div class="status glass" id="status">Loading neural map…</div>
+
+  <div id="tooltip" class="glass"></div>
+
+
+  <div id="ctx-menu" class="glass">
+    <button type="button" data-action="reinforce">Reinforce</button>
+    <button type="button" data-action="delete" class="danger">Delete</button>
+  </div>
+
+  <div class="console-bar glass" id="console-bar">
+    <label for="search-input">Search</label>
+    <input type="search" id="search-input" placeholder="Semantic recall…" autocomplete="off" />
+    <label for="projection-slider">Projected decay</label>
+    <input type="range" id="projection-slider" min="0" max="365" step="1" value="0" />
+    <span id="projection-label">0d</span>
+  </div>
+
+  <aside id="torsion-resolve" class="glass hidden">
+    <h3>Torsion resolution</h3>
+    <div id="torsion-fact-a" class="fact"></div>
+    <div id="torsion-fact-b" class="fact"></div>
+    <div id="torsion-explain" class="explain"></div>
+    <textarea id="torsion-draft" placeholder="Reconciled fact (optional — AI fills if empty)"></textarea>
+    <div style="display:flex;gap:0.45rem;flex-wrap:wrap;">
+      <button type="button" class="console-btn primary" id="btn-resolve-ai">Resolve with AI</button>
+      <button type="button" class="console-btn" id="btn-resolve-close">Close</button>
+    </div>
+    <div id="torsion-resolve-status" class="explain" style="margin-top:0.5rem;"></div>
+  </aside>
+
+  <aside id="detail" class="glass hidden">
+    <div id="detail-badge" class="badge clear">clear</div>
+    <h2 id="detail-title">Memory</h2>
+    <div class="meta" id="detail-meta"></div>
+    <div class="text" id="detail-text"></div>
+    <div class="tags" id="detail-tags"></div>
+  </aside>
+
+  <script>
+    /* —— Domain / drawer palette (Westfield) —— */
+    const DRAWER_COLORS = {
+      stewardship: "#b07cff",
+      foundational: "#b07cff",
+      goals: "#b07cff",
+      mission: "#b07cff",
+      patents: "#4da3ff",
+      patent: "#4da3ff",
+      product: "#4da3ff",
+      team: "#39ff88",
+      facts: "#39ff88",
+      markets: "#f0c14a",
+      finance: "#f0c14a",
+      trading: "#f0c14a",
+      ops: "#5ad0e6",
+      prefs: "#ff8f6b",
+      preferences: "#ff8f6b",
+      general: "#8b93a7",
+    };
+
+    function drawerColor(drawer, domain) {
+      const key = String(drawer || domain || "general").toLowerCase();
+      if (DRAWER_COLORS[key]) return DRAWER_COLORS[key];
+      // Stable hash fallback
+      let h = 0;
+      for (let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) | 0;
+      const hue = Math.abs(h) % 360;
+      return `hsl(${hue} 55% 58%)`;
+    }
+
+    /** P_effective → visual life (0.2 faint decay … 1.0 bright) */
+    function decayOpacity(pEff) {
+      const p = Math.max(0, Math.min(100, Number(pEff) || 0));
+      return 0.2 + (p / 100) * 0.8;
+    }
+
+    function isDecayed(pEff) {
+      return Number(pEff) < 38;
+    }
+
+    let projectedDays = 0;
+    let searchHitIds = new Set();
+    let searchLinkKeys = new Set();
+    let ctxTargetNode = null;
+    let activeTorsionReport = null;
+
+    function computeProjectedPEff(d, extraDays) {
+      const hl = Number(d.half_life) || 30;
+      const lambda = Math.log(2) / hl;
+      const touch = Number(d.days_since_touch || 0) + extraDays;
+      const created = Number(d.days_since_created || 0) + extraDays;
+      const grace = Number(d.t_persistence || 30);
+      let decay = 0;
+      if (created > grace) {
+        decay = 1 - Math.exp(-lambda * touch);
+      }
+      decay = Math.max(0, Math.min(1, decay));
+      const v = (Number(d.v_correct || 0) + 1) / (Number(d.v_total || 0) + 2);
+      const p = Number(d.p_magnitude || 0);
+      return Math.max(0, Math.min(100, p * v * (1 - decay) * 0.8));
+    }
+
+    function displayPEffective(d) {
+      if (projectedDays > 0) return computeProjectedPEff(d, projectedDays);
+      return Number(d.p_effective) || 0;
+    }
+
+    function linkKey(l) {
+      const s = typeof l.source === "object" ? l.source.id : l.source;
+      const t = typeof l.target === "object" ? l.target.id : l.target;
+      return s < t ? `${s}|${t}` : `${t}|${s}`;
+    }
+
+    async function apiFetch(path, options) {
+      const res = await fetch(path, { cache: "no-store", ...options });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const detail = body.detail;
+        const msg = typeof detail === "string" ? detail : Array.isArray(detail) ? detail.map((d) => d.msg).join(", ") : `${res.status}`;
+        throw new Error(msg);
+      }
+      return body;
+    }
+
+    function applyNodeVisuals(nodeSel) {
+      nodeSel.each(function (d) {
+        const pEff = displayPEffective(d);
+        const g = d3.select(this);
+        g.select(".life-wrap")
+          .classed("decayed", isDecayed(pEff))
+          .style("--decay-opacity", decayOpacity(pEff))
+          .style("opacity", decayOpacity(pEff));
+        g.select(".life-wrap circle.orb").attr("r", radius(pEff));
+        g.select(".life-wrap circle.halo").attr(
+          "r",
+          d.torsion_status === "torsion" ? radius(pEff) + 7 : 0
+        );
+        g.select("text.p-badge")
+          .text(pEff >= 35 ? Math.round(pEff) : "")
+          .attr("y", 0);
+        g.select("text.label").attr("y", -(radius(pEff) + 10));
+      });
+    }
+
+    function refreshAllVisuals() {
+      applyNodeVisuals(gNodes.selectAll("g.node"));
+      applySearchStyles();
+    }
+
+    function applySearchStyles() {
+      const searching = searchHitIds.size > 0;
+      gNodes.selectAll("g.node").classed("search-hit", (d) => searching && searchHitIds.has(d.id));
+      gNodes.selectAll("g.node").classed(
+        "search-dim",
+        (d) => searching && !searchHitIds.has(d.id)
+      );
+      gLinks.selectAll("path").each(function (l) {
+        const key = linkKey(l);
+        const hot = searching && searchLinkKeys.has(key);
+        d3.select(this).classed("search-hit", hot).classed("search-dim", searching && !hot);
+      });
+    }
+
+    let searchTimer = null;
+    async function runSearch(query) {
+      const q = (query || "").trim();
+      searchHitIds = new Set();
+      searchLinkKeys = new Set();
+      if (!q) {
+        applySearchStyles();
+        return;
+      }
+      try {
+        const data = await apiFetch(`/api/v1/search?q=${encodeURIComponent(q)}&k=30`);
+        searchHitIds = new Set((data.hits || []).map((h) => h.id));
+        graphData.links.forEach((l) => {
+          const s = typeof l.source === "object" ? l.source.id : l.source;
+          const t = typeof l.target === "object" ? l.target.id : l.target;
+          if (searchHitIds.has(s) && searchHitIds.has(t)) searchLinkKeys.add(linkKey(l));
+          if (searchHitIds.has(s) || searchHitIds.has(t)) {
+            searchHitIds.add(s);
+            searchHitIds.add(t);
+          }
+        });
+        applySearchStyles();
+        setStatus(`Search · ${searchHitIds.size} signatures`);
+      } catch (err) {
+        setStatus(`Search failed: ${err.message}`);
+      }
+    }
+
+    function hideContextMenu() {
+      document.getElementById("ctx-menu").classList.remove("visible");
+      ctxTargetNode = null;
+    }
+
+    function showContextMenu(event, d) {
+      event.preventDefault();
+      ctxTargetNode = d;
+      const menu = document.getElementById("ctx-menu");
+      menu.style.left = `${event.clientX}px`;
+      menu.style.top = `${event.clientY}px`;
+      menu.classList.add("visible");
+    }
+
+    async function reinforceNode(d) {
+      try {
+        setStatus("Reinforcing…");
+        const data = await apiFetch(`/api/v1/memories/${d.id}/reinforce`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ coupling_score: 0.75 }),
+        });
+        Object.assign(d, data.node);
+        const sel = gNodes.selectAll("g.node").filter((n) => n.id === d.id);
+        sel.classed("reinforce-pulse", true);
+        applyNodeVisuals(sel);
+        window.setTimeout(() => sel.classed("reinforce-pulse", false), 600);
+        setStatus(`Reinforced · P=${Number(d.p_magnitude).toFixed(1)}`);
+      } catch (err) {
+        setStatus(`Reinforce failed: ${err.message}`);
+      }
+    }
+
+    async function deleteNode(d) {
+      if (!window.confirm("Delete this memory permanently?")) return;
+      try {
+        await apiFetch(`/api/v1/memories/${d.id}`, { method: "DELETE" });
+        setStatus("Deleted · reloading…");
+        await load();
+      } catch (err) {
+        setStatus(`Delete failed: ${err.message}`);
+      }
+    }
+
+    function openTorsionResolve(report) {
+      activeTorsionReport = report;
+      document.getElementById("detail").classList.add("hidden");
+      document.getElementById("torsion-feed").classList.add("hidden");
+      const panel = document.getElementById("torsion-resolve");
+      panel.classList.remove("hidden");
+      document.getElementById("torsion-fact-a").textContent = `A: ${report.signature_a_text}`;
+      document.getElementById("torsion-fact-b").textContent = `B: ${report.signature_b_text}`;
+      document.getElementById("torsion-explain").textContent =
+        `[${Number(report.torsion_score).toFixed(2)}] ${report.conflict_kind} — ${report.explanation}`;
+      document.getElementById("torsion-draft").value = "";
+      document.getElementById("torsion-resolve-status").textContent = "";
+      focusTorsionPair(report);
+    }
+
+    function closeTorsionResolve() {
+      activeTorsionReport = null;
+      document.getElementById("torsion-resolve").classList.add("hidden");
+      if (torsionReports.length) document.getElementById("torsion-feed").classList.remove("hidden");
+    }
+
+    async function resolveTorsionWithAI() {
+      if (!activeTorsionReport) return;
+      const btn = document.getElementById("btn-resolve-ai");
+      const draft = document.getElementById("torsion-draft").value.trim();
+      btn.disabled = true;
+      document.getElementById("torsion-resolve-status").textContent = "Reconciling…";
+      try {
+        const data = await apiFetch("/api/v1/torsion/resolve", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            signature_a_id: activeTorsionReport.signature_a_id,
+            signature_b_id: activeTorsionReport.signature_b_id,
+            use_ai: true,
+            reconciled_text: draft || null,
+          }),
+        });
+        const newId = data.new_memory_id;
+        const mergeFromIds = data.deleted_ids || [
+          activeTorsionReport.signature_a_id,
+          activeTorsionReport.signature_b_id,
+        ];
+        closeTorsionResolve();
+        await load({
+          preserveLayout: true,
+          preserveProjection: true,
+          focusNodeId: newId,
+          mergeFromIds,
+        });
+      } catch (err) {
+        document.getElementById("torsion-resolve-status").textContent = err.message;
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    function renderAllTorsionLinks() {
+      gTorsionLinks.selectAll("path.torsion-bridge").remove();
+      torsionReports.forEach((report, idx) => {
+        const a = graphData.nodes.find((n) => n.id === report.signature_a_id);
+        const b = graphData.nodes.find((n) => n.id === report.signature_b_id);
+        if (!a || !b) return;
+        const fake = { source: a, target: b, index: idx, _bendSide: idx % 2 ? 1 : -1, _report: report };
+        gTorsionLinks
+          .append("path")
+          .attr("class", "torsion-bridge")
+          .datum(fake)
+          .attr("d", linkArc(fake))
+          .on("click", (event, d) => {
+            event.stopPropagation();
+            openTorsionResolve(d._report);
+          });
+      });
+    }
+
+
+    function truncateLabel(text, n = 20) {
+      const t = (text || "").replace(/\s+/g, " ").trim();
+      if (t.length <= n) return t;
+      return t.slice(0, n).trimEnd() + "…";
+    }
+
+    /** Radius strictly proportional to P_effective — tiny decay → huge pressure */
+    function radius(pEff) {
+      const p = Math.max(0, Math.min(100, Number(pEff) || 0));
+      return 3.5 + (p / 100) * 28;
+    }
+
+    function pointToSegmentDistance(px, py, x1, y1, x2, y2) {
+      const dx = x2 - x1;
+      const dy = y2 - y1;
+      const len2 = dx * dx + dy * dy;
+      if (len2 === 0) return Math.hypot(px - x1, py - y1);
+      let t = ((px - x1) * dx + (py - y1) * dy) / len2;
+      t = Math.max(0, Math.min(1, t));
+      return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+    }
+
+    /** Curved link that bends away from obstructing nodes; caches geometry on link._curve */
+    function computeLinkCurve(d) {
+      const sx = d.source.x;
+      const sy = d.source.y;
+      const tx = d.target.x;
+      const ty = d.target.y;
+      const dx = tx - sx;
+      const dy = ty - sy;
+      const dist = Math.hypot(dx, dy) || 1;
+      const leftX = -dy / dist;
+      const leftY = dx / dist;
+
+      let bend = Math.min(56, 18 + dist * 0.15);
+      let side = d._bendSide || (d.index % 2 === 0 ? 1 : -1);
+
+      let bestPush = 0;
+      let bestSide = side;
+      for (const n of graphData.nodes) {
+        const nid = n.id;
+        if (nid === d.source.id || nid === d.target.id) continue;
+        if (!nodeVisible(n)) continue;
+        const clearance = radius(n.p_effective) + 16;
+        const dSeg = pointToSegmentDistance(n.x, n.y, sx, sy, tx, ty);
+        if (dSeg >= clearance) continue;
+        const cross = (n.x - sx) * dy - (n.y - sy) * dx;
+        const s = cross >= 0 ? 1 : -1;
+        const need = clearance - dSeg + 10;
+        if (need > bestPush) {
+          bestPush = need;
+          bestSide = s;
+        }
+      }
+      if (bestPush > 0) {
+        bend = Math.max(bend, bestPush);
+        side = bestSide;
+        d._bendSide = side;
+      }
+
+      d._curve = {
+        sx,
+        sy,
+        mx: (sx + tx) / 2 + leftX * side * bend,
+        my: (sy + ty) / 2 + leftY * side * bend,
+        tx,
+        ty,
+      };
+      return d._curve;
+    }
+
+    function linkArc(d) {
+      const c = computeLinkCurve(d);
+      return `M${c.sx},${c.sy} Q${c.mx},${c.my} ${c.tx},${c.ty}`;
+    }
+
+    function pointOnQuadBezier(t, sx, sy, mx, my, tx, ty) {
+      const u = 1 - t;
+      return {
+        x: u * u * sx + 2 * u * t * mx + t * t * tx,
+        y: u * u * sy + 2 * u * t * my + t * t * ty,
+      };
+    }
+
+    function pointOnLink(d, t) {
+      const c = d._curve;
+      if (!c) return { x: d.source.x, y: d.source.y };
+      return pointOnQuadBezier(t, c.sx, c.sy, c.mx, c.my, c.tx, c.ty);
+    }
+
+    const svg = d3.select("#graph");
+    const W = () => window.innerWidth;
+    const H = () => window.innerHeight;
+    svg.attr("width", W()).attr("height", H());
+
+    const gRoot = svg.append("g");
+    const gLinks = gRoot.append("g").attr("class", "links");
+    const gSignals = gRoot.append("g").attr("class", "signals");
+    const gTorsionLinks = gRoot.append("g").attr("class", "torsion-links");
+    const gNodes = gRoot.append("g").attr("class", "nodes");
+
+    let isNodeDragging = false;
+    let suppressNextClick = false;
+    let savedTransform = d3.zoomIdentity;
+    let reentryGuard = false;
+
+    const zoomBehavior = d3
+      .zoom()
+      .scaleExtent([0.25, 3.5])
+      .filter((event) => {
+        // Hard lock while a node is held / dragged
+        if (isNodeDragging || suppressNextClick) return false;
+        if (event.type === "wheel") {
+          // Block pinch-zoom (ctrl+wheel) entirely — trackpad bleeds this into drags
+          if (event.ctrlKey) return false;
+          const t = event.target;
+          if (t && t.closest && t.closest("g.node")) return false;
+          return true;
+        }
+        if (event.type === "mousedown" || event.type === "touchstart") {
+          const t = event.target;
+          if (t && t.closest && t.closest("g.node")) return false;
+          return event.button === 0 && !event.ctrlKey;
+        }
+        return false;
+      })
+      .on("zoom", (event) => {
+        if (reentryGuard) return;
+        if (isNodeDragging) {
+          // Undo any transform change that slipped through during drag
+          reentryGuard = true;
+          svg.call(zoomBehavior.transform, savedTransform);
+          reentryGuard = false;
+          gRoot.attr("transform", savedTransform);
+          return;
+        }
+        savedTransform = event.transform;
+        gRoot.attr("transform", savedTransform);
+      });
+
+    svg.call(zoomBehavior);
+    svg.on("dblclick.zoom", null);
+
+    // Capture-phase blockers: Mac trackpad sends wheel/gesture during click-drag
+    const svgEl = svg.node();
+    function blockZoomGesture(e) {
+      if (!isNodeDragging) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+    }
+    svgEl.addEventListener("wheel", blockZoomGesture, { capture: true, passive: false });
+    svgEl.addEventListener("gesturestart", blockZoomGesture, { capture: true, passive: false });
+    svgEl.addEventListener("gesturechange", blockZoomGesture, { capture: true, passive: false });
+    svgEl.addEventListener("gestureend", blockZoomGesture, { capture: true, passive: false });
+    window.addEventListener(
+      "wheel",
+      (e) => {
+        if (isNodeDragging && e.ctrlKey) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+        }
+      },
+      { capture: true, passive: false }
+    );
+
+    function freezeCamera() {
+      isNodeDragging = true;
+      savedTransform = d3.zoomTransform(svgEl);
+      // Detach zoom listeners so nothing can mutate scale/translate
+      svg.on(".zoom", null);
+      gRoot.attr("transform", savedTransform);
+    }
+
+    function unfreezeCamera() {
+      isNodeDragging = false;
+      svg.call(zoomBehavior);
+      reentryGuard = true;
+      svg.call(zoomBehavior.transform, savedTransform);
+      reentryGuard = false;
+      gRoot.attr("transform", savedTransform);
+    }
+
+    let simulation = null;
+    let graphData = { nodes: [], links: [] };
+    let torsionReports = [];
+    let focusedId = null;
+    let neighborIds = new Set();
+    let activeDrawer = "__all__";
+
+    const tooltip = document.getElementById("tooltip");
+
+    function setStatus(msg) {
+      document.getElementById("status").textContent = msg;
+    }
+
+    function nodeVisible(d) {
+      return activeDrawer === "__all__" || d.drawer === activeDrawer;
+    }
+
+    function syncCarouselButtons() {
+      const rail = document.getElementById("chip-rail");
+      const prev = document.getElementById("chip-prev");
+      const next = document.getElementById("chip-next");
+      if (!rail || !prev || !next) return;
+      const max = Math.max(0, rail.scrollWidth - rail.clientWidth);
+      prev.disabled = rail.scrollLeft <= 2;
+      next.disabled = rail.scrollLeft >= max - 2;
+    }
+
+    function buildDrawerChips(nodes) {
+      const rail = document.getElementById("chip-rail");
+      rail.querySelectorAll("[data-drawer]:not(#chip-all)").forEach((el) => el.remove());
+      const drawers = [...new Set(nodes.map((n) => n.drawer || "general"))].sort();
+      drawers.forEach((drawer) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "chip-btn" + (activeDrawer === drawer ? " active" : "");
+        btn.dataset.drawer = drawer;
+        btn.innerHTML = `<span class="dot" style="background:${drawerColor(drawer)}"></span>${drawer}`;
+        btn.addEventListener("click", () => setDrawerFilter(drawer));
+        rail.appendChild(btn);
+      });
+      document.getElementById("chip-all").classList.toggle("active", activeDrawer === "__all__");
+      requestAnimationFrame(syncCarouselButtons);
+    }
+
+    function updateLegend(nodes) {
+      const legend = document.getElementById("legend");
+      const drawers = [...new Set(nodes.map((n) => n.drawer || "general"))].sort();
+      legend.innerHTML =
+        `<div class="legend-row"><span class="swatch" style="background:#4da3ff"></span> Size ∝ P<sub>effective</sub></div>` +
+        `<div class="legend-row"><span class="swatch link"></span> Curve = tag resonance</div>` +
+        `<div class="legend-row"><span class="swatch torsion"></span> Pulse = torsion conflict</div>` +
+        drawers
+          .map(
+            (d) =>
+              `<div class="legend-row"><span class="swatch" style="background:${drawerColor(d)}"></span> ${d}</div>`
+          )
+          .join("");
+    }
+
+    function captureNodePositions() {
+      const pos = new Map();
+      if (!graphData?.nodes?.length) return pos;
+      graphData.nodes.forEach((n) => {
+        if (Number.isFinite(n.x) && Number.isFinite(n.y)) {
+          pos.set(n.id, { x: n.x, y: n.y, vx: n.vx || 0, vy: n.vy || 0 });
+        }
+      });
+      return pos;
+    }
+
+    function applySavedPositions(nodes, savedPos) {
+      if (!savedPos?.size) return;
+      nodes.forEach((n) => {
+        const p = savedPos.get(n.id);
+        if (p) {
+          n.x = p.x;
+          n.y = p.y;
+          n.vx = p.vx;
+          n.vy = p.vy;
+        }
+      });
+    }
+
+    function placeNewNodeAtMergePoint(nodes, newId, deletedIds, savedPos) {
+      if (!newId || !deletedIds?.length || !savedPos?.size) return;
+      const anchors = deletedIds
+        .map((id) => savedPos.get(id))
+        .filter((p) => p && Number.isFinite(p.x) && Number.isFinite(p.y));
+      const node = nodes.find((n) => n.id === newId);
+      if (!node || !anchors.length) return;
+      if (anchors.length >= 2) {
+        node.x = (anchors[0].x + anchors[1].x) / 2;
+        node.y = (anchors[0].y + anchors[1].y) / 2;
+      } else {
+        node.x = anchors[0].x;
+        node.y = anchors[0].y;
+      }
+      node.vx = 0;
+      node.vy = 0;
+    }
+
+    function focusResolvedNode(nodeId) {
+      const node = graphData.nodes.find((n) => n.id === nodeId);
+      if (!node) {
+        setStatus("Resolved · merged node not visible");
+        return;
+      }
+
+      if (activeDrawer !== "__all__" && !nodeVisible(node)) {
+        setDrawerFilter("__all__");
+      }
+
+      focusedId = node.id;
+      neighborIds = new Set();
+      graphData.links.forEach((l) => {
+        const s = typeof l.source === "object" ? l.source.id : l.source;
+        const t = typeof l.target === "object" ? l.target.id : l.target;
+        if (s === node.id) neighborIds.add(t);
+        if (t === node.id) neighborIds.add(s);
+      });
+      applyFocusStyles();
+      showDetail(node);
+
+      const reveal = () => {
+        if (!Number.isFinite(node.x) || !Number.isFinite(node.y)) {
+          requestAnimationFrame(reveal);
+          return;
+        }
+        zoomToNodes([node], { padding: 140, maxScale: 2.5 });
+        const sel = gNodes.selectAll("g.node").filter((n) => n.id === nodeId);
+        sel.classed("reinforce-pulse", true);
+        window.setTimeout(() => sel.classed("reinforce-pulse", false), 1200);
+        document.getElementById("hint").textContent =
+          `Merged · ${truncateLabel(node.text, 36)} · Esc to clear`;
+        setStatus(`Resolved · merged memory highlighted`);
+      };
+      reveal();
+    }
+
+    function zoomToNodes(nodes, { padding = 100, maxScale = 2.4 } = {}) {
+      const valid = (nodes || []).filter((n) => n && Number.isFinite(n.x) && Number.isFinite(n.y));
+      if (!valid.length) return;
+
+      let minX = Infinity;
+      let maxX = -Infinity;
+      let minY = Infinity;
+      let maxY = -Infinity;
+      valid.forEach((n) => {
+        const r = radius(n.p_effective) + 24;
+        minX = Math.min(minX, n.x - r);
+        maxX = Math.max(maxX, n.x + r);
+        minY = Math.min(minY, n.y - r);
+        maxY = Math.max(maxY, n.y + r);
+      });
+
+      const spanX = Math.max(maxX - minX, 60) + padding * 2;
+      const spanY = Math.max(maxY - minY, 60) + padding * 2;
+      const midX = (minX + maxX) / 2;
+      const midY = (minY + maxY) / 2;
+      const scale = Math.min(maxScale, 0.9 * Math.min(W() / spanX, H() / spanY));
+      const transform = d3.zoomIdentity
+        .translate(W() / 2, H() / 2)
+        .scale(scale)
+        .translate(-midX, -midY);
+
+      svg.transition().duration(700).ease(d3.easeCubicOut).call(zoomBehavior.transform, transform);
+      savedTransform = transform;
+    }
+
+    function clearTorsionBridge() {
+      renderAllTorsionLinks();
+    }
+
+    function renderTorsionFeed(reports) {
+      const feed = document.getElementById("torsion-feed");
+      const list = document.getElementById("torsion-list");
+      torsionReports = reports || [];
+      if (!torsionReports.length) {
+        feed.classList.add("hidden");
+        list.innerHTML = "";
+        return;
+      }
+      feed.classList.remove("hidden");
+      list.innerHTML = torsionReports
+        .slice(0, 5)
+        .map(
+          (r, i) =>
+            `<div class="tor-item" data-idx="${i}"><span class="kind">[${Number(r.torsion_score).toFixed(2)}] ${r.conflict_kind}</span>${(r.explanation || "").slice(0, 110)}${(r.explanation || "").length > 110 ? "…" : ""}</div>`
+        )
+        .join("");
+      list.querySelectorAll(".tor-item").forEach((el) => {
+        el.addEventListener("click", (event) => {
+          event.stopPropagation();
+          const r = torsionReports[Number(el.dataset.idx)];
+          if (!r) return;
+          openTorsionResolve(r);
+        });
+      });
+    }
+
+    function focusTorsionPair(report) {
+      const a = graphData.nodes.find((n) => n.id === report.signature_a_id);
+      const b = graphData.nodes.find((n) => n.id === report.signature_b_id);
+      if (!a && !b) return;
+
+      // Ensure both are visible even if drawer filter is active
+      if ((a && !nodeVisible(a)) || (b && !nodeVisible(b))) {
+        setDrawerFilter("__all__");
+      }
+
+      const primary = a || b;
+      const secondary = a && b ? (a === primary ? b : a) : null;
+
+      focusedId = primary.id;
+      neighborIds = new Set(secondary ? [secondary.id] : []);
+      // Also include resonance neighbors of primary
+      graphData.links.forEach((l) => {
+        const s = typeof l.source === "object" ? l.source.id : l.source;
+        const t = typeof l.target === "object" ? l.target.id : l.target;
+        if (s === primary.id) neighborIds.add(t);
+        if (t === primary.id) neighborIds.add(s);
+        if (secondary) {
+          if (s === secondary.id) neighborIds.add(t);
+          if (t === secondary.id) neighborIds.add(s);
+        }
+      });
+
+      applyFocusStyles();
+      showDetail(primary);
+      zoomToNodes([a, b].filter(Boolean), { padding: 120, maxScale: 2.6 });
+      document.getElementById("hint").textContent =
+        `Torsion focus · ${report.conflict_kind} · Esc to clear`;
+    }
+
+    function setDrawerFilter(drawer) {
+      activeDrawer = drawer;
+      document.querySelectorAll(".chip-btn[data-drawer]").forEach((btn) => {
+        btn.classList.toggle("active", btn.dataset.drawer === drawer);
+      });
+      clearFocus();
+      applyFilterStyles();
+      const visible = graphData.nodes.filter(nodeVisible).length;
+      document.getElementById("hint").textContent =
+        drawer === "__all__"
+          ? "Click a node to focus resonance · Esc to clear"
+          : `Drawer “${drawer}” · ${visible} memories · Esc / All drawers to reset`;
+    }
+
+    function applyFilterStyles() {
+      gNodes.selectAll("g.node").classed("filtered-out", (d) => !nodeVisible(d));
+      gLinks.selectAll("path").classed("filtered-out", (d) => {
+        const s = typeof d.source === "object" ? d.source : graphData.nodes.find((n) => n.id === d.source);
+        const t = typeof d.target === "object" ? d.target : graphData.nodes.find((n) => n.id === d.target);
+        if (!s || !t) return true;
+        return !nodeVisible(s) || !nodeVisible(t);
+      });
+      gSignals.selectAll("circle.signal").style("display", (d) => {
+        const s = typeof d.link.source === "object" ? d.link.source : graphData.nodes.find((n) => n.id === d.link.source);
+        const t = typeof d.link.target === "object" ? d.link.target : graphData.nodes.find((n) => n.id === d.link.target);
+        if (!s || !t) return "none";
+        return nodeVisible(s) && nodeVisible(t) ? null : "none";
+      });
+      applyFocusStyles();
+    }
+
+    function showTooltip(event, d) {
+      const tags = (d.tags || [])
+        .map((t) => `<span class="tag">${t}</span>`)
+        .join("");
+      tooltip.innerHTML = `
+        <div class="tt-title">${d.text || ""}</div>
+        <div class="tt-row">
+          <span class="chip p">P<sub>eff</sub> ${Number(d.p_effective).toFixed(1)}</span>
+          <span class="chip p">P<sub>raw</sub> ${Number(d.p_magnitude).toFixed(1)}</span>
+          <span class="chip">${d.drawer || "general"}</span>
+          ${d.torsion_status === "torsion" ? '<span class="chip danger">TORSION</span>' : ""}
+        </div>
+        <div class="tt-tags">${tags || '<span class="tag">no tags</span>'}</div>
+      `;
+      tooltip.classList.add("visible");
+      moveTooltip(event);
+    }
+
+    function moveTooltip(event) {
+      const pad = 14;
+      const tw = tooltip.offsetWidth || 240;
+      const th = tooltip.offsetHeight || 100;
+      let x = event.clientX + pad;
+      let y = event.clientY + pad;
+      if (x + tw > window.innerWidth - 8) x = event.clientX - tw - pad;
+      if (y + th > window.innerHeight - 8) y = event.clientY - th - pad;
+      tooltip.style.left = `${x}px`;
+      tooltip.style.top = `${y}px`;
+    }
+
+    function hideTooltip() {
+      tooltip.classList.remove("visible");
+    }
+
+    function showDetail(d) {
+      const panel = document.getElementById("detail");
+      panel.classList.remove("hidden");
+      document.getElementById("torsion-feed").classList.add("hidden");
+      const badge = document.getElementById("detail-badge");
+      badge.textContent = d.torsion_status === "torsion" ? "torsion" : "aligned";
+      badge.className = "badge " + (d.torsion_status === "torsion" ? "torsion" : "clear");
+      document.getElementById("detail-title").textContent = truncateLabel(d.text, 64);
+      document.getElementById("detail-meta").innerHTML =
+        `id ${d.id.slice(0, 8)} · <b>${d.drawer}</b> / ${d.domain}<br>` +
+        `P<sub>eff</sub> <b style="color:var(--neon)">${Number(d.p_effective).toFixed(1)}</b>` +
+        ` · P<sub>raw</sub> ${Number(d.p_magnitude).toFixed(1)} · recalls ${d.retrieval_count}`;
+      document.getElementById("detail-text").textContent = d.text || "";
+      const tags = document.getElementById("detail-tags");
+      tags.innerHTML = "";
+      (d.tags || []).forEach((t) => {
+        const el = document.createElement("span");
+        el.className = "tag";
+        el.textContent = t;
+        tags.appendChild(el);
+      });
+    }
+
+    function clearFocus() {
+      focusedId = null;
+      neighborIds = new Set();
+      applyFocusStyles();
+      document.getElementById("detail").classList.add("hidden");
+      if (!activeTorsionReport && torsionReports.length) {
+        document.getElementById("torsion-feed").classList.remove("hidden");
+      }
+      if (activeDrawer === "__all__") {
+        document.getElementById("hint").textContent = "Click a node to focus resonance · Esc to clear";
+      }
+    }
+
+    function setFocus(d) {
+      if (!nodeVisible(d)) return;
+      focusedId = d.id;
+      neighborIds = new Set();
+      graphData.links.forEach((l) => {
+        const s = typeof l.source === "object" ? l.source.id : l.source;
+        const t = typeof l.target === "object" ? l.target.id : l.target;
+        if (s === d.id) neighborIds.add(t);
+        if (t === d.id) neighborIds.add(s);
+      });
+      applyFocusStyles();
+      showDetail(d);
+      // No camera zoom here — zoom only from torsion-feed selection.
+      document.getElementById("hint").textContent =
+        `Focused · ${neighborIds.size} resonance neighbor(s) · Esc to clear`;
+    }
+
+    function applyFocusStyles() {
+      const focusing = focusedId != null;
+      gNodes.selectAll("g.node").each(function (d) {
+        const el = d3.select(this);
+        const visible = nodeVisible(d);
+        el.classed("focus", focusing && d.id === focusedId);
+        el.classed("neighbor", focusing && neighborIds.has(d.id));
+        el.classed(
+          "dimmed",
+          visible && focusing && d.id !== focusedId && !neighborIds.has(d.id)
+        );
+      });
+      gLinks.selectAll("path").each(function (d) {
+        const s = typeof d.source === "object" ? d.source.id : d.source;
+        const t = typeof d.target === "object" ? d.target.id : d.target;
+        const hot =
+          focusing &&
+          ((s === focusedId && neighborIds.has(t)) ||
+            (t === focusedId && neighborIds.has(s)));
+        d3.select(this)
+          .classed("hot", hot)
+          .classed("dimmed", focusing && !hot);
+      });
+      applySearchStyles();
+      gSignals.selectAll("circle.signal").each(function (d) {
+        const link = d.link;
+        const s = typeof link.source === "object" ? link.source.id : link.source;
+        const t = typeof link.target === "object" ? link.target.id : link.target;
+        const hot =
+          focusing &&
+          ((s === focusedId && neighborIds.has(t)) ||
+            (t === focusedId && neighborIds.has(s)));
+        d3.select(this)
+          .classed("hot", hot)
+          .style("opacity", focusing ? (hot ? 0.95 : 0.06) : null);
+      });
+    }
+
+    const MAX_SIGNALS = 20;
+    const SIGNAL_FRAME_MS = 1000 / 24;
+    let signalParticles = [];
+    let lifeAnimating = false;
+    let lifeLastFrame = 0;
+    let reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    function buildSignalParticles(links) {
+      const ranked = links
+        .filter((l) => (l.resonance || 0) >= 0.2)
+        .sort((a, b) => (b.resonance || 0) - (a.resonance || 0))
+        .slice(0, MAX_SIGNALS);
+      return ranked.map((link, i) => ({
+        id: `${i}`,
+        link,
+        phase: (i * 0.17) % 1,
+        speed: 0.0009 + (link.resonance || 0) * 0.0008,
+        r: 1.2 + (link.resonance || 0) * 1.6,
+      }));
+    }
+
+    function renderSignalParticles(links) {
+      signalParticles = buildSignalParticles(links);
+      gSignals.selectAll("circle.signal").interrupt();
+      gSignals
+        .selectAll("circle.signal")
+        .data(signalParticles, (d) => d.id)
+        .join("circle")
+        .attr("class", (d) =>
+          "signal" + ((d.link.resonance || 0) > 0.45 ? " hot" : "")
+        )
+        .attr("r", (d) => d.r)
+        .attr("opacity", (d) => 0.2 + (d.link.resonance || 0) * 0.55);
+    }
+
+    function advanceSignals() {
+      if (!signalParticles.length || reducedMotion) return;
+      const sel = gSignals.selectAll("circle.signal");
+      if (sel.empty()) return;
+      sel.each(function (d) {
+        d.phase = (d.phase + d.speed * 16) % 1;
+        const pt = pointOnLink(d.link, d.phase);
+        d3.select(this).attr("transform", `translate(${pt.x},${pt.y})`);
+      });
+    }
+
+    function startLifeLoop() {
+      if (lifeAnimating || reducedMotion) return;
+      lifeAnimating = true;
+      function frame(now) {
+        if (document.hidden) {
+          requestAnimationFrame(frame);
+          return;
+        }
+        if (now - lifeLastFrame >= SIGNAL_FRAME_MS) {
+          lifeLastFrame = now;
+          advanceSignals();
+        }
+        requestAnimationFrame(frame);
+      }
+      requestAnimationFrame(frame);
+    }
+
+    function renderGraph(data, layoutOpts = {}) {
+      const nodes = data.nodes.map((d) => ({ ...d }));
+      const links = data.links.map((d) => ({ ...d }));
+
+      if (layoutOpts.savedPos) {
+        applySavedPositions(nodes, layoutOpts.savedPos);
+        if (layoutOpts.focusNodeId && layoutOpts.mergeFromIds?.length) {
+          placeNewNodeAtMergePoint(
+            nodes,
+            layoutOpts.focusNodeId,
+            layoutOpts.mergeFromIds,
+            layoutOpts.savedPos
+          );
+        }
+      }
+
+      graphData = { nodes, links };
+
+      document.getElementById("stat-count").textContent = String(data.count);
+      document.getElementById("stat-links").textContent = String(links.length);
+      const torEl = document.getElementById("stat-torsion");
+      torEl.textContent = String(data.torsion_count);
+      torEl.className = "value" + (data.torsion_count > 0 ? " warn" : "");
+
+      const avg =
+        nodes.length === 0
+          ? 0
+          : nodes.reduce((s, n) => s + n.p_effective, 0) / nodes.length;
+      document.getElementById("stat-avg").textContent = avg.toFixed(1);
+
+      buildDrawerChips(nodes);
+      updateLegend(nodes);
+
+      if (!nodes.length) {
+        document.getElementById("empty").classList.remove("hidden");
+        gSignals.selectAll("*").remove();
+        signalParticles = [];
+        setStatus("No memories in store.");
+        return;
+      }
+      document.getElementById("empty").classList.add("hidden");
+
+      if (simulation) simulation.stop();
+
+      simulation = d3
+        .forceSimulation(nodes)
+        .force(
+          "link",
+          d3
+            .forceLink(links)
+            .id((d) => d.id)
+            // High resonance → pull closer
+            .distance((d) => {
+              const res = d.resonance || 0;
+              return 42 + (1 - res) * 48;
+            })
+            .strength((d) => 0.35 + 0.55 * (d.resonance || 0))
+        )
+        .force("charge", d3.forceManyBody().strength(-160))
+        .force("center", d3.forceCenter(W() / 2, H() / 2 + 28))
+        .force(
+          "collision",
+          d3.forceCollide().radius((d) => radius(d.p_effective) + 14).strength(0.9)
+        );
+
+      if (layoutOpts.savedPos) {
+        simulation.alpha(0.18).restart();
+      }
+
+      const link = gLinks
+        .selectAll("path")
+        .data(links, (d) => {
+          const s = d.source.id || d.source;
+          const t = d.target.id || d.target;
+          return `${s}-${t}`;
+        })
+        .join("path")
+        .attr("stroke", "rgba(57, 255, 136, 0.45)")
+        .attr("stroke-opacity", (d) => 0.18 + 0.45 * (d.resonance || 0))
+        .attr("stroke-width", (d) => 0.8 + 4.2 * (d.resonance || 0));
+
+      renderSignalParticles(links);
+
+      const node = gNodes
+        .selectAll("g.node")
+        .data(nodes, (d) => d.id)
+        .join((enter) => {
+          const g = enter.append("g");
+          const life = g.append("g").attr("class", "life-wrap");
+          life.append("circle").attr("class", "halo");
+          life.append("circle").attr("class", "orb");
+          g.append("text").attr("class", "p-badge").attr("text-anchor", "middle").attr("dy", "0.35em");
+          g.append("text").attr("class", "label").attr("text-anchor", "middle");
+          return g;
+        });
+
+      node.attr("class", (d) =>
+        "node " + (d.torsion_status === "torsion" ? "torsion" : "clear")
+      );
+
+      node
+        .select(".life-wrap circle.orb")
+        .attr("fill", (d) => drawerColor(d.drawer, d.domain));
+
+      applyNodeVisuals(node);
+
+      node
+        .select("text.label")
+        .text((d) => truncateLabel(d.text, 20));
+
+      node
+        .on("contextmenu", (event, d) => {
+          if (isNodeDragging) return;
+          showContextMenu(event, d);
+        })
+        .on("mouseenter", (event, d) => {
+          if (isNodeDragging) return;
+          showTooltip(event, d);
+        })
+        .on("mousemove", (event) => {
+          if (isNodeDragging) return;
+          moveTooltip(event);
+        })
+        .on("mouseleave", hideTooltip)
+        .on("mousedown", (event) => {
+          // Freeze before drag threshold — trackpad wheel starts immediately
+          if (event.button === 0) freezeCamera();
+        })
+        .on("touchstart", () => {
+          freezeCamera();
+        })
+        .on("click", (event, d) => {
+          event.stopPropagation();
+          if (suppressNextClick) {
+            suppressNextClick = false;
+            return;
+          }
+          if (focusedId === d.id) clearFocus();
+          else setFocus(d);
+        })
+        .call(
+          d3
+            .drag()
+            .container(gRoot.node())
+            .subject((event, d) => d)
+            .clickDistance(6)
+            .on("start", (event, d) => {
+              // Already frozen on mousedown; keep state consistent
+              if (!isNodeDragging) freezeCamera();
+              suppressNextClick = false;
+              if (event.sourceEvent) {
+                event.sourceEvent.stopPropagation();
+                event.sourceEvent.preventDefault();
+              }
+              if (!event.active) simulation.alphaTarget(0.28).restart();
+              d.fx = d.x;
+              d.fy = d.y;
+              hideTooltip();
+            })
+            .on("drag", (event, d) => {
+              suppressNextClick = true;
+              if (event.sourceEvent) {
+                event.sourceEvent.stopPropagation();
+                event.sourceEvent.preventDefault();
+              }
+              gRoot.attr("transform", savedTransform);
+              d.fx = event.x;
+              d.fy = event.y;
+            })
+            .on("end", (event, d) => {
+              if (event.sourceEvent) {
+                event.sourceEvent.stopPropagation();
+              }
+              if (!event.active) simulation.alphaTarget(0);
+              d.fx = null;
+              d.fy = null;
+              unfreezeCamera();
+              if (suppressNextClick) {
+                window.setTimeout(() => {
+                  suppressNextClick = false;
+                }, 50);
+              }
+            })
+        );
+
+      svg.on("click", () => clearFocus());
+
+      simulation.on("tick", () => {
+        link.attr("d", linkArc);
+        gTorsionLinks.selectAll("path.torsion-bridge").attr("d", linkArc);
+        node.attr("transform", (d) => `translate(${d.x},${d.y})`);
+      });
+
+      if (!lifeAnimating && !reducedMotion) startLifeLoop();
+
+      applyFilterStyles();
+      setStatus(
+        `${data.count} signatures · ${links.length} resonance arcs · ${data.store}`
+      );
+    }
+
+    async function load(options = {}) {
+      const {
+        preserveLayout = false,
+        preserveProjection = false,
+        focusNodeId = null,
+        mergeFromIds = [],
+      } = options;
+      const savedPos = preserveLayout ? captureNodePositions() : null;
+
+      try {
+        setStatus("Loading neural map…");
+        const [mapRes, torRes] = await Promise.all([
+          fetch("/api/v1/memory-map", { cache: "no-store" }),
+          fetch("/api/v1/torsion", { cache: "no-store" }),
+        ]);
+        if (!mapRes.ok) throw new Error(`memory-map ${mapRes.status}`);
+        const map = await mapRes.json();
+        let reports = [];
+        if (torRes.ok) {
+          const tor = await torRes.json();
+          reports = tor.reports || [];
+        }
+        torsionReports = reports;
+        if (!preserveProjection) {
+          projectedDays = 0;
+          document.getElementById("projection-slider").value = "0";
+          document.getElementById("projection-label").textContent = "0d";
+        }
+        renderGraph(map, { savedPos, focusNodeId, mergeFromIds });
+        renderTorsionFeed(reports);
+        renderAllTorsionLinks();
+        if (focusNodeId) {
+          focusResolvedNode(focusNodeId);
+        }
+      } catch (err) {
+        setStatus("Failed to load: " + err.message);
+        console.error(err);
+      }
+    }
+
+    document.getElementById("chip-all").addEventListener("click", () => setDrawerFilter("__all__"));
+    document.getElementById("btn-refresh").addEventListener("click", () => load());
+
+    const chipRail = document.getElementById("chip-rail");
+    document.getElementById("chip-prev").addEventListener("click", () => {
+      chipRail.scrollBy({ left: -160, behavior: "smooth" });
+    });
+    document.getElementById("chip-next").addEventListener("click", () => {
+      chipRail.scrollBy({ left: 160, behavior: "smooth" });
+    });
+    chipRail.addEventListener("scroll", syncCarouselButtons, { passive: true });
+    window.addEventListener("resize", syncCarouselButtons);
+    window.addEventListener("resize", () => {
+      svg.attr("width", W()).attr("height", H());
+      if (simulation) {
+        simulation.force("center", d3.forceCenter(W() / 2, H() / 2 + 28));
+        simulation.alpha(0.25).restart();
+      }
+    });
+
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        if (activeTorsionReport) {
+          closeTorsionResolve();
+          return;
+        }
+        if (focusedId) clearFocus();
+        else if (activeDrawer !== "__all__") setDrawerFilter("__all__");
+      }
+    });
+
+    document.getElementById("search-input").addEventListener("input", (e) => {
+      window.clearTimeout(searchTimer);
+      searchTimer = window.setTimeout(() => runSearch(e.target.value), 280);
+    });
+
+    document.getElementById("projection-slider").addEventListener("input", (e) => {
+      projectedDays = Number(e.target.value) || 0;
+      document.getElementById("projection-label").textContent = `${projectedDays}d`;
+      refreshAllVisuals();
+    });
+
+    document.getElementById("ctx-menu").addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-action]");
+      if (!btn || !ctxTargetNode) return;
+      const action = btn.dataset.action;
+      hideContextMenu();
+      if (action === "reinforce") reinforceNode(ctxTargetNode);
+      if (action === "delete") deleteNode(ctxTargetNode);
+    });
+
+    document.addEventListener("click", () => hideContextMenu());
+    document.addEventListener("contextmenu", (e) => {
+      if (!e.target.closest("#ctx-menu")) hideContextMenu();
+    });
+
+    document.getElementById("btn-resolve-ai").addEventListener("click", () => resolveTorsionWithAI());
+    document.getElementById("btn-resolve-close").addEventListener("click", () => {
+      closeTorsionResolve();
+      clearFocus();
+    });
+
+    load();
+  </script>
+</body>
+</html>
