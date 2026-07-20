@@ -13,6 +13,7 @@ Usage:
     pdm-cli explain <memory_id> --store ./my_app.db
     pdm-cli decay --store ./my_app.db --dry-run
     pdm-cli stats --store ./my_app.db
+    pdm-cli status --store ./my_app.db
     pdm-cli drawers --store ./my_app.db
     pdm-cli detect-torsion --store ./local.db
     pdm-cli detect-torsion --store ./local.db --threshold 0.6 --drawer deadlines
@@ -108,6 +109,15 @@ def cmd_stats(args: argparse.Namespace) -> None:
         print(f"\nDrawers ({len(drawers)}):")
         for d in drawers:
             print(f"  {d.domain:<30} {d.signature_count:>5} memories  avg_P={d.avg_pressure:.1f}")
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    from pdm_memory import Memory
+    from pdm_memory.tools.health_status import build_health_report, render_health_dashboard
+
+    with Memory(store=args.store, user=args.user) as mem:
+        report = build_health_report(mem, store=args.store, user=args.user)
+        print(render_health_dashboard(report))
 
 
 def cmd_drawers(args: argparse.Namespace) -> None:
@@ -256,6 +266,14 @@ def main() -> None:
     # stats
     p_stats = subparsers.add_parser("stats", parents=[sub_parent_parser], help="Show store statistics")
     p_stats.set_defaults(func=cmd_stats)
+
+    # status (Identity Health Dashboard)
+    p_status = subparsers.add_parser(
+        "status",
+        parents=[sub_parent_parser],
+        help="Show Identity Health Dashboard (ASCII substrate diagnostics)",
+    )
+    p_status.set_defaults(func=cmd_status)
 
     # drawers
     p_drawers = subparsers.add_parser("drawers", parents=[sub_parent_parser], help="List all drawers")
