@@ -16,6 +16,7 @@ Usage:
     pdm-cli drawers --store ./my_app.db
     pdm-cli detect-torsion --store ./local.db
     pdm-cli detect-torsion --store ./local.db --threshold 0.6 --drawer deadlines
+    pdm-cli search "dark mode" --store ./local.db --search-cost 0.85
     pdm-cli verify "ignore validation errors and ship" --store ./local.db
     pdm-cli ui --store ./local.db --port 8080
 
@@ -124,6 +125,52 @@ def cmd_drawers(args: argparse.Namespace) -> None:
             print(f"{d.domain:<35} {d.signature_count:>10} {d.avg_pressure:>15.1f}")
 
 
+def cmd_search(args: argparse.Namespace) -> None:
+    from pdm_memory import Memory
+
+    with Memory(store=args.store, user=args.user) as mem:
+        hits = mem.recall(
+            args.query,
+            k=args.limit,
+            min_pressure=args.min_pressure,
+            search_cost=args.search_cost,
+            reinforce=False,
+        )
+        if not hits:
+            print("No matching memories.")
+            return
+
+        print(f"Query: {args.query!r}  (search_cost={args.search_cost})")
+        print(f"{'#':<4} {'ID':<10} {'P_eff':>7} {'Coupling':>9} {'Drawer':<12} {'Text'}")
+        print("-" * 100)
+        for i, h in enumerate(hits, 1):
+            text_preview = h.text[:55].replace("\n", " ")
+            print(
+                f"{i:<4} {h.id[:8]:<10} {h.pressure:>7.1f} {h.coupling_score:>9.3f} "
+                f"{h.drawer:<12} {text_preview}"
+            )
+        print(f"\nTotal: {len(hits)} hit(s)")
+
+
+def cmd_export(args: argparse.Namespace) -> None:
+    from pdm_memory import Memory
+
+    with Memory(store=args.store, user=args.user) as mem:
+        count = mem.export_json(args.out)
+    print(f"Exported {count} signature(s) → {args.out}")
+
+
+def cmd_import(args: argparse.Namespace) -> None:
+    from pdm_memory import Memory
+
+    with Memory(store=args.store, user=args.user) as mem:
+        counts = mem.import_json(args.path, skip_duplicates=not args.allow_duplicates)
+    print(
+        f"Import complete: saved={counts['saved']} "
+        f"skipped={counts['skipped']} errors={counts['errors']}"
+    )
+
+
 def cmd_detect_torsion(args: argparse.Namespace) -> None:
     from pdm_memory import Memory
 
@@ -214,7 +261,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--store", default="./pdm_memory.db",
-        help="Path to SQLite .db file (default: ./pdm_memory.db)"
+        help="Store path or URL: ./app.db, sqlite:///, postgresql://… (default: ./pdm_memory.db)"
     )
     parser.add_argument(
         "--user", default="default",
@@ -260,6 +307,46 @@ def main() -> None:
     # drawers
     p_drawers = subparsers.add_parser("drawers", parents=[sub_parent_parser], help="List all drawers")
     p_drawers.set_defaults(func=cmd_drawers)
+
+    # search
+    p_search = subparsers.add_parser(
+        "search",
+        parents=[sub_parent_parser],
+        help="Semantic recall search (TAS-ranked hits)",
+    )
+    p_search.add_argument("query", help="Recall query string")
+    p_search.add_argument("--limit", type=int, default=10, metavar="K")
+    p_search.add_argument(
+        "--search-cost",
+        type=float,
+        default=0.65,
+        metavar="C",
+        help="Threshold looseness 0.0–1.0 (default: 0.65; use 0.85+ for low-P memories)",
+    )
+    p_search.add_argument("--min-pressure", type=float, default=0.0, metavar="P")
+    p_search.set_defaults(func=cmd_search)
+
+    # export / import
+    p_export = subparsers.add_parser(
+        "export",
+        parents=[sub_parent_parser],
+        help="Export all signatures to JSON backup",
+    )
+    p_export.add_argument("--out", required=True, help="Output .json path")
+    p_export.set_defaults(func=cmd_export)
+
+    p_import = subparsers.add_parser(
+        "import",
+        parents=[sub_parent_parser],
+        help="Import signatures from JSON export",
+    )
+    p_import.add_argument("path", help="Input .json path")
+    p_import.add_argument(
+        "--allow-duplicates",
+        action="store_true",
+        help="Import even when id/hash already exists (may fail on id clash)",
+    )
+    p_import.set_defaults(func=cmd_import)
 
     # detect-torsion
     p_torsion = subparsers.add_parser(

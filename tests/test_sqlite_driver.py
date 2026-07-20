@@ -107,6 +107,16 @@ class TestSQLiteDriverCRUD:
         assert all(r.p_magnitude >= 60 for r in records)
         assert len(records) == 2
 
+    def test_find_by_hash(self, driver):
+        sig = make_sig(text="Unique dedupe text")
+        driver.save(sig)
+        from pdm_memory.storage.schema import hash_fact_text
+
+        found = driver.find_by_hash(hash_fact_text("Unique dedupe text"), user=sig.user)
+        assert found is not None
+        assert found.id == sig.id
+        assert driver.find_by_hash("deadbeef", user=sig.user) is None
+
     def test_count(self, driver):
         for _ in range(3):
             driver.save(make_sig())
@@ -157,6 +167,17 @@ class TestPrivacyMode:
 
 
 class TestSQLiteDriverPersistence:
+    def test_transaction_rollback(self, driver):
+        sig_keep = make_sig(text="keep")
+        driver.save(sig_keep)
+        sig_rollback = make_sig(text="rollback")
+        with pytest.raises(RuntimeError, match="boom"):
+            with driver.transaction():
+                driver.save(sig_rollback)
+                raise RuntimeError("boom")
+        assert driver.get(sig_keep.id, user=sig_keep.user) is not None
+        assert driver.get(sig_rollback.id, user=sig_rollback.user) is None
+
     def test_data_persists_across_instances(self, db_path):
         # Write with one driver instance
         d1 = SQLiteDriver(db_path=db_path)

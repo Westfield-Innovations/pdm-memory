@@ -27,80 +27,20 @@ import json
 import logging
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Iterator, List, Optional
 
 from pdm_memory.core.signature import DrawerInfo, SignatureRecord
 from pdm_memory.storage.base import BaseStorage
-
-logger = logging.getLogger(__name__)
-
-# Columns allowed in UPDATE — never take raw dict keys (SQL injection).
-# ``id`` and ``user`` are intentionally excluded (immutable ownership).
-_UPDATABLE_COLUMNS: frozenset[str] = frozenset(
-    {
-        "compressed_fact",
-        "compressed_fact_hash",
-        "source",
-        "p_magnitude",
-        "t_persistence",
-        "phase_privilege",
-        "effective_spike",
-        "intent_tags",
-        "question_regime",
-        "domain",
-        "drawer_domain",
-        "retrieval_count",
-        "last_retrieved",
-        "created_at",
-        "validation_prediction_total",
-        "validation_prediction_correct",
-        "decay_rate",
-        "t_deadline",
-        "urgency_rate",
-        "metadata",
-    }
+from pdm_memory.storage.schema import (
+    SCHEMA_SQLITE,
+    UPDATABLE_COLUMNS,
+    apply_sqlite_migrations,
+    mapping_to_record,
 )
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS pdm_signatures (
-    id                              TEXT PRIMARY KEY,
-    user                            TEXT NOT NULL DEFAULT 'default',
-    compressed_fact                 TEXT NOT NULL,
-    compressed_fact_hash            TEXT NOT NULL,
-    source                          TEXT NOT NULL DEFAULT 'chat',
-    p_magnitude                     REAL NOT NULL DEFAULT 50.0,
-    t_persistence                   REAL NOT NULL DEFAULT 30.0,
-    phase_privilege                 REAL NOT NULL DEFAULT 1.0,
-    effective_spike                 REAL,
-    intent_tags                     TEXT NOT NULL DEFAULT '[]',
-    question_regime                 TEXT NOT NULL DEFAULT 'neutral',
-    domain                          TEXT NOT NULL DEFAULT 'insight',
-    drawer_domain                   TEXT NOT NULL DEFAULT 'general',
-    retrieval_count                 INTEGER NOT NULL DEFAULT 0,
-    last_retrieved                  TEXT,
-    created_at                      TEXT NOT NULL,
-    validation_prediction_total     INTEGER NOT NULL DEFAULT 0,
-    validation_prediction_correct   INTEGER NOT NULL DEFAULT 0,
-    decay_rate                      REAL NOT NULL DEFAULT 0.9,
-    t_deadline                      TEXT,
-    urgency_rate                    REAL NOT NULL DEFAULT 2.0,
-    metadata                        TEXT NOT NULL DEFAULT '{}'
-);
-
-CREATE INDEX IF NOT EXISTS idx_pdm_user_pressure
-    ON pdm_signatures (user, p_magnitude DESC);
-
-CREATE INDEX IF NOT EXISTS idx_pdm_user_drawer
-    ON pdm_signatures (user, drawer_domain);
-
-CREATE TABLE IF NOT EXISTS pdm_drawers (
-    domain          TEXT NOT NULL,
-    user            TEXT NOT NULL DEFAULT 'default',
-    description     TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY (domain, user)
-);
-"""
+logger = logging.getLogger(__name__)
 
 
 def _now_iso() -> str:
@@ -133,9 +73,33 @@ class SQLiteDriver(BaseStorage):
         # Initialise schema on startup
         conn = self._conn()
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.executescript(_SCHEMA)
+        conn.executescript(SCHEMA_SQLITE)
+        apply_sqlite_migrations(conn)
         conn.commit()
         logger.debug("[PDM-SQLite] Opened %s (store_raw=%s)", db_path, store_raw)
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Atomic batch — defer commits until context exit."""
+        conn = self._conn()
+        depth = getattr(self._local, "txn_depth", 0)
+        if depth == 0:
+            conn.execute("BEGIN IMMEDIATE")
+        self._local.txn_depth = depth + 1
+        try:
+            yield
+            self._local.txn_depth = depth
+            if depth == 0:
+                conn.commit()
+        except Exception:
+            self._local.txn_depth = depth
+            if depth == 0:
+                conn.rollback()
+            raise
+
+    def _commit_if_idle(self, conn: sqlite3.Connection) -> None:
+        if getattr(self._local, "txn_depth", 0) == 0:
+            conn.commit()
 
     # ------------------------------------------------------------------
     # Connection management (one connection per thread)
@@ -172,20 +136,22 @@ class SQLiteDriver(BaseStorage):
         conn = self._conn()
         conn.execute(
             """
-            INSERT OR REPLACE INTO pdm_signatures (
+            INSERT INTO pdm_signatures (
                 id, user, compressed_fact, compressed_fact_hash, source,
                 p_magnitude, t_persistence, phase_privilege, effective_spike,
                 intent_tags, question_regime, domain, drawer_domain,
                 retrieval_count, last_retrieved, created_at,
                 validation_prediction_total, validation_prediction_correct,
-                decay_rate, t_deadline, urgency_rate, metadata
+                decay_rate, t_deadline, urgency_rate, metadata,
+                is_deleted, idempotency_key
             ) VALUES (
                 ?, ?, ?, ?, ?,
                 ?, ?, ?, ?,
                 ?, ?, ?, ?,
                 ?, ?, ?,
                 ?, ?,
-                ?, ?, ?, ?
+                ?, ?, ?, ?,
+                ?, ?
             )
             """,
             (
@@ -211,6 +177,8 @@ class SQLiteDriver(BaseStorage):
                 sig.t_deadline.isoformat() if sig.t_deadline else None,
                 sig.urgency_rate,
                 json.dumps(sig.metadata),
+                1 if sig.is_deleted else 0,
+                sig.idempotency_key,
             ),
         )
         # Upsert drawer record
@@ -218,16 +186,44 @@ class SQLiteDriver(BaseStorage):
             "INSERT OR IGNORE INTO pdm_drawers (domain, user, description) VALUES (?, ?, ?)",
             (sig.drawer_domain, sig.user, ""),
         )
-        conn.commit()
+        self._commit_if_idle(conn)
         logger.debug("[PDM-SQLite] Saved signature %s (P=%.1f)", sig.id, sig.p_magnitude)
         return sig.id
 
     def get(self, memory_id: str, user: str = "default") -> Optional[SignatureRecord]:
         row = self._conn().execute(
-            "SELECT * FROM pdm_signatures WHERE id = ? AND user = ?",
+            "SELECT * FROM pdm_signatures WHERE id = ? AND user = ? AND is_deleted = 0",
             (memory_id, user),
         ).fetchone()
-        return self._row_to_record(row) if row else None
+        return mapping_to_record(row) if row else None
+
+    def find_by_hash(self, text_hash: str, user: str = "default") -> Optional[SignatureRecord]:
+        row = self._conn().execute(
+            "SELECT * FROM pdm_signatures WHERE user = ? AND compressed_fact_hash = ? "
+            "AND is_deleted = 0 LIMIT 1",
+            (user, text_hash),
+        ).fetchone()
+        return mapping_to_record(row) if row else None
+
+    def find_by_idempotency_key(
+        self,
+        idempotency_key: str,
+        user: str = "default",
+    ) -> Optional[SignatureRecord]:
+        row = self._conn().execute(
+            "SELECT * FROM pdm_signatures WHERE user = ? AND idempotency_key = ? "
+            "AND is_deleted = 0 LIMIT 1",
+            (user, idempotency_key.strip()),
+        ).fetchone()
+        return mapping_to_record(row) if row else None
+
+    def ping(self) -> bool:
+        try:
+            row = self._conn().execute("SELECT 1 AS ok").fetchone()
+            return bool(row and row["ok"] == 1)
+        except Exception as exc:
+            logger.warning("[PDM-SQLite] ping failed: %s", exc)
+            return False
 
     def update(self, memory_id: str, user: str = "default", **fields) -> None:
         """Update whitelisted columns for ``memory_id`` owned by ``user``."""
@@ -241,7 +237,7 @@ class SQLiteDriver(BaseStorage):
             f"UPDATE pdm_signatures SET {set_clause} WHERE id = ? AND user = ?",
             values,
         )
-        self._conn().commit()
+        self._commit_if_idle(self._conn())
         if cur.rowcount == 0:
             logger.warning(
                 "[PDM-SQLite] update(%s) affected 0 rows (missing or wrong user=%s)",
@@ -274,7 +270,7 @@ class SQLiteDriver(BaseStorage):
                     memory_id,
                     user,
                 )
-        conn.commit()
+        self._commit_if_idle(conn)
 
     @staticmethod
     def _prepare_update_fields(fields: dict) -> dict:
@@ -287,11 +283,11 @@ class SQLiteDriver(BaseStorage):
         if not fields:
             return {}
 
-        unknown = set(fields) - _UPDATABLE_COLUMNS
+        unknown = set(fields) - UPDATABLE_COLUMNS
         if unknown:
             raise ValueError(
                 f"Refusing to update non-whitelisted column(s): {sorted(unknown)}. "
-                f"Allowed: {sorted(_UPDATABLE_COLUMNS)}"
+                f"Allowed: {sorted(UPDATABLE_COLUMNS)}"
             )
 
         prepared: dict = {}
@@ -309,11 +305,20 @@ class SQLiteDriver(BaseStorage):
         return prepared
 
     def delete(self, memory_id: str, user: str = "default") -> None:
-        self._conn().execute(
+        conn = self._conn()
+        conn.execute(
+            "UPDATE pdm_signatures SET is_deleted = 1 WHERE id = ? AND user = ? AND is_deleted = 0",
+            (memory_id, user),
+        )
+        self._commit_if_idle(conn)
+
+    def hard_delete(self, memory_id: str, user: str = "default") -> None:
+        conn = self._conn()
+        conn.execute(
             "DELETE FROM pdm_signatures WHERE id = ? AND user = ?",
             (memory_id, user),
         )
-        self._conn().commit()
+        self._commit_if_idle(conn)
 
     def list(
         self,
@@ -321,19 +326,33 @@ class SQLiteDriver(BaseStorage):
         limit: int = 100,
         min_pressure: float = 0.0,
         drawer: Optional[str] = None,
+        cursor_id: Optional[str] = None,
+        include_deleted: bool = False,
     ) -> List[SignatureRecord]:
-        query = (
-            "SELECT * FROM pdm_signatures WHERE user = ? AND p_magnitude >= ?"
-        )
+        where = ["user = ?", "p_magnitude >= ?"]
         params: list = [user, min_pressure]
+        if not include_deleted:
+            where.append("is_deleted = 0")
         if drawer:
-            query += " AND drawer_domain = ?"
+            where.append("drawer_domain = ?")
             params.append(drawer)
-        query += " ORDER BY p_magnitude DESC LIMIT ?"
-        params.append(limit)
+        if cursor_id:
+            cursor = self._conn().execute(
+                "SELECT p_magnitude FROM pdm_signatures WHERE id = ? AND user = ?",
+                (cursor_id, user),
+            ).fetchone()
+            if cursor is not None:
+                where.append("(p_magnitude < ? OR (p_magnitude = ? AND id < ?))")
+                p_cursor = float(cursor["p_magnitude"])
+                params.extend([p_cursor, p_cursor, cursor_id])
 
+        query = (
+            f"SELECT * FROM pdm_signatures WHERE {' AND '.join(where)} "
+            "ORDER BY p_magnitude DESC, id DESC LIMIT ?"
+        )
+        params.append(limit)
         rows = self._conn().execute(query, params).fetchall()
-        return [self._row_to_record(r) for r in rows]
+        return [mapping_to_record(r) for r in rows]
 
     def list_drawers(self, user: str = "default") -> List[DrawerInfo]:
         rows = self._conn().execute(
@@ -345,7 +364,7 @@ class SQLiteDriver(BaseStorage):
                 AVG(s.p_magnitude) AS avg_pressure
             FROM pdm_drawers d
             LEFT JOIN pdm_signatures s
-                ON s.drawer_domain = d.domain AND s.user = d.user
+                ON s.drawer_domain = d.domain AND s.user = d.user AND s.is_deleted = 0
             WHERE d.user = ?
             GROUP BY d.domain, d.description
             ORDER BY d.domain
@@ -364,36 +383,7 @@ class SQLiteDriver(BaseStorage):
 
     def count(self, user: str = "default") -> int:
         row = self._conn().execute(
-            "SELECT COUNT(*) FROM pdm_signatures WHERE user = ?", (user,)
+            "SELECT COUNT(*) FROM pdm_signatures WHERE user = ? AND is_deleted = 0",
+            (user,),
         ).fetchone()
         return row[0] if row else 0
-
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _row_to_record(row: sqlite3.Row) -> SignatureRecord:
-        return SignatureRecord(
-            id=row["id"],
-            user=row["user"],
-            compressed_fact=row["compressed_fact"],
-            source=row["source"],
-            p_magnitude=row["p_magnitude"],
-            t_persistence=row["t_persistence"],
-            phase_privilege=row["phase_privilege"],
-            effective_spike=row["effective_spike"],
-            intent_tags=json.loads(row["intent_tags"] or "[]"),
-            question_regime=row["question_regime"],
-            domain=row["domain"],
-            drawer_domain=row["drawer_domain"],
-            retrieval_count=row["retrieval_count"],
-            last_retrieved=_parse_dt(row["last_retrieved"]),
-            created_at=_parse_dt(row["created_at"]),
-            validation_prediction_total=row["validation_prediction_total"],
-            validation_prediction_correct=row["validation_prediction_correct"],
-            decay_rate=row["decay_rate"],
-            t_deadline=_parse_dt(row["t_deadline"]),
-            urgency_rate=row["urgency_rate"],
-            metadata=json.loads(row["metadata"] or "{}"),
-        )

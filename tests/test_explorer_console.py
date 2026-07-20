@@ -57,6 +57,16 @@ class TestExplorerConsoleAPI:
         assert body["count"] >= 1
         assert any("orion" in h["text"].lower() for h in body["hits"])
 
+    def test_search_cost_finds_low_pressure_memory(self, client: TestClient) -> None:
+        tight = client.get("/api/v1/search", params={"q": "dark mode", "search_cost": 0.65})
+        assert tight.status_code == 200
+        assert tight.json()["count"] == 0
+
+        loose = client.get("/api/v1/search", params={"q": "dark mode", "search_cost": 0.9})
+        assert loose.status_code == 200
+        assert loose.json()["count"] >= 1
+        assert loose.json()["search_cost"] == pytest.approx(0.9)
+
     def test_reinforce_memory(self, client: TestClient) -> None:
         with Memory(store=str(client.app.state.store), user="default") as mem:
             mid = mem._storage.list(user="default", limit=1)[0].id

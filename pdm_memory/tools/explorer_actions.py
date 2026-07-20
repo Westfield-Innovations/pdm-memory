@@ -157,7 +157,7 @@ def generate_reconciliation(
     Produce reconciled fact text.
 
     Returns:
-        (reconciled_text, method) where method is ``ai`` or ``heuristic``.
+        (reconciled_text, method) where method is ``ollama`` or ``heuristic``.
     """
     if use_ai:
         ai_text = _try_ollama_reconcile(
@@ -167,7 +167,7 @@ def generate_reconciliation(
             conflict_kind=conflict_kind,
         )
         if ai_text:
-            return ai_text, "ai"
+            return ai_text, "ollama"
     text = _heuristic_reconcile(
         fact_a,
         fact_b,

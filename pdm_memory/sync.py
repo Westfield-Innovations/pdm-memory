@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from pdm_memory.storage.base import BaseStorage
 from pdm_memory.storage.errors import CloudStorageError
 
 logger = logging.getLogger(__name__)
@@ -50,17 +51,17 @@ class SyncReport:
 
 class MemorySync:
     """
-    Bidirectional sync between a local SQLiteDriver and a CloudDriver.
+    Bidirectional sync between a local BaseStorage and CloudDriver.
 
     Conflict resolution: signature with higher p_magnitude wins.
     If equal, the more recently created one wins.
     """
 
-    def __init__(self, local, cloud) -> None:
+    def __init__(self, local: BaseStorage, cloud: BaseStorage) -> None:
         """
         Args:
-            local: SQLiteDriver instance
-            cloud: CloudDriver instance
+            local: Local storage backend (SQLite, PostgreSQL, …).
+            cloud: CloudDriver instance.
         """
         self._local = local
         self._cloud = cloud

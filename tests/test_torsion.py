@@ -91,6 +91,51 @@ class TestDetectTorsionEngine:
         assert "['3'" not in reports[0].explanation
         assert ", 3" not in reports[0].explanation.split("vs")[0]
 
+    def test_polarity_dont_typo(self) -> None:
+        """Users type 'dont' without apostrophe — must still flag polarity."""
+        engine = RetrievalEngine()
+        a = SignatureRecord(
+            id="p1",
+            compressed_fact="I love football",
+            intent_tags=["football", "prefs", "sports"],
+            drawer_domain="prefs",
+            domain="preference",
+            p_magnitude=60.0,
+        )
+        b = SignatureRecord(
+            id="p2",
+            compressed_fact="I dont love football",
+            intent_tags=["football", "prefs", "sports"],
+            drawer_domain="prefs",
+            domain="preference",
+            p_magnitude=60.0,
+        )
+        reports = engine.detect_torsion([a, b], threshold=0.5)
+        assert len(reports) == 1
+        assert reports[0].conflict_kind == "polarity"
+
+    def test_polarity_dont_with_apostrophe(self) -> None:
+        engine = RetrievalEngine()
+        a = SignatureRecord(
+            id="p3",
+            compressed_fact="I love football",
+            intent_tags=["football", "prefs"],
+            drawer_domain="prefs",
+            domain="preference",
+            p_magnitude=55.0,
+        )
+        b = SignatureRecord(
+            id="p4",
+            compressed_fact="I don't love football",
+            intent_tags=["football", "prefs"],
+            drawer_domain="prefs",
+            domain="preference",
+            p_magnitude=55.0,
+        )
+        reports = engine.detect_torsion([a, b], threshold=0.5)
+        assert len(reports) == 1
+        assert reports[0].conflict_kind == "polarity"
+
 
 class TestDetectTorsionMemory:
     def test_memory_api_and_v_penalty(self, tmp_path) -> None:

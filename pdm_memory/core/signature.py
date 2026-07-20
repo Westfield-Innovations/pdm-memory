@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 
@@ -69,9 +69,13 @@ class SignatureRecord:
     # Extra metadata
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    # Storage / lifecycle (Tier 3)
+    is_deleted: bool = False
+    idempotency_key: Optional[str] = None
+
     def __post_init__(self) -> None:
         if self.created_at is None:
-            self.created_at = datetime.utcnow()
+            self.created_at = datetime.now(tz=timezone.utc)
         if self.effective_spike is None:
             from pdm_memory.core.math import calculate_effective_spike
             self.effective_spike = calculate_effective_spike(
