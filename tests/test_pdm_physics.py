@@ -7,7 +7,6 @@ Version 2.0 gate: these invariants MUST hold regardless of storage backend quirk
 from __future__ import annotations
 
 import random
-import string
 from datetime import datetime, timedelta, timezone
 
 import pytest
