@@ -4,6 +4,7 @@
 [![Python](https://img.shields.io/pypi/pyversions/pdm-memory)](https://pypi.org/project/pdm-memory/)
 [![CI](https://github.com/westfield-innovations/pdm-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/westfield-innovations/pdm-memory/actions)
 [![License: Proprietary](https://img.shields.io/badge/License-Proprietary%20ELv2-blue)](LICENSE)
+[![Documentation](https://img.shields.io/badge/Docs-azus.ai%2Fsupport-blue)](https://azus.ai/support)
 
 Your LLM forgets everything between conversations. The standard fix — stuff a vector database into the context window — is expensive, slow, and retrieves **what matches words, not what matters**.
 
@@ -13,12 +14,15 @@ Your LLM forgets everything between conversations. The standard fix — stuff a 
 - 🗄️ **Your storage.** One local file. Your data never leaves your machine. Check the source — there's no phone-home in it.
 - ⚡ **Ten minutes.** `pip install pdm-memory` → three lines → persistent memory.
 
+📖 **Documentation:** [azus.ai/support](https://azus.ai/support)
+
 **Benchmarks vs standard RAG:** [link] · Run yourself: `python -m pdm_memory.bench`
 
 ---
 
 ## Table of Contents
 
+0. [Documentation](https://azus.ai/support)
 1. [Privacy Mode](#-privacy-mode-local-sqlite)
 2. [Ecosystem Mode](#-ecosystem-mode-azus-cloud)
 3. [LLM Adapters](#-llm-adapters)

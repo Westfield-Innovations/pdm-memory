@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pdm-memory"
-version = "0.1.9"
+version = "0.2.0"
 description = "Pressure-Driven Memory (PDM) — persistent, resonance-based memory for AI apps."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -60,8 +60,8 @@ pdm-cli = "pdm_memory.tools.cli:main"
 
 [project.urls]
 Homepage = "https://azus.ai"
-Documentation = "https://azus.ai"
-"Bug Tracker" = "https://github.com/westfield-innovations/pdm-memory/issues"
+Documentation = "https://azus.ai/support"
+"Bug Tracker" = "https://azus.ai/support?tab=bugs"
 Source = "https://github.com/westfield-innovations/pdm-memory"
 Repository = "https://github.com/westfield-innovations/pdm-memory"
 

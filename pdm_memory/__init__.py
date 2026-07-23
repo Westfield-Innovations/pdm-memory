@@ -24,7 +24,7 @@ from pdm_memory.core.signature import MemoryHit, DrawerInfo
 from pdm_memory.models import AlignmentReport, SurfaceReport, TorsionReport
 from pdm_memory.storage.factory import create_storage, register_storage
 
-__version__ = "0.1.9"
+__version__ = "0.2.0"
 __all__ = [
     "Memory",
     "MemoryHit",
