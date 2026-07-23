@@ -33,6 +33,26 @@ class TestMemorySaveRecall:
         # The coding memory should rank higher
         assert any("Python" in t for t in texts)
 
+    def test_recall_filters_unrelated_high_pressure(self, mem):
+        mem.save(
+            "User wants answers in Ukrainian, short and direct",
+            tags=["language", "prefs", "style"],
+            p_magnitude=72,
+        )
+        mem.save(
+            "Launch date for Orion is 2026-08-01",
+            tags=["orion", "launch", "date", "product"],
+            p_magnitude=85,
+        )
+        hits = mem.recall(
+            "what language should I use?",
+            k=3,
+            reinforce=False,
+            search_cost=0.65,
+        )
+        assert hits
+        assert not any("orion" in h.text.lower() for h in hits)
+
     def test_recall_empty_db(self, mem):
         hits = mem.recall("anything", k=5)
         assert hits == []
@@ -47,11 +67,45 @@ class TestMemorySaveRecall:
         with pytest.raises(ValueError):
             mem.save("")
 
+    def test_save_dedupe_returns_existing_id(self, mem):
+        first = mem.save("Duplicate fact", tags=["a", "b", "c"], p_magnitude=50)
+        second = mem.save("Duplicate fact", tags=["x", "y", "z"], p_magnitude=90)
+        assert second == first
+        assert mem.count() == 1
+
+    def test_save_dedupe_reinforce(self, mem):
+        mid = mem.save("Repeat me", tags=["a", "b", "c"], p_magnitude=50)
+        before = mem._storage.get(mid, user="test_user").p_magnitude
+        mem.save("Repeat me", tags=["a", "b", "c"], dedupe_reinforce=True)
+        after = mem._storage.get(mid, user="test_user").p_magnitude
+        assert after > before
+
+    def test_save_dedupe_disabled(self, mem):
+        mem.save("Same text", tags=["a", "b", "c"], dedupe=False)
+        mem.save("Same text", tags=["d", "e", "f"], dedupe=False)
+        assert mem.count() == 2
+
     def test_count(self, mem):
         assert mem.count() == 0
         mem.save("first", tags=["a", "b", "c"])
         mem.save("second", tags=["d", "e", "f"])
         assert mem.count() == 2
+
+
+class TestMemoryFromEnv:
+    def test_from_env_sqlite(self, tmp_path, monkeypatch):
+        db = str(tmp_path / "env.db")
+        monkeypatch.setenv("PDM_STORE", db)
+        monkeypatch.setenv("PDM_USER", "env_user")
+        with Memory.from_env() as mem:
+            mem.save("env fact", tags=["env", "test", "unit"])
+            assert mem.count() == 1
+            assert mem._user == "env_user"
+
+    def test_from_env_missing_store(self, monkeypatch):
+        monkeypatch.delenv("PDM_STORE", raising=False)
+        with pytest.raises(ValueError, match="PDM_STORE"):
+            Memory.from_env()
 
 
 class TestMemoryReinforce:
@@ -62,9 +116,9 @@ class TestMemoryReinforce:
         updated = mem._storage.get(mid, user="test_user")
         assert updated.p_magnitude > original.p_magnitude
 
-    def test_reinforce_missing_id(self, mem, caplog):
-        # Should not raise — just log a warning
-        mem.reinforce("nonexistent-id-1234-5678-90ab")
+    def test_reinforce_missing_id(self, mem):
+        with pytest.raises(ValueError, match="not found"):
+            mem.reinforce("nonexistent-id-1234-5678-90ab")
 
 
 class TestMemoryDecay:
@@ -142,6 +196,50 @@ class TestMemoryContextManager:
         # After close, file should still exist
         import os
         assert os.path.exists(db)
+
+
+class TestMemoryGetUpdate:
+    def test_get_returns_hit(self, mem):
+        mid = mem.save("User prefers metric units", tags=["units", "prefs"], p_magnitude=70)
+        hit = mem.get(mid)
+        assert hit is not None
+        assert hit.id == mid
+        assert hit.text == "User prefers metric units"
+        assert hit.p_raw == pytest.approx(70.0)
+        assert hit.pressure > 0
+
+    def test_get_missing_returns_none(self, mem):
+        assert mem.get("00000000-0000-0000-0000-000000000000") is None
+
+    def test_update_text_and_tags(self, mem):
+        mid = mem.save("Old fact", tags=["old", "a", "b"], p_magnitude=50)
+        hit = mem.update(mid, text="New fact", tags=["new", "c", "d"])
+        assert hit.text == "New fact"
+        assert hit.intent_tags == ["new", "c", "d"]
+        stored = mem._storage.get(mid, user="test_user")
+        assert stored.compressed_fact == "New fact"
+
+    def test_update_pressure_recalculates_spike(self, mem):
+        mid = mem.save("Fact", tags=["a", "b", "c"], p_magnitude=40, t_persistence=30)
+        mem.update(mid, p_magnitude=90)
+        stored = mem._storage.get(mid, user="test_user")
+        assert stored.p_magnitude == pytest.approx(90.0)
+        assert stored.effective_spike is not None
+        assert stored.effective_spike > 0
+
+    def test_update_missing_raises(self, mem):
+        with pytest.raises(ValueError, match="not found"):
+            mem.update("00000000-0000-0000-0000-000000000000", text="nope")
+
+    def test_update_empty_fields_raises(self, mem):
+        mid = mem.save("Fact", tags=["a", "b", "c"])
+        with pytest.raises(ValueError, match="At least one field"):
+            mem.update(mid)
+
+    def test_update_empty_text_raises(self, mem):
+        mid = mem.save("Fact", tags=["a", "b", "c"])
+        with pytest.raises(ValueError, match="cannot be empty"):
+            mem.update(mid, text="   ")
 
 
 class TestMemoryIngest:

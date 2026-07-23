@@ -21,7 +21,18 @@ See README.md for full documentation.
 
 from pdm_memory.memory import Memory
 from pdm_memory.core.signature import MemoryHit, DrawerInfo
-from pdm_memory.models import AlignmentReport, TorsionReport
+from pdm_memory.models import AlignmentReport, SurfaceReport, TorsionReport
+from pdm_memory.storage.factory import create_storage, register_storage
 
 __version__ = "0.1.9"
-__all__ = ["Memory", "MemoryHit", "DrawerInfo", "AlignmentReport", "TorsionReport", "__version__"]
+__all__ = [
+    "Memory",
+    "MemoryHit",
+    "DrawerInfo",
+    "AlignmentReport",
+    "SurfaceReport",
+    "TorsionReport",
+    "create_storage",
+    "register_storage",
+    "__version__",
+]

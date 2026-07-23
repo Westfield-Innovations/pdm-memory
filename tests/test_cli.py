@@ -93,6 +93,31 @@ class TestCLIDrawers:
         assert "science" in output
 
 
+class TestCLISearch:
+    def test_search_finds_hits(self, tmp_path):
+        db = str(tmp_path / "search.db")
+        from pdm_memory import Memory
+
+        with Memory(store=db, user="default") as mem:
+            mem.save(
+                "User prefers dark mode in the dashboard",
+                tags=["ui", "theme", "prefs"],
+                p_magnitude=62,
+            )
+
+        output, code = run_cli(
+            ["--store", db, "search", "dark mode", "--search-cost", "0.65"]
+        )
+        assert code == 0
+        assert "dark mode" in output.lower()
+
+    def test_search_empty(self, tmp_path):
+        db = str(tmp_path / "search_empty.db")
+        output, code = run_cli(["--store", db, "search", "nothing here"])
+        assert code == 0
+        assert "No matching memories" in output
+
+
 class TestCLIExplain:
     def test_explain(self, tmp_path):
         db = str(tmp_path / "explain_test.db")

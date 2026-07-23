@@ -94,16 +94,24 @@ def _build_resonance_links(
     ]
 
 
-def _node_payload(mem: Memory, memory_id: str, now: datetime) -> dict[str, Any]:
+def _node_payload(
+    mem: Memory,
+    memory_id: str,
+    now: datetime,
+    *,
+    compute_torsion: bool = True,
+) -> dict[str, Any]:
     rec = mem._storage.get(memory_id, user=mem._user)
     if rec is None:
         raise HTTPException(status_code=404, detail="Memory not found")
-    torsion_ids: set[str] = set()
-    for report in mem.detect_torsion(threshold=0.7):
-        torsion_ids.add(report.signature_a_id)
-        torsion_ids.add(report.signature_b_id)
-    status = "torsion" if rec.id in torsion_ids else "clear"
-    return record_to_node(rec, now, torsion_status=status)
+    torsion_status = "clear"
+    if compute_torsion:
+        torsion_ids: set[str] = set()
+        for report in mem.detect_torsion(threshold=0.7):
+            torsion_ids.add(report.signature_a_id)
+            torsion_ids.add(report.signature_b_id)
+        torsion_status = "torsion" if rec.id in torsion_ids else "clear"
+    return record_to_node(rec, now, torsion_status=torsion_status)
 
 
 def create_app(
@@ -205,13 +213,15 @@ def create_app(
     def search(
         q: str = Query(..., min_length=1, max_length=500),
         k: int = Query(default=25, ge=1, le=100),
+        search_cost: float = Query(default=0.65, ge=0.0, le=1.0),
     ) -> dict[str, Any]:
         """Semantic recall search — returns matching signature IDs (no reinforce)."""
         with Memory(store=app.state.store, user=app.state.user) as mem:
-            hits = mem.recall(q, k=k, reinforce=False, search_cost=0.65)
+            hits = mem.recall(q, k=k, reinforce=False, search_cost=search_cost)
 
         return {
             "query": q,
+            "search_cost": search_cost,
             "count": len(hits),
             "hits": [
                 {
@@ -234,7 +244,7 @@ def create_app(
                 raise HTTPException(status_code=404, detail="Memory not found")
             mem.reinforce(memory_id, coupling_score=body.coupling_score)
             now = datetime.now(tz=timezone.utc)
-            node = _node_payload(mem, memory_id, now)
+            node = _node_payload(mem, memory_id, now, compute_torsion=False)
         return {
             "ok": True,
             "id": memory_id,
@@ -303,8 +313,19 @@ def create_app(
         }
 
     @app.get("/api/v1/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok", "store": app.state.store, "user": app.state.user}
+    def health() -> dict[str, Any]:
+        storage_ok = False
+        try:
+            with Memory(store=app.state.store, user=app.state.user) as mem:
+                storage_ok = mem._storage.ping()
+        except Exception as exc:
+            logger.warning("[PDM Explorer] health storage check failed: %s", exc)
+        return {
+            "status": "ok",
+            "store": app.state.store,
+            "user": app.state.user,
+            "storage_ok": storage_ok,
+        }
 
     return app
 

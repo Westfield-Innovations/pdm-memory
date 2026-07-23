@@ -86,3 +86,43 @@ class AlignmentReport:
     def is_safe_to_act(self) -> bool:
         """True only when a guarded agent may proceed with ACT."""
         return self.status == "ALIGNED"
+
+
+@dataclass(slots=True)
+class MemoryListPage:
+    """Keyset-paginated list of memories."""
+
+    items: List[Any]
+    next_cursor_id: Optional[str] = None
+
+
+@dataclass(slots=True)
+class SurfaceReport:
+    """
+    Lite agent-loop snapshot: recall + torsion scan + alignment gate for one query.
+    """
+
+    hits: List[Any]
+    torsion_count: int
+    alignment: str
+    alignment_score: float = 0.0
+    torsion_reports: List[TorsionReport] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "hits": [
+                {
+                    "id": h.id,
+                    "text": h.text,
+                    "pressure": round(float(h.pressure), 2),
+                    "p_raw": round(float(h.p_raw), 2),
+                    "drawer": h.drawer,
+                    "coupling_score": round(float(h.coupling_score), 4),
+                    "tags": list(h.intent_tags),
+                }
+                for h in self.hits
+            ],
+            "torsion_count": self.torsion_count,
+            "alignment": self.alignment,
+            "alignment_score": round(float(self.alignment_score), 4),
+        }

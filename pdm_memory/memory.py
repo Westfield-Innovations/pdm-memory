@@ -33,8 +33,11 @@ Wrapper (zero-config LLM integration):
 from __future__ import annotations
 
 import logging
+import os
+from contextlib import nullcontext
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, ContextManager, Dict, List, Optional, Union
+from pathlib import Path
 
 from pdm_memory.core.math import (
     DECAY_DELETE_THRESHOLD,
@@ -53,8 +56,9 @@ from pdm_memory.core.signature import (
     MemoryHit,
     SignatureRecord,
 )
-from pdm_memory.models import AlignmentReport, TorsionReport
+from pdm_memory.models import AlignmentReport, MemoryListPage, SurfaceReport, TorsionReport
 from pdm_memory.storage.base import BaseStorage
+from pdm_memory.types import RecallHook, TorsionJudge
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +68,8 @@ class Memory:
     PDM Memory — persistent, pressure-driven memory for AI applications.
 
     Args:
-        store:       Path to a local SQLite .db file, or "cloud" for cloud mode.
+        store:       SQLite path/URL, PostgreSQL DSN, ``"cloud"``, or a custom URL
+                     registered via :func:`pdm_memory.storage.register_storage`.
         user:        User identifier to scope all memories (default "default").
         token:       JWT access token (required when store="cloud").
         refresh_token: JWT refresh token for automatic renewal (cloud only).
@@ -72,6 +77,8 @@ class Memory:
         store_raw:   If False, only SHA-256 hashes of text are stored locally.
                      True by default for usability; set False for maximum privacy.
         engine:      Custom RetrievalEngine instance (override for testing).
+        storage:     Pre-built :class:`BaseStorage` instance (bypasses ``store`` URL).
+        torsion_judge: Optional callback to flag torsion pairs rules-only detection misses.
     """
 
     def __init__(
@@ -83,14 +90,59 @@ class Memory:
         cloud_url: str = "https://api.azus.ai",
         store_raw: bool = True,
         engine: Optional[RetrievalEngine] = None,
+        storage: Optional[BaseStorage] = None,
+        torsion_judge: Optional[TorsionJudge] = None,
     ) -> None:
         self._user = user
         self._engine = engine or RetrievalEngine()
+        self._torsion_judge = torsion_judge
         self._cloud_driver: Optional[Any] = None   # lazy init
-        self._storage: BaseStorage = self._init_storage(
-            store, token, refresh_token, cloud_url, store_raw
-        )
+        if storage is not None:
+            if not isinstance(storage, BaseStorage):
+                raise TypeError(
+                    f"storage must be a BaseStorage instance, got {type(storage).__name__}"
+                )
+            self._storage = storage
+        else:
+            self._storage = self._init_storage(
+                store, token, refresh_token, cloud_url, store_raw
+            )
         logger.debug("[PDM] Memory initialised | user=%s store=%s", user, store)
+
+    @classmethod
+    def from_env(cls, *, prefix: str = "PDM", **kwargs: Any) -> "Memory":
+        """
+        Construct Memory from environment variables (fail fast if missing).
+
+        Reads:
+            ``{prefix}_STORE`` (required)
+            ``{prefix}_USER`` (default: ``default``)
+            ``{prefix}_TOKEN`` (required when store is ``cloud``)
+            ``{prefix}_REFRESH_TOKEN`` (optional)
+            ``{prefix}_CLOUD_URL`` (default: ``https://api.azus.ai``)
+
+        Example:
+            export PDM_STORE=postgresql://localhost/pdm
+            export PDM_USER=alice
+            mem = Memory.from_env()
+        """
+        store = os.environ.get(f"{prefix}_STORE")
+        if not store:
+            raise ValueError(
+                f"{prefix}_STORE environment variable is required for Memory.from_env()"
+            )
+        user = os.environ.get(f"{prefix}_USER", "default")
+        token = os.environ.get(f"{prefix}_TOKEN")
+        refresh_token = os.environ.get(f"{prefix}_REFRESH_TOKEN")
+        cloud_url = os.environ.get(f"{prefix}_CLOUD_URL", "https://api.azus.ai")
+        return cls(
+            store=store,
+            user=user,
+            token=token,
+            refresh_token=refresh_token,
+            cloud_url=cloud_url,
+            **kwargs,
+        )
 
     # ------------------------------------------------------------------
     # Core API
@@ -108,6 +160,10 @@ class Memory:
         phase_privilege: float = 1.0,
         deadline: Optional[datetime] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        *,
+        dedupe: bool = True,
+        dedupe_reinforce: bool = False,
+        idempotency_key: Optional[str] = None,
     ) -> str:
         """
         Store a new memory.
@@ -126,21 +182,43 @@ class Memory:
             phase_privilege: Nesting multiplier (usually 1.0).
             deadline:       Optional datetime for time-sensitive memories (PDM-T).
             metadata:       Arbitrary extra data attached to the memory.
+            dedupe:         If True, return existing ID when fact hash already stored.
+            dedupe_reinforce: When dedupe hits, call reinforce() on the existing memory.
+            idempotency_key:  If set, repeated saves with the same key return the existing ID.
 
         Returns:
-            The new memory ID (UUID string).
+            The new memory ID (UUID string), or existing ID if dedupe matched.
         """
         if not text or not text.strip():
             raise ValueError("Memory text cannot be empty.")
 
-        text = text[:500]  # Enforce 500-char limit
+        text = text.strip()[:500]
+
+        if idempotency_key:
+            key = idempotency_key.strip()
+            if key:
+                existing = self._storage.find_by_idempotency_key(key, user=self._user)
+                if existing is not None:
+                    logger.debug("[PDM] save() idempotency → %s", existing.id[:8])
+                    return existing.id
+
+        if dedupe:
+            from pdm_memory.storage.schema import hash_fact_text
+
+            existing = self._storage.find_by_hash(hash_fact_text(text), user=self._user)
+            if existing is not None:
+                if dedupe_reinforce:
+                    self.reinforce(existing.id)
+                logger.debug("[PDM] save() dedupe → %s", existing.id[:8])
+                return existing.id
+
         resolved_tags = tags or []
         domain = infer_domain(resolved_tags)
         eff_spike = calculate_effective_spike(p_magnitude, t_persistence, phase_privilege)
 
         sig = SignatureRecord(
             user=self._user,
-            compressed_fact=text.strip(),
+            compressed_fact=text,
             source=source,
             p_magnitude=p_magnitude,
             t_persistence=t_persistence,
@@ -153,10 +231,204 @@ class Memory:
             decay_rate=0.9,
             t_deadline=deadline,
             metadata=metadata or {},
+            idempotency_key=idempotency_key.strip() if idempotency_key else None,
         )
         memory_id = self._storage.save(sig)
         logger.debug("[PDM] save() → %s (P=%.1f)", memory_id, p_magnitude)
         return memory_id
+
+    def save_many(
+        self,
+        items: List[Dict[str, Any]],
+        *,
+        dedupe: bool = True,
+        dedupe_reinforce: bool = False,
+    ) -> Dict[str, int]:
+        """
+        Batch-save multiple memories in one storage transaction when supported.
+
+        Each item accepts the same keys as :meth:`save` (``text``, ``tags``,
+        ``p_magnitude``, ``drawer``, ``source``, ``regime``, ``t_persistence``,
+        ``metadata``, ``deadline``).
+
+        Returns:
+            Dict with ``saved``, ``skipped``, ``errors`` counts.
+        """
+        saved = 0
+        skipped = 0
+        errors = 0
+
+        txn = getattr(self._storage, "transaction", None)
+        ctx: ContextManager[None] = txn() if callable(txn) else nullcontext()
+
+        with ctx:
+            for item in items:
+                try:
+                    text = str(item.get("text") or item.get("compressed_fact") or "").strip()
+                    if not text:
+                        errors += 1
+                        continue
+
+                    from pdm_memory.storage.schema import hash_fact_text
+
+                    if dedupe:
+                        existing = self._storage.find_by_hash(
+                            hash_fact_text(text[:500]), user=self._user
+                        )
+                        if existing is not None:
+                            if dedupe_reinforce:
+                                self.reinforce(existing.id)
+                            skipped += 1
+                            continue
+
+                    self.save(
+                        text,
+                        source=str(item.get("source") or "batch"),
+                        tags=item.get("tags") or item.get("intent_tags"),
+                        p_magnitude=float(item.get("p_magnitude", 50.0)),
+                        t_persistence=float(item.get("t_persistence", 30.0)),
+                        drawer=str(item.get("drawer") or item.get("drawer_domain") or "general"),
+                        regime=str(item.get("regime") or item.get("question_regime") or "neutral"),
+                        metadata=item.get("metadata"),
+                        dedupe=False,
+                    )
+                    saved += 1
+                except Exception:
+                    errors += 1
+
+        logger.info("[PDM] save_many saved=%d skipped=%d errors=%d", saved, skipped, errors)
+        return {"saved": saved, "skipped": skipped, "errors": errors}
+
+    def export_json(
+        self,
+        path: Union[str, Path],
+        *,
+        limit: int = 100_000,
+    ) -> int:
+        """Export all user signatures to JSON. Returns count written."""
+        from pdm_memory.io.json_transfer import export_signatures_json
+
+        count = export_signatures_json(
+            self._storage,
+            path,
+            user=self._user,
+            limit=limit,
+        )
+        logger.info("[PDM] export_json → %s (%d signatures)", path, count)
+        return count
+
+    def import_json(
+        self,
+        path: Union[str, Path],
+        *,
+        skip_duplicates: bool = True,
+    ) -> Dict[str, int]:
+        """Import signatures from JSON export. Returns saved/skipped/errors counts."""
+        from pdm_memory.io.json_transfer import import_signatures_json
+
+        counts = import_signatures_json(
+            self._storage,
+            path,
+            user=self._user,
+            skip_duplicates=skip_duplicates,
+        )
+        logger.info("[PDM] import_json ← %s %s", path, counts)
+        return counts
+
+    def get(self, memory_id: str) -> Optional[MemoryHit]:
+        """
+        Fetch a single memory by ID with live pressure metrics.
+
+        Returns:
+            MemoryHit with current P_effective, or None if not found.
+        """
+        rec = self._storage.get(memory_id, user=self._user)
+        if rec is None:
+            return None
+        return self._record_to_hit(rec)
+
+    def update(
+        self,
+        memory_id: str,
+        *,
+        text: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        p_magnitude: Optional[float] = None,
+        t_persistence: Optional[float] = None,
+        drawer: Optional[str] = None,
+        regime: Optional[str] = None,
+        source: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> MemoryHit:
+        """
+        Update whitelisted fields on an existing memory.
+
+        Args:
+            memory_id:   Target signature UUID.
+            text:        New fact text (max 500 chars).
+            tags:        Replacement intent tags (recomputes domain).
+            p_magnitude: New stored pressure (0–100).
+            t_persistence: New persistence half-life in days.
+            drawer:      New drawer / category name.
+            regime:      New question regime.
+            source:      New source label.
+            metadata:    Shallow-merged into existing metadata dict.
+
+        Returns:
+            Updated MemoryHit with live P_effective.
+
+        Raises:
+            ValueError: Memory not found or no fields to update.
+        """
+        rec = self._storage.get(memory_id, user=self._user)
+        if rec is None:
+            raise ValueError(f"Memory '{memory_id}' not found for user '{self._user}'")
+
+        fields: Dict[str, Any] = {}
+        if text is not None:
+            if not text.strip():
+                raise ValueError("Memory text cannot be empty.")
+            from pdm_memory.storage.schema import encode_compressed_fact
+
+            trimmed = text.strip()[:500]
+            store_raw = getattr(self._storage, "store_raw", True)
+            stored, text_hash = encode_compressed_fact(trimmed, store_raw=store_raw)
+            fields["compressed_fact"] = stored
+            fields["compressed_fact_hash"] = text_hash
+        if tags is not None:
+            fields["intent_tags"] = tags
+            fields["domain"] = infer_domain(tags)
+        if p_magnitude is not None:
+            if not 0.0 <= p_magnitude <= 100.0:
+                raise ValueError("p_magnitude must be between 0 and 100")
+            fields["p_magnitude"] = p_magnitude
+        if t_persistence is not None:
+            fields["t_persistence"] = t_persistence
+        if drawer is not None:
+            fields["drawer_domain"] = drawer
+        if regime is not None:
+            fields["question_regime"] = regime
+        if source is not None:
+            fields["source"] = source
+        if metadata is not None:
+            fields["metadata"] = {**(rec.metadata or {}), **metadata}
+
+        if not fields:
+            raise ValueError("At least one field must be provided to update()")
+
+        new_p = fields.get("p_magnitude", rec.p_magnitude)
+        new_t = fields.get("t_persistence", rec.t_persistence)
+        if "p_magnitude" in fields or "t_persistence" in fields:
+            fields["effective_spike"] = calculate_effective_spike(
+                new_p, new_t, rec.phase_privilege
+            )
+
+        self._storage.update(memory_id, user=self._user, **fields)
+        updated = self._storage.get(memory_id, user=self._user)
+        if updated is None:
+            raise ValueError(f"Memory '{memory_id}' not found after update")
+        logger.debug("[PDM] update(%s) fields=%s", memory_id[:8], sorted(fields))
+        return self._record_to_hit(updated)
 
     def recall(
         self,
@@ -166,6 +438,10 @@ class Memory:
         search_cost: float = 0.5,
         drawer: Optional[str] = None,
         reinforce: bool = True,
+        *,
+        candidate_limit: int = 10_000,
+        page_size: int = 500,
+        on_recall: Optional[RecallHook] = None,
     ) -> List[MemoryHit]:
         """
         Retrieve the top-k most relevant memories for a query.
@@ -185,15 +461,18 @@ class Memory:
             search_cost: 0.0 = strict (high threshold), 1.0 = loose (low threshold).
             drawer:      Optional: filter by drawer name.
             reinforce:   If True, increment retrieval_count and update last_retrieved.
+            candidate_limit: Max signatures loaded from storage for ranking (default 10_000).
+            page_size:       Keyset page size when loading candidates (default 500).
+            on_recall:       Optional callback invoked for each returned hit before reinforce.
 
         Returns:
             List[MemoryHit] ranked by relevance, length ≤ k.
         """
-        records = self._storage.list(
-            user=self._user,
-            limit=500,
+        records = self._load_recall_candidates(
             min_pressure=min_pressure,
             drawer=drawer,
+            candidate_limit=candidate_limit,
+            page_size=page_size,
         )
         if not records:
             return []
@@ -205,10 +484,58 @@ class Memory:
             search_cost=search_cost,
         )
 
+        if on_recall:
+            for hit in hits:
+                on_recall(hit)
+
         if reinforce and hits:
             self._apply_reinforcement(hits)
 
         return hits
+
+    def surface(
+        self,
+        query: str,
+        k: int = 5,
+        *,
+        search_cost: float = 0.65,
+        torsion_threshold: float = 0.70,
+        min_goal_pressure: float = 60.0,
+        reinforce: bool = False,
+    ) -> SurfaceReport:
+        """
+        Lite agent loop — recall, torsion scan, and alignment gate in one call.
+
+        Args:
+            query:              Context / intent to evaluate.
+            k:                  Max recall hits.
+            search_cost:        TAS threshold looseness for recall.
+            torsion_threshold:  Minimum torsion_score to count.
+            min_goal_pressure:  Goal-anchor pressure floor for alignment.
+            reinforce:          If True, reinforce recall hits (default False).
+
+        Returns:
+            SurfaceReport with hits, torsion_count, and alignment status.
+        """
+        hits = self.recall(
+            query,
+            k=k,
+            search_cost=search_cost,
+            reinforce=reinforce,
+        )
+        torsion_reports = self.detect_torsion(threshold=torsion_threshold)
+        alignment = self.verify_alignment(
+            query,
+            min_pressure=min_goal_pressure,
+            torsion_threshold=torsion_threshold,
+        )
+        return SurfaceReport(
+            hits=hits,
+            torsion_count=len(torsion_reports),
+            alignment=alignment.status,
+            alignment_score=alignment.score,
+            torsion_reports=torsion_reports,
+        )
 
     def reinforce(self, memory_id: str, coupling_score: float = 0.5) -> None:
         """
@@ -221,10 +548,23 @@ class Memory:
             memory_id:     The memory UUID to reinforce.
             coupling_score: Coupling strength (0–1), influences Δp magnitude.
         """
+        now = datetime.now(tz=timezone.utc)
+        atomic_reinforce = getattr(self._storage, "atomic_reinforce", None)
+        if callable(atomic_reinforce):
+            atomic_reinforce(
+                memory_id,
+                self._user,
+                compute_delta=lambda p, rc: self._engine.compute_reinforcement_delta(
+                    p, rc, coupling_score
+                ),
+                last_retrieved=now,
+            )
+            logger.debug("[PDM] reinforce(%s) atomic", memory_id)
+            return
+
         rec = self._storage.get(memory_id, user=self._user)
         if rec is None:
-            logger.warning("[PDM] reinforce(%s): not found", memory_id)
-            return
+            raise ValueError(f"Memory '{memory_id}' not found for user '{self._user}'")
         delta = self._engine.compute_reinforcement_delta(
             rec.p_magnitude, rec.retrieval_count, coupling_score
         )
@@ -236,13 +576,13 @@ class Memory:
             p_magnitude=new_p,
             effective_spike=new_spike,
             retrieval_count=(rec.retrieval_count or 0) + 1,
-            last_retrieved=datetime.now(tz=timezone.utc),
+            last_retrieved=now,
         )
         logger.debug("[PDM] reinforce(%s) Δp=+%.2f → P=%.1f", memory_id, delta, new_p)
 
     def delete(self, memory_id: str) -> bool:
         """
-        Hard-delete a signature from the local store.
+        Soft-delete a signature (``is_deleted=True`` where supported).
 
         Returns:
             True if deleted, False if not found.
@@ -284,15 +624,18 @@ class Memory:
         drawer = rec_a.drawer_domain or rec_b.drawer_domain or "general"
         p_mag = min(100.0, max(rec_a.p_magnitude, rec_b.p_magnitude) + 8.0)
 
-        new_id = self.save(
-            text,
-            tags=tags,
-            drawer=drawer,
-            p_magnitude=p_mag,
-            source="reconcile",
-        )
-        self.delete(signature_a_id)
-        self.delete(signature_b_id)
+        txn = getattr(self._storage, "transaction", None)
+        ctx: ContextManager[None] = txn() if callable(txn) else nullcontext()
+        with ctx:
+            new_id = self.save(
+                text,
+                tags=tags,
+                drawer=drawer,
+                p_magnitude=p_mag,
+                source="reconcile",
+            )
+            self._storage.delete(signature_a_id, user=self._user)
+            self._storage.delete(signature_b_id, user=self._user)
         logger.info(
             "[PDM] reconcile_torsion %s+%s → %s",
             signature_a_id[:8],
@@ -384,7 +727,11 @@ class Memory:
 
             if p_eff < DECAY_DELETE_THRESHOLD:
                 if not dry_run:
-                    self._storage.delete(rec.id, user=self._user)
+                    hard_delete = getattr(self._storage, "hard_delete", None)
+                    if callable(hard_delete):
+                        hard_delete(rec.id, user=self._user)
+                    else:
+                        self._storage.delete(rec.id, user=self._user)
                 counts["deleted"] += 1
             else:
                 counts["skipped"] += 1
@@ -399,6 +746,23 @@ class Memory:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return max(0.0, (now - dt).total_seconds() / 86400.0)
+
+    def _record_to_hit(self, rec: SignatureRecord) -> MemoryHit:
+        """Build a MemoryHit with live decay / P_effective (no query coupling)."""
+        now = datetime.now(tz=timezone.utc)
+        days_since = self._days_since(rec.last_retrieved or rec.created_at, now)
+        days_since_created = self._days_since(rec.created_at, now)
+        domain = rec.domain or infer_domain(rec.intent_tags)
+        half_life = resolve_half_life(domain)
+        decay = calculate_decay_factor(
+            days_since,
+            half_life,
+            days_since_created=days_since_created,
+            t_persistence=rec.t_persistence,
+        )
+        v = calculate_v(rec.validation_prediction_correct, rec.validation_prediction_total)
+        p_eff = calculate_p_effective(rec.p_magnitude, v, decay, 1.0, 0.80)
+        return MemoryHit.from_record(rec, p_eff, decay, 1.0, v)
 
     def detect_torsion(
         self,
@@ -429,7 +793,11 @@ class Memory:
             limit=limit,
             drawer=drawer,
         )
-        reports = self._engine.detect_torsion(records, threshold=threshold)
+        reports = self._engine.detect_torsion(
+            records,
+            threshold=threshold,
+            judge=self._torsion_judge,
+        )
         if apply_v_penalty and reports:
             self._apply_torsion_v_penalty(reports)
         return reports
@@ -525,7 +893,7 @@ class Memory:
         token: Optional[str] = None,
     ) -> Any:
         """
-        Sync memories between local SQLite and the AZUS cloud.
+        Sync memories between a local storage backend and the AZUS cloud.
 
         Task 2.3.
 
@@ -538,9 +906,10 @@ class Memory:
             SyncReport with pushed, pulled, conflicts counts.
 
         Raises:
-            RuntimeError: If cloud driver is not configured.
+            RuntimeError: If cloud driver is not configured or storage is cloud-only.
         """
         from pdm_memory.sync import MemorySync
+        from pdm_memory.storage.cloud_driver import CloudDriver
 
         cloud = self._get_cloud_driver(cloud_url, token)
         if cloud is None:
@@ -549,12 +918,10 @@ class Memory:
                 "Pass token= and cloud_url= either to Memory() or to sync()."
             )
 
-        if not isinstance(self._storage, __import__(
-            "pdm_memory.storage.sqlite_driver", fromlist=["SQLiteDriver"]
-        ).SQLiteDriver):
+        if isinstance(self._storage, CloudDriver):
             raise RuntimeError(
-                "sync() requires the local storage to be a SQLiteDriver. "
-                "Currently using cloud mode — use sync() from a local Memory instance."
+                "sync() requires a local storage backend (SQLite, PostgreSQL, etc.). "
+                "Cloud-only Memory cannot sync to itself."
             )
 
         syncer = MemorySync(local=self._storage, cloud=cloud)
@@ -606,6 +973,36 @@ class Memory:
     # Introspection
     # ------------------------------------------------------------------
 
+    def list(
+        self,
+        limit: int = 50,
+        min_pressure: float = 0.0,
+        drawer: Optional[str] = None,
+        cursor_id: Optional[str] = None,
+    ) -> MemoryListPage:
+        """
+        Keyset-paginated list of memories ordered by pressure (desc).
+
+        Args:
+            limit:      Page size (default 50).
+            min_pressure: Minimum stored p_magnitude.
+            drawer:     Optional drawer filter.
+            cursor_id:  Last ID from the previous page (``next_cursor_id``).
+
+        Returns:
+            MemoryListPage with ``items`` and ``next_cursor_id`` when more pages exist.
+        """
+        records = self._storage.list(
+            user=self._user,
+            limit=limit,
+            min_pressure=min_pressure,
+            drawer=drawer,
+            cursor_id=cursor_id,
+        )
+        hits = [self._record_to_hit(rec) for rec in records]
+        next_cursor = records[-1].id if len(records) == limit else None
+        return MemoryListPage(items=hits, next_cursor_id=next_cursor)
+
     def list_drawers(self) -> List[DrawerInfo]:
         """Return all drawer categories with signature counts and avg pressure."""
         return self._storage.list_drawers(user=self._user)
@@ -628,6 +1025,40 @@ class Memory:
     # Private helpers
     # ------------------------------------------------------------------
 
+    def _load_recall_candidates(
+        self,
+        *,
+        min_pressure: float,
+        drawer: Optional[str],
+        candidate_limit: int,
+        page_size: int,
+    ) -> List[SignatureRecord]:
+        """Load recall candidates via keyset pagination instead of one bulk query."""
+        if candidate_limit <= 0:
+            return []
+
+        page_size = max(1, min(page_size, candidate_limit))
+        records: List[SignatureRecord] = []
+        cursor_id: Optional[str] = None
+
+        while len(records) < candidate_limit:
+            batch_limit = min(page_size, candidate_limit - len(records))
+            batch = self._storage.list(
+                user=self._user,
+                limit=batch_limit,
+                min_pressure=min_pressure,
+                drawer=drawer,
+                cursor_id=cursor_id,
+            )
+            if not batch:
+                break
+            records.extend(batch)
+            if len(batch) < batch_limit:
+                break
+            cursor_id = batch[-1].id
+
+        return records
+
     def _init_storage(
         self,
         store: str,
@@ -636,22 +1067,19 @@ class Memory:
         cloud_url: str,
         store_raw: bool,
     ) -> BaseStorage:
-        if store == "cloud":
-            if not token:
-                raise ValueError(
-                    "Cloud mode requires a JWT token. "
-                    "Pass token='eyJ...' to Memory()."
-                )
-            from pdm_memory.auth.jwt_handler import JWTAuth
-            from pdm_memory.storage.cloud_driver import CloudDriver
-            auth = JWTAuth(token=token, refresh_token=refresh_token)
-            driver = CloudDriver(auth=auth, base_url=cloud_url, user=self._user)
-            # Keep reference for sync()
+        from pdm_memory.storage.factory import create_storage
+
+        driver = create_storage(
+            store,
+            user=self._user,
+            token=token,
+            refresh_token=refresh_token,
+            cloud_url=cloud_url,
+            store_raw=store_raw,
+        )
+        if store.strip() == "cloud":
             self._cloud_driver = driver
-            return driver
-        else:
-            from pdm_memory.storage.sqlite_driver import SQLiteDriver
-            return SQLiteDriver(db_path=store, store_raw=store_raw)
+        return driver
 
     def _get_cloud_driver(
         self,

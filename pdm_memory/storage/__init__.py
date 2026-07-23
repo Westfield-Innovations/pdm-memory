@@ -4,6 +4,12 @@
 
 """pdm_memory.storage package."""
 from pdm_memory.storage.base import BaseStorage
+from pdm_memory.storage.factory import create_storage, register_storage
 from pdm_memory.storage.sqlite_driver import SQLiteDriver
 
-__all__ = ["BaseStorage", "SQLiteDriver"]
+__all__ = [
+    "BaseStorage",
+    "SQLiteDriver",
+    "create_storage",
+    "register_storage",
+]

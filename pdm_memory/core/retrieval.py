@@ -21,7 +21,10 @@ import math
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pdm_memory.types import TorsionJudge
 
 from pdm_memory.core.math import (
     P_MAX,
@@ -47,9 +50,46 @@ _TOPIC_GATE: float = 0.35
 _SMALL_CLUSTER: int = 48
 _NEGATION_TOKENS: frozenset[str] = frozenset(
     {
-        "not", "never", "no", "false", "isn't", "aren't", "wasn't", "weren't",
-        "cannot", "can't", "won't", "without", "none", "neither",
+        # English (incl. typo / no-apostrophe forms users actually type)
+        "not",
+        "never",
+        "no",
+        "false",
+        "without",
+        "none",
+        "neither",
+        "nor",
+        "cannot",
+        "dont",
+        "doesnt",
+        "didnt",
+        "isnt",
+        "arent",
+        "wasnt",
+        "werent",
+        "wont",
+        "cant",
+        "shouldnt",
+        "wouldnt",
+        "couldnt",
     }
+)
+# Applied before polarity checks — user text is messy
+_CONTRACTION_MAP: Tuple[Tuple[str, str], ...] = (
+    ("don't", " do not "),
+    ("doesn't", " does not "),
+    ("didn't", " did not "),
+    ("isn't", " is not "),
+    ("aren't", " are not "),
+    ("wasn't", " was not "),
+    ("weren't", " were not "),
+    ("won't", " will not "),
+    ("can't", " can not "),
+    ("shouldn't", " should not "),
+    ("wouldn't", " would not "),
+    ("couldn't", " could not "),
+    ("cannot", " can not "),
+    ("n't", " not "),
 )
 _ANTONYM_PAIRS: Tuple[Tuple[str, str], ...] = (
     ("prefer", "avoid"),
@@ -241,6 +281,9 @@ class RetrievalEngine:
             )
 
             if coupling.is_coupled:
+                if query_tags and self._semantic_query_overlap(rec, query_tags) < 0.12:
+                    damped.append(coupling)
+                    continue
                 hit = MemoryHit.from_record(
                     rec, p_eff, decay, i_weight, v,
                     coupling_score=coupling.coupling_score,
@@ -257,6 +300,37 @@ class RetrievalEngine:
         coupled.sort(key=lambda t: t[0].coupling_score * t[1].p_effective, reverse=True)
 
         return [hit for _, hit in coupled[:k]]
+
+    @staticmethod
+    def _semantic_query_overlap(rec: SignatureRecord, query_tags: Sequence[str]) -> float:
+        """
+        Tag or fact-token overlap between query and signature.
+
+        Blocks high-P memories from coupling when tags do not match and the
+        fact text shares no meaningful tokens with the query.
+        """
+        if not query_tags:
+            return 1.0
+        cue = {t.lower() for t in query_tags if t}
+        sig_tags = {t.lower() for t in (rec.intent_tags or []) if t}
+        if RetrievalEngine._tags_overlap(cue, sig_tags):
+            return 1.0
+        fact_tokens = set(RetrievalEngine._tokenize_query(rec.compressed_fact or ""))
+        if not fact_tokens:
+            return 0.0
+        if RetrievalEngine._tags_overlap(cue, fact_tokens):
+            return 1.0
+        return len(fact_tokens & cue) / max(len(fact_tokens | cue), 1)
+
+    @staticmethod
+    def _tags_overlap(cue: Set[str], tags: Set[str]) -> bool:
+        if cue & tags:
+            return True
+        for q in cue:
+            for t in tags:
+                if len(q) >= 4 and (q in t or t in q):
+                    return True
+        return False
 
     def compute_reinforcement_delta(
         self,
@@ -371,6 +445,7 @@ class RetrievalEngine:
         self,
         records: Sequence[SignatureRecord],
         threshold: float = 0.7,
+        judge: Optional["TorsionJudge"] = None,
     ) -> List[TorsionReport]:
         """
         Find Reverse Resonance pairs: high topic similarity + opposing facts/pressure.
@@ -378,6 +453,8 @@ class RetrievalEngine:
         Search space is limited to drawer/domain (or metadata ``cluster_id``) buckets.
         Within a bucket, candidates come from a tag inverted index (shared intent tags).
         Small buckets may also compare all pairs. Never runs blind global N².
+
+        Optional ``judge`` callback may flag pairs rules-only detection missed (e.g. paraphrase).
         """
         if threshold < 0.0 or threshold > 1.0:
             raise ValueError("threshold must be in [0.0, 1.0]")
@@ -392,6 +469,7 @@ class RetrievalEngine:
 
         reports: List[TorsionReport] = []
         seen_pairs: Set[Tuple[str, str]] = set()
+        reported_pairs: Set[Tuple[str, str]] = set()
 
         for cluster_key, group in clusters.items():
             if len(group) < 2:
@@ -405,9 +483,46 @@ class RetrievalEngine:
                 report = self._score_torsion_pair(a, b, cluster_key=cluster_key)
                 if report is not None and report.torsion_score >= threshold:
                     reports.append(report)
+                    reported_pairs.add(pair_key)
+
+        if judge is not None:
+            reports = self._merge_judge_reports(
+                clusters, reports, threshold, judge, reported_pairs
+            )
 
         reports.sort(key=lambda r: r.torsion_score, reverse=True)
         return reports
+
+    def _merge_judge_reports(
+        self,
+        clusters: Dict[str, List[SignatureRecord]],
+        reports: List[TorsionReport],
+        threshold: float,
+        judge: "TorsionJudge",
+        reported_pairs: Set[Tuple[str, str]],
+    ) -> List[TorsionReport]:
+        """Append judge-flagged pairs not already reported by rules-only detection."""
+        merged = list(reports)
+        seen_pairs: Set[Tuple[str, str]] = set()
+        for group in clusters.values():
+            if len(group) < 2:
+                continue
+            for a, b in self._torsion_candidate_pairs(group):
+                pair_key = (a.id, b.id) if a.id < b.id else (b.id, a.id)
+                if pair_key in seen_pairs or pair_key in reported_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+                try:
+                    judged = judge(a, b)
+                except Exception as exc:
+                    logger.warning("[PDM] torsion_judge failed for pair: %s", exc)
+                    continue
+                if judged is None or judged.torsion_score < threshold:
+                    continue
+                reported_pairs.add(pair_key)
+                merged.append(judged)
+        merged.sort(key=lambda r: r.torsion_score, reverse=True)
+        return merged
 
     def _torsion_candidate_pairs(
         self,
@@ -550,8 +665,10 @@ class RetrievalEngine:
                 best_kind, best_strength, best_detail = "factual", strength, detail
 
         # Negation / antonym polarity on shared content
-        tok_a = set(self._tokenize_query(a.compressed_fact or ""))
-        tok_b = set(self._tokenize_query(b.compressed_fact or ""))
+        norm_a = self._normalize_polarity_text(a.compressed_fact or "")
+        norm_b = self._normalize_polarity_text(b.compressed_fact or "")
+        tok_a = set(self._tokenize_query(norm_a))
+        tok_b = set(self._tokenize_query(norm_b))
         content_a = tok_a - _NEGATION_TOKENS
         content_b = tok_b - _NEGATION_TOKENS
         content_overlap = (
@@ -559,8 +676,8 @@ class RetrievalEngine:
             if content_a or content_b
             else 0.0
         )
-        neg_a = bool(_NEGATION_TOKENS & set(WORD_PATTERN.findall((a.compressed_fact or "").lower())))
-        neg_b = bool(_NEGATION_TOKENS & set(WORD_PATTERN.findall((b.compressed_fact or "").lower())))
+        neg_a = self._has_negation(norm_a)
+        neg_b = self._has_negation(norm_b)
         if neg_a != neg_b and content_overlap >= 0.28:
             strength = min(1.0, 0.45 + 0.55 * content_overlap)
             if strength > best_strength:
@@ -570,8 +687,8 @@ class RetrievalEngine:
                     "one affirms, the other negates the shared topic",
                 )
 
-        text_blob_a = f"{' '.join(a.intent_tags or [])} {(a.compressed_fact or '')}".lower()
-        text_blob_b = f"{' '.join(b.intent_tags or [])} {(b.compressed_fact or '')}".lower()
+        text_blob_a = f"{' '.join(a.intent_tags or [])} {norm_a}".lower()
+        text_blob_b = f"{' '.join(b.intent_tags or [])} {norm_b}".lower()
         for left, right in _ANTONYM_PAIRS:
             a_has_l, a_has_r = left in text_blob_a, right in text_blob_a
             b_has_l, b_has_r = left in text_blob_b, right in text_blob_b
@@ -634,6 +751,38 @@ class RetrievalEngine:
                 return f"{base}: opposing pressure vectors ({detail})."
             case _:
                 return f"{base}: reverse resonance on a shared topic."
+
+    @staticmethod
+    def _normalize_polarity_text(text: str) -> str:
+        """Expand contractions / slang so negation tokens become detectable."""
+        t = (text or "").lower()
+        for src, dst in _CONTRACTION_MAP:
+            t = t.replace(src, dst)
+        # Common no-apostrophe typos after apostrophe expansion
+        for src, dst in (
+            (" dont ", " do not "),
+            (" doesnt ", " does not "),
+            (" didnt ", " did not "),
+            (" isnt ", " is not "),
+            (" arent ", " are not "),
+            (" wasnt ", " was not "),
+            (" werent ", " were not "),
+            (" wont ", " will not "),
+            (" cant ", " can not "),
+        ):
+            t = t.replace(src, dst)
+        # Leading typo without spaces: "i dont love" already spaced by lower()
+        if t.startswith("dont "):
+            t = "do not " + t[5:]
+        return t
+
+    @staticmethod
+    def _has_negation(text: str) -> bool:
+        """True if text contains an English negation cue after normalization."""
+        norm = RetrievalEngine._normalize_polarity_text(text)
+        tokens = set(WORD_PATTERN.findall(norm))
+        # Also catch leftover no-apostrophe forms as whole tokens
+        return bool(tokens & _NEGATION_TOKENS)
 
     @staticmethod
     def _standalone_numbers(text: str) -> set[str]:

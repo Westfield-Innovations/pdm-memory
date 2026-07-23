@@ -97,9 +97,33 @@ class CloudDriver(BaseStorage):
         """
         try:
             resp = self._get(f"/api/v1/pdm/signatures/{memory_id}/")
-            return self._payload_to_record(resp.json())
+            rec = self._payload_to_record(resp.json())
+            if self._record_deleted(rec):
+                return None
+            return rec
         except CloudNotFoundError:
             return None
+
+    def find_by_idempotency_key(
+        self,
+        idempotency_key: str,
+        user: str = "default",
+    ) -> Optional[SignatureRecord]:
+        key = idempotency_key.strip()
+        if not key:
+            return None
+        for rec in self.list(user=user, limit=500):
+            if rec.idempotency_key == key:
+                return rec
+        return None
+
+    def ping(self) -> bool:
+        try:
+            self._get("/api/v1/pdm/retrieve", params={"limit": 1, "min_pressure": 0})
+            return True
+        except Exception as exc:
+            logger.warning("[PDM-Cloud] ping failed: %s", exc)
+            return False
 
     def update(self, memory_id: str, user: str = "default", **fields) -> None:
         """PATCH /api/v1/pdm/signatures/<id>/ — raises on failure."""
@@ -113,7 +137,20 @@ class CloudDriver(BaseStorage):
         self._patch(f"/api/v1/pdm/signatures/{memory_id}/", fields)
 
     def delete(self, memory_id: str, user: str = "default") -> None:
-        """DELETE /api/v1/pdm/signatures/<id>/ — raises on failure (404 = not found error)."""
+        """Soft-delete via metadata flag (Companion API has no is_deleted column yet)."""
+        rec = self.get(memory_id, user=user)
+        if rec is None:
+            raise CloudNotFoundError(
+                f"Cloud resource not found: /api/v1/pdm/signatures/{memory_id}/",
+                status_code=404,
+                path=f"/api/v1/pdm/signatures/{memory_id}/",
+            )
+        meta = dict(rec.metadata or {})
+        meta["_pdm_is_deleted"] = True
+        self.update(memory_id, user=user, metadata=meta)
+
+    def hard_delete(self, memory_id: str, user: str = "default") -> None:
+        """DELETE /api/v1/pdm/signatures/<id>/ — permanent removal."""
         import httpx
 
         self._auth.ensure_fresh()
@@ -136,15 +173,36 @@ class CloudDriver(BaseStorage):
         limit: int = 100,
         min_pressure: float = 0.0,
         drawer: Optional[str] = None,
+        cursor_id: Optional[str] = None,
+        include_deleted: bool = False,
     ) -> List[SignatureRecord]:
-        """GET /api/v1/pdm/retrieve — raises on failure (never fakes an empty store)."""
-        params: dict = {"limit": limit, "min_pressure": min_pressure}
+        """GET /api/v1/pdm/retrieve — client-side keyset when API has no cursor param."""
+        fetch_limit = limit if cursor_id is None else max(limit * 4, 200)
+        params: dict = {"limit": fetch_limit, "min_pressure": min_pressure}
         if drawer:
             params["drawer"] = drawer
         resp = self._get("/api/v1/pdm/retrieve", params=params)
         data = resp.json()
         items = data if isinstance(data, list) else data.get("results", [])
-        return [self._payload_to_record(item) for item in items]
+        records = [self._payload_to_record(item) for item in items]
+        if not include_deleted:
+            records = [rec for rec in records if not self._record_deleted(rec)]
+        records.sort(key=lambda rec: (rec.p_magnitude, rec.id))
+        records.reverse()
+
+        if cursor_id:
+            cursor = next((rec for rec in records if rec.id == cursor_id), None)
+            if cursor is None:
+                cursor = self.get(cursor_id, user=user)
+            if cursor is not None:
+                records = [
+                    rec
+                    for rec in records
+                    if rec.p_magnitude < cursor.p_magnitude
+                    or (rec.p_magnitude == cursor.p_magnitude and rec.id < cursor_id)
+                ]
+
+        return records[:limit]
 
     def list_drawers(self, user: str = "default") -> List[DrawerInfo]:
         """GET /api/v1/pdm/drawers — raises on failure."""
@@ -303,6 +361,8 @@ class CloudDriver(BaseStorage):
         on our side.
         """
         meta: dict[str, Any] = dict(sig.metadata or {})
+        if sig.idempotency_key:
+            meta["_idempotency_key"] = sig.idempotency_key
         # Preserve SDK-only fields that the public response serializer may omit
         meta["_pdm_sdk"] = {
             "client_id": sig.id,
@@ -341,6 +401,13 @@ class CloudDriver(BaseStorage):
             # Companion ingest alias some clients use
             "related_tickers": list(meta.get("related_tickers") or []),
         }
+
+    @staticmethod
+    def _record_deleted(rec: SignatureRecord) -> bool:
+        if rec.is_deleted:
+            return True
+        meta = rec.metadata or {}
+        return bool(meta.get("_pdm_is_deleted"))
 
     @classmethod
     def _payload_to_record(cls, data: dict) -> SignatureRecord:
@@ -429,6 +496,10 @@ class CloudDriver(BaseStorage):
                 if isinstance(meta, dict)
                 else {}
             ),
+            "is_deleted": bool(data.get("is_deleted"))
+            or bool(isinstance(meta, dict) and meta.get("_pdm_is_deleted")),
+            "idempotency_key": data.get("idempotency_key")
+            or (meta.get("_idempotency_key") if isinstance(meta, dict) else None),
         }
         if record_id:
             kwargs["id"] = record_id

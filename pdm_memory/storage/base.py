@@ -14,10 +14,15 @@ knows which driver is active.
 
 from __future__ import annotations
 
+import hashlib
+import logging
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from contextlib import contextmanager
+from typing import Iterator, List, Optional
 
 from pdm_memory.core.signature import DrawerInfo, SignatureRecord
+
+logger = logging.getLogger(__name__)
 
 
 class BaseStorage(ABC):
@@ -30,41 +35,17 @@ class BaseStorage(ABC):
 
     @abstractmethod
     def save(self, sig: SignatureRecord) -> str:
-        """
-        Persist a new signature.
-
-        Args:
-            sig: The SignatureRecord to store.
-
-        Returns:
-            The assigned memory ID (sig.id).
-        """
+        """Persist a new signature. Returns sig.id."""
         ...
 
     @abstractmethod
     def get(self, memory_id: str, user: str = "default") -> Optional[SignatureRecord]:
-        """
-        Retrieve a single signature by ID.
-
-        Args:
-            memory_id: The UUID string of the signature.
-            user:      Owner filter (prevents cross-user access).
-
-        Returns:
-            SignatureRecord or None if not found.
-        """
+        """Retrieve a single active (non-deleted) signature by ID."""
         ...
 
     @abstractmethod
     def update(self, memory_id: str, user: str = "default", **fields) -> None:
-        """
-        Update specific fields of an existing signature.
-
-        Args:
-            memory_id: The UUID string of the signature.
-            user:      Owner filter (required to prevent cross-user IDOR).
-            **fields:  Whitelisted field names and new values to update.
-        """
+        """Update whitelisted columns for ``memory_id`` owned by ``user``."""
         ...
 
     def update_batch(
@@ -72,26 +53,17 @@ class BaseStorage(ABC):
         updates: List[tuple[str, dict]],
         user: str = "default",
     ) -> None:
-        """
-        Update multiple signatures in a batch.
-
-        Args:
-            updates: List of ``(memory_id, fields_dict)`` pairs.
-            user:    Owner filter applied to every row.
-        """
         for memory_id, fields in updates:
             self.update(memory_id, user=user, **fields)
 
     @abstractmethod
     def delete(self, memory_id: str, user: str = "default") -> None:
-        """
-        Delete a signature by ID.
-
-        Args:
-            memory_id: The UUID string.
-            user:      Owner filter for safety.
-        """
+        """Soft-delete a signature (``is_deleted=True`` where supported)."""
         ...
+
+    def hard_delete(self, memory_id: str, user: str = "default") -> None:
+        """Permanently remove a signature. Default: same as delete()."""
+        self.delete(memory_id, user=user)
 
     @abstractmethod
     def list(
@@ -100,38 +72,63 @@ class BaseStorage(ABC):
         limit: int = 100,
         min_pressure: float = 0.0,
         drawer: Optional[str] = None,
+        cursor_id: Optional[str] = None,
+        include_deleted: bool = False,
     ) -> List[SignatureRecord]:
         """
-        List signatures for a user, optionally filtered.
+        List signatures ordered by ``p_magnitude DESC, id DESC``.
 
-        Args:
-            user:         Owner filter.
-            limit:        Maximum records to return.
-            min_pressure: Only return signatures with p_magnitude >= this.
-            drawer:       Optional drawer_domain filter.
-
-        Returns:
-            List[SignatureRecord] ordered by p_magnitude descending.
+        Keyset pagination: pass ``cursor_id`` from the last item of the previous page.
         """
         ...
 
     @abstractmethod
     def list_drawers(self, user: str = "default") -> List[DrawerInfo]:
-        """
-        List all drawers (categories) with aggregate stats.
-
-        Returns:
-            List[DrawerInfo] ordered by domain name.
-        """
+        """List all drawers with aggregate stats."""
         ...
 
     def count(self, user: str = "default") -> int:
-        """
-        Return total number of signatures for a user.
-        Default implementation via list() — backends may override for efficiency.
-        """
         return len(self.list(user=user, limit=10_000))
 
+    def find_by_hash(self, text_hash: str, user: str = "default") -> Optional[SignatureRecord]:
+        for rec in self.list(user=user, limit=10_000):
+            fact = rec.compressed_fact or ""
+            if fact.startswith("[HASH:") and fact.endswith("]"):
+                existing_hash = fact[6:-1]
+            else:
+                existing_hash = hashlib.sha256(fact.encode()).hexdigest()
+            if existing_hash == text_hash:
+                return rec
+        return None
+
+    def find_by_idempotency_key(
+        self,
+        idempotency_key: str,
+        user: str = "default",
+    ) -> Optional[SignatureRecord]:
+        key = idempotency_key.strip()
+        if not key:
+            return None
+        for rec in self.list(user=user, limit=10_000):
+            if rec.idempotency_key == key:
+                return rec
+            meta_key = (rec.metadata or {}).get("_idempotency_key")
+            if meta_key == key:
+                return rec
+        return None
+
+    def ping(self) -> bool:
+        """Lightweight storage connectivity check."""
+        try:
+            self.list(user="__pdm_ping__", limit=1)
+            return True
+        except Exception as exc:
+            logger.warning("[PDM] storage ping failed: %s", exc)
+            return False
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        yield
+
     def close(self) -> None:
-        """Optional: release any open connections. Called by Memory.close()."""
         pass
