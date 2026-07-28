@@ -32,17 +32,20 @@ Wrapper (zero-config LLM integration):
 
 from __future__ import annotations
 
+import builtins
 import logging
 import os
 from contextlib import nullcontext
 from datetime import datetime, timezone
-from typing import Any, ContextManager, Dict, List, Optional, Union
 from pathlib import Path
+from typing import Any, ContextManager
+
+from typing_extensions import Self
 
 from pdm_memory.core.math import (
     DECAY_DELETE_THRESHOLD,
-    calculate_effective_spike,
     calculate_decay_factor,
+    calculate_effective_spike,
     calculate_intent_weight,
     calculate_p_effective,
     calculate_v,
@@ -85,13 +88,13 @@ class Memory:
         self,
         store: str = "./pdm_memory.db",
         user: str = "default",
-        token: Optional[str] = None,
-        refresh_token: Optional[str] = None,
+        token: str | None = None,
+        refresh_token: str | None = None,
         cloud_url: str = "https://api.azus.ai",
         store_raw: bool = True,
-        engine: Optional[RetrievalEngine] = None,
-        storage: Optional[BaseStorage] = None,
-        torsion_judge: Optional[TorsionJudge] = None,
+        engine: RetrievalEngine | None = None,
+        storage: BaseStorage | None = None,
+        torsion_judge: TorsionJudge | None = None,
     ) -> None:
         self._user = user
         self._engine = engine or RetrievalEngine()
@@ -99,7 +102,7 @@ class Memory:
         self._token = token
         self._refresh_token = refresh_token
         self._cloud_url = cloud_url
-        self._cloud_driver: Optional[Any] = None   # lazy init
+        self._cloud_driver: Any | None = None   # lazy init
         if storage is not None:
             if not isinstance(storage, BaseStorage):
                 raise TypeError(
@@ -113,7 +116,7 @@ class Memory:
         logger.debug("[PDM] Memory initialised | user=%s store=%s", user, store)
 
     @classmethod
-    def from_env(cls, *, prefix: str = "PDM", **kwargs: Any) -> "Memory":
+    def from_env(cls, *, prefix: str = "PDM", **kwargs: Any) -> Memory:
         """
         Construct Memory from environment variables (fail fast if missing).
 
@@ -155,18 +158,18 @@ class Memory:
         self,
         text: str,
         source: str = "chat",
-        tags: Optional[List[str]] = None,
+        tags: builtins.list[str] | None = None,
         p_magnitude: float = 50.0,
         t_persistence: float = 30.0,
         drawer: str = "general",
         regime: str = "neutral",
         phase_privilege: float = 1.0,
-        deadline: Optional[datetime] = None,
-        metadata: Optional[Dict[str, Any]] = None,
+        deadline: datetime | None = None,
+        metadata: dict[str, Any] | None = None,
         *,
         dedupe: bool = True,
         dedupe_reinforce: bool = False,
-        idempotency_key: Optional[str] = None,
+        idempotency_key: str | None = None,
     ) -> str:
         """
         Store a new memory.
@@ -242,11 +245,11 @@ class Memory:
 
     def save_many(
         self,
-        items: List[Dict[str, Any]],
+        items: builtins.list[dict[str, Any]],
         *,
         dedupe: bool = True,
         dedupe_reinforce: bool = False,
-    ) -> Dict[str, int]:
+    ) -> dict[str, int]:
         """
         Batch-save multiple memories in one storage transaction when supported.
 
@@ -304,7 +307,7 @@ class Memory:
 
     def export_json(
         self,
-        path: Union[str, Path],
+        path: str | Path,
         *,
         limit: int = 100_000,
     ) -> int:
@@ -322,10 +325,10 @@ class Memory:
 
     def import_json(
         self,
-        path: Union[str, Path],
+        path: str | Path,
         *,
         skip_duplicates: bool = True,
-    ) -> Dict[str, int]:
+    ) -> dict[str, int]:
         """Import signatures from JSON export. Returns saved/skipped/errors counts."""
         from pdm_memory.io.json_transfer import import_signatures_json
 
@@ -338,7 +341,7 @@ class Memory:
         logger.info("[PDM] import_json ← %s %s", path, counts)
         return counts
 
-    def get(self, memory_id: str) -> Optional[MemoryHit]:
+    def get(self, memory_id: str) -> MemoryHit | None:
         """
         Fetch a single memory by ID with live pressure metrics.
 
@@ -354,14 +357,14 @@ class Memory:
         self,
         memory_id: str,
         *,
-        text: Optional[str] = None,
-        tags: Optional[List[str]] = None,
-        p_magnitude: Optional[float] = None,
-        t_persistence: Optional[float] = None,
-        drawer: Optional[str] = None,
-        regime: Optional[str] = None,
-        source: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
+        text: str | None = None,
+        tags: builtins.list[str] | None = None,
+        p_magnitude: float | None = None,
+        t_persistence: float | None = None,
+        drawer: str | None = None,
+        regime: str | None = None,
+        source: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> MemoryHit:
         """
         Update whitelisted fields on an existing memory.
@@ -387,7 +390,7 @@ class Memory:
         if rec is None:
             raise ValueError(f"Memory '{memory_id}' not found for user '{self._user}'")
 
-        fields: Dict[str, Any] = {}
+        fields: dict[str, Any] = {}
         if text is not None:
             if not text.strip():
                 raise ValueError("Memory text cannot be empty.")
@@ -439,13 +442,13 @@ class Memory:
         k: int = 5,
         min_pressure: float = 0.0,
         search_cost: float = 0.5,
-        drawer: Optional[str] = None,
+        drawer: str | None = None,
         reinforce: bool = True,
         *,
         candidate_limit: int = 10_000,
         page_size: int = 500,
-        on_recall: Optional[RecallHook] = None,
-    ) -> List[MemoryHit]:
+        on_recall: RecallHook | None = None,
+    ) -> builtins.list[MemoryHit]:
         """
         Retrieve the top-k most relevant memories for a query.
 
@@ -689,7 +692,7 @@ class Memory:
         )
         return report
 
-    def decay(self, dry_run: bool = False) -> Dict[str, int]:
+    def decay(self, dry_run: bool = False) -> dict[str, int]:
         """
         Purge memories whose live ``P_effective`` is below the delete threshold.
 
@@ -744,7 +747,7 @@ class Memory:
         return counts
 
     @staticmethod
-    def _days_since(dt: Optional[datetime], now: datetime) -> float:
+    def _days_since(dt: datetime | None, now: datetime) -> float:
         if dt is None:
             return 0.0
         if dt.tzinfo is None:
@@ -770,12 +773,12 @@ class Memory:
 
     def detect_torsion(
         self,
-        drawer: Optional[str] = None,
+        drawer: str | None = None,
         threshold: float = 0.7,
         *,
         apply_v_penalty: bool = False,
         limit: int = 10_000,
-    ) -> List[TorsionReport]:
+    ) -> builtins.list[TorsionReport]:
         """
         Detect Reverse Resonance — high topic similarity with opposing facts/pressure.
 
@@ -806,7 +809,7 @@ class Memory:
             self._apply_torsion_v_penalty(reports)
         return reports
 
-    def explain(self, memory_id: str, query: Optional[str] = None) -> ExplainReport:
+    def explain(self, memory_id: str, query: str | None = None) -> ExplainReport:
         """
         Return a detailed explanation of why a memory has its current pressure.
 
@@ -893,8 +896,8 @@ class Memory:
     def sync(
         self,
         direction: str = "push",
-        cloud_url: Optional[str] = None,
-        token: Optional[str] = None,
+        cloud_url: str | None = None,
+        token: str | None = None,
     ) -> Any:
         """
         Sync memories between a local storage backend and the AZUS cloud.
@@ -912,8 +915,8 @@ class Memory:
         Raises:
             RuntimeError: If cloud driver is not configured or storage is cloud-only.
         """
-        from pdm_memory.sync import MemorySync
         from pdm_memory.storage.cloud_driver import CloudDriver
+        from pdm_memory.sync import MemorySync
 
         cloud = self._get_cloud_driver(cloud_url, token)
         if cloud is None:
@@ -938,11 +941,11 @@ class Memory:
     def ingest(
         self,
         data_source: Any,
-        mapping: Optional[Dict[str, str]] = None,
-        llm_client: Optional[Any] = None,
+        mapping: dict[str, str] | None = None,
+        llm_client: Any | None = None,
         batch_size: int = 50,
-        on_progress: Optional[Any] = None,
-    ) -> Dict[str, int]:
+        on_progress: Any | None = None,
+    ) -> dict[str, int]:
         """
         Ingest legacy data into PDM memory.
 
@@ -961,8 +964,8 @@ class Memory:
         Returns:
             Dict with keys: saved, skipped, errors.
         """
-        from pdm_memory.ingest.ingester import DataIngester
         from pdm_memory.ingest.batch import BatchProcessor
+        from pdm_memory.ingest.ingester import DataIngester
 
         ingester = DataIngester(
             storage=self._storage,
@@ -981,8 +984,8 @@ class Memory:
         self,
         limit: int = 50,
         min_pressure: float = 0.0,
-        drawer: Optional[str] = None,
-        cursor_id: Optional[str] = None,
+        drawer: str | None = None,
+        cursor_id: str | None = None,
     ) -> MemoryListPage:
         """
         Keyset-paginated list of memories ordered by pressure (desc).
@@ -1007,7 +1010,7 @@ class Memory:
         next_cursor = records[-1].id if len(records) == limit else None
         return MemoryListPage(items=hits, next_cursor_id=next_cursor)
 
-    def list_drawers(self) -> List[DrawerInfo]:
+    def list_drawers(self) -> builtins.list[DrawerInfo]:
         """Return all drawer categories with signature counts and avg pressure."""
         return self._storage.list_drawers(user=self._user)
 
@@ -1019,7 +1022,7 @@ class Memory:
         """Release storage connections. Call when done with the Memory instance."""
         self._storage.close()
 
-    def __enter__(self) -> "Memory":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *args) -> None:
@@ -1033,17 +1036,17 @@ class Memory:
         self,
         *,
         min_pressure: float,
-        drawer: Optional[str],
+        drawer: str | None,
         candidate_limit: int,
         page_size: int,
-    ) -> List[SignatureRecord]:
+    ) -> builtins.list[SignatureRecord]:
         """Load recall candidates via keyset pagination instead of one bulk query."""
         if candidate_limit <= 0:
             return []
 
         page_size = max(1, min(page_size, candidate_limit))
-        records: List[SignatureRecord] = []
-        cursor_id: Optional[str] = None
+        records: list[SignatureRecord] = []
+        cursor_id: str | None = None
 
         while len(records) < candidate_limit:
             batch_limit = min(page_size, candidate_limit - len(records))
@@ -1066,8 +1069,8 @@ class Memory:
     def _init_storage(
         self,
         store: str,
-        token: Optional[str],
-        refresh_token: Optional[str],
+        token: str | None,
+        refresh_token: str | None,
         cloud_url: str,
         store_raw: bool,
     ) -> BaseStorage:
@@ -1087,9 +1090,9 @@ class Memory:
 
     def _get_cloud_driver(
         self,
-        cloud_url: Optional[str],
-        token: Optional[str],
-    ) -> Optional[Any]:
+        cloud_url: str | None,
+        token: str | None,
+    ) -> Any | None:
         if self._cloud_driver:
             return self._cloud_driver
         resolved_url = cloud_url or self._cloud_url
@@ -1107,14 +1110,14 @@ class Memory:
             return CloudDriver(auth=auth, base_url=resolved_url, user=self._user)
         return None
 
-    def _apply_torsion_v_penalty(self, reports: List[TorsionReport]) -> None:
+    def _apply_torsion_v_penalty(self, reports: builtins.list[TorsionReport]) -> None:
         """Record a validation miss on each signature involved in high torsion."""
         affected: set[str] = set()
         for report in reports:
             affected.add(report.signature_a_id)
             affected.add(report.signature_b_id)
 
-        batch_updates: List[tuple[str, dict]] = []
+        batch_updates: list[tuple[str, dict]] = []
         for sig_id in affected:
             rec = self._storage.get(sig_id, user=self._user)
             if rec is None:
@@ -1133,10 +1136,10 @@ class Memory:
             except Exception as e:
                 logger.warning("[PDM] torsion V penalty batch failed: %s", e)
 
-    def _apply_reinforcement(self, hits: List[MemoryHit]) -> None:
+    def _apply_reinforcement(self, hits: builtins.list[MemoryHit]) -> None:
         """Write retrieval reinforcement back to storage for all hits."""
         now = datetime.now(tz=timezone.utc)
-        batch_updates: List[tuple[str, dict]] = []
+        batch_updates: list[tuple[str, dict]] = []
         for hit in hits:
             try:
                 rec = self._storage.get(hit.id, user=self._user)

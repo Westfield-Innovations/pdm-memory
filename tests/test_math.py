@@ -1,19 +1,20 @@
 """Tests for PDM core math formulas — verifies parity with companion_api/pdm/kernel.py"""
 
 import pytest
+
 from pdm_memory.core.math import (
-    calculate_effective_spike,
+    DECAY_DELETE_THRESHOLD,
+    DOMAIN_HALF_LIVES,
     calculate_decay_factor,
-    calculate_v,
-    calculate_intent_weight,
-    calculate_p_effective,
+    calculate_effective_spike,
     calculate_half_life_pressure,
     calculate_incremental_decay,
+    calculate_intent_weight,
+    calculate_p_effective,
     calculate_temporal_geometry,
+    calculate_v,
     infer_domain,
     infer_regime,
-    DOMAIN_HALF_LIVES,
-    DECAY_DELETE_THRESHOLD,
 )
 
 

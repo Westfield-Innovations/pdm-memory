@@ -3,8 +3,8 @@
 # MODIFICATION PROHIBITED. USE AS SHIPPED.
 
 """pdm_memory.ingest package."""
-from pdm_memory.ingest.ingester import DataIngester
 from pdm_memory.ingest.auto_signature import AutoSignatureGenerator
 from pdm_memory.ingest.batch import BatchProcessor
+from pdm_memory.ingest.ingester import DataIngester
 
-__all__ = ["DataIngester", "AutoSignatureGenerator", "BatchProcessor"]
+__all__ = ["AutoSignatureGenerator", "BatchProcessor", "DataIngester"]

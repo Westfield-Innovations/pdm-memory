@@ -14,11 +14,13 @@ Usage:
 
 from __future__ import annotations
 
+import builtins
 import logging
 import threading
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Callable, Iterator, List, Optional
+from typing import Any
 
 from pdm_memory.core.math import P_MAX, calculate_effective_spike
 from pdm_memory.core.signature import DrawerInfo, SignatureRecord
@@ -137,14 +139,14 @@ class PostgresDriver(BaseStorage):
         logger.debug("[PDM-Postgres] Saved signature %s (P=%.1f)", sig.id, sig.p_magnitude)
         return sig.id
 
-    def get(self, memory_id: str, user: str = "default") -> Optional[SignatureRecord]:
+    def get(self, memory_id: str, user: str = "default") -> SignatureRecord | None:
         row = self._conn().execute(
             'SELECT * FROM pdm_signatures WHERE id = %s AND "user" = %s AND is_deleted = 0',
             (memory_id, user),
         ).fetchone()
         return mapping_to_record(row) if row else None
 
-    def find_by_hash(self, text_hash: str, user: str = "default") -> Optional[SignatureRecord]:
+    def find_by_hash(self, text_hash: str, user: str = "default") -> SignatureRecord | None:
         row = self._conn().execute(
             'SELECT * FROM pdm_signatures WHERE "user" = %s AND compressed_fact_hash = %s '
             "AND is_deleted = 0 LIMIT 1",
@@ -156,7 +158,7 @@ class PostgresDriver(BaseStorage):
         self,
         idempotency_key: str,
         user: str = "default",
-    ) -> Optional[SignatureRecord]:
+    ) -> SignatureRecord | None:
         row = self._conn().execute(
             'SELECT * FROM pdm_signatures WHERE "user" = %s AND idempotency_key = %s '
             "AND is_deleted = 0 LIMIT 1",
@@ -243,7 +245,7 @@ class PostgresDriver(BaseStorage):
 
     def update_batch(
         self,
-        updates: List[tuple[str, dict]],
+        updates: builtins.list[tuple[str, dict]],
         user: str = "default",
     ) -> None:
         if not updates:
@@ -289,10 +291,10 @@ class PostgresDriver(BaseStorage):
         user: str = "default",
         limit: int = 100,
         min_pressure: float = 0.0,
-        drawer: Optional[str] = None,
-        cursor_id: Optional[str] = None,
+        drawer: str | None = None,
+        cursor_id: str | None = None,
         include_deleted: bool = False,
-    ) -> List[SignatureRecord]:
+    ) -> builtins.list[SignatureRecord]:
         where = ['"user" = %s', "p_magnitude >= %s"]
         params: list[Any] = [user, min_pressure]
         if not include_deleted:
@@ -318,7 +320,7 @@ class PostgresDriver(BaseStorage):
         rows = self._conn().execute(query, params).fetchall()
         return [mapping_to_record(r) for r in rows]
 
-    def list_drawers(self, user: str = "default") -> List[DrawerInfo]:
+    def list_drawers(self, user: str = "default") -> builtins.list[DrawerInfo]:
         rows = self._conn().execute(
             """
             SELECT

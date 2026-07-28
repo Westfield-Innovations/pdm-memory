@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from datetime import datetime, timezone
-from typing import Any, Mapping, Optional
+from typing import Any
 
 from pdm_memory.core.signature import SignatureRecord
 
@@ -184,7 +185,7 @@ def apply_postgres_migrations(conn: Any) -> None:
     )
 
 
-def parse_dt(value: Optional[str]) -> Optional[datetime]:
+def parse_dt(value: str | None) -> datetime | None:
     if not value:
         return None
     try:

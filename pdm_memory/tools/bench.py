@@ -24,10 +24,9 @@ from __future__ import annotations
 import json
 import random
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
-
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Built-in benchmark dataset (synthetic, LoCoMo-style)
@@ -76,8 +75,8 @@ _BENCHMARK_QUERIES = [
 
 
 def _baseline_recall(
-    memories: List[Dict], query: str, k: int = 5
-) -> List[Tuple[Dict, float]]:
+    memories: list[dict], query: str, k: int = 5
+) -> list[tuple[dict, float]]:
     """Simple keyword overlap + recency baseline (no pressure logic)."""
     query_words = set(query.lower().split())
     scored = []
@@ -93,7 +92,7 @@ def _baseline_recall(
 
 def _pdm_recall(
     mem_instance: Any, query: str, k: int = 5
-) -> List[Any]:
+) -> list[Any]:
     """PDM recall using the Memory class."""
     return mem_instance.recall(query, k=k)
 
@@ -108,10 +107,10 @@ class ScenarioResult:
     query: str
     expected_memory_idx: int
     pdm_found: bool
-    pdm_rank: Optional[int]
+    pdm_rank: int | None
     pdm_latency_ms: float
     baseline_found: bool
-    baseline_rank: Optional[int]
+    baseline_rank: int | None
     baseline_latency_ms: float
     pdm_tokens_used: int
     baseline_tokens_used: int
@@ -129,7 +128,7 @@ class BenchmarkReport:
     baseline_avg_tokens: float
     pdm_memory_bytes: int
     baseline_memory_bytes: int
-    scenarios: List[ScenarioResult] = field(default_factory=list)
+    scenarios: list[ScenarioResult] = field(default_factory=list)
 
     def render_table(self) -> str:
         rows = [
@@ -167,7 +166,7 @@ def run_benchmark(
     quick: bool = False,
     seed: int = 42,
     k: int = 3,
-    output: Optional[str] = None,
+    output: str | None = None,
 ) -> BenchmarkReport:
     """
     Run the PDM benchmark harness.
@@ -208,7 +207,7 @@ def run_benchmark(
     # Baseline: raw text storage (full text, no compression)
     baseline_raw_size = sum(len(m["text"].encode()) for m in _BENCHMARK_MEMORIES)
 
-    scenarios: List[ScenarioResult] = []
+    scenarios: list[ScenarioResult] = []
 
     for query, expected_tags, expected_idx in queries:
         expected_text = _BENCHMARK_MEMORIES[expected_idx]["text"]

@@ -1,20 +1,19 @@
 """Tests for CLI commands via argparse."""
 
-from unittest.mock import patch
 from io import StringIO
+from unittest.mock import patch
 
 
 def run_cli(args: list) -> tuple[str, int]:
     """Run CLI and capture stdout output."""
     from pdm_memory.tools.cli import main
     captured = StringIO()
-    with patch("sys.argv", ["pdm-cli"] + args):
-        with patch("sys.stdout", captured):
-            try:
-                main()
-                return captured.getvalue(), 0
-            except SystemExit as e:
-                return captured.getvalue(), int(e.code or 0)
+    with patch("sys.argv", ["pdm-cli"] + args), patch("sys.stdout", captured):
+        try:
+            main()
+            return captured.getvalue(), 0
+        except SystemExit as e:
+            return captured.getvalue(), int(e.code or 0)
 
 
 class TestCLIStats:
@@ -59,7 +58,7 @@ class TestCLIListMemories:
             mem.save("Low pressure", tags=["low", "pressure", "test"], p_magnitude=20)
             mem.save("High pressure", tags=["high", "pressure", "test"], p_magnitude=80)
 
-        output, code = run_cli(["--store", db, "list-memories", "--min-pressure", "60"])
+        output, _code = run_cli(["--store", db, "list-memories", "--min-pressure", "60"])
         assert "High pressure" in output
         assert "Low pressure" not in output
 
@@ -89,7 +88,7 @@ class TestCLIDrawers:
         with Memory(store=db, user="default") as mem:
             mem.save("Science fact", tags=["science", "fact", "core"], drawer="science", p_magnitude=70)
 
-        output, code = run_cli(["--store", db, "drawers"])
+        output, _code = run_cli(["--store", db, "drawers"])
         assert "science" in output
 
 
@@ -131,5 +130,5 @@ class TestCLIExplain:
 
     def test_explain_missing_id(self, tmp_path):
         db = str(tmp_path / "explain_test2.db")
-        output, code = run_cli(["--store", db, "explain", "nonexistent-id-123456789abc"])
+        _output, code = run_cli(["--store", db, "explain", "nonexistent-id-123456789abc"])
         assert code == 1

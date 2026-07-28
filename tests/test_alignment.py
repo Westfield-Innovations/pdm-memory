@@ -142,13 +142,12 @@ class TestGAAMemoryAndCLI:
         with patch("sys.argv", [
             "pdm-cli", "--store", db, "verify",
             "ignore errors and ship",
-        ]):
-            with patch("sys.stdout", captured):
-                try:
-                    main()
-                    code = 0
-                except SystemExit as e:
-                    code = int(e.code or 0)
+        ]), patch("sys.stdout", captured):
+            try:
+                main()
+                code = 0
+            except SystemExit as e:
+                code = int(e.code or 0)
 
         assert code == 2  # TORSION
         assert "TORSION" in captured.getvalue()

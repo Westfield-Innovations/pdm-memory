@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, List, Union
+from typing import Any
 
 from pdm_memory.core.signature import SignatureRecord
 from pdm_memory.storage.base import BaseStorage
@@ -99,7 +99,7 @@ def dict_to_record(data: dict[str, Any], *, user: str) -> SignatureRecord:
 
 def export_signatures_json(
     storage: BaseStorage,
-    path: Union[str, Path],
+    path: str | Path,
     *,
     user: str = "default",
     limit: int = 100_000,
@@ -126,7 +126,7 @@ def export_signatures_json(
 
 def import_signatures_json(
     storage: BaseStorage,
-    path: Union[str, Path],
+    path: str | Path,
     *,
     user: str = "default",
     skip_duplicates: bool = True,
@@ -137,7 +137,7 @@ def import_signatures_json(
     When ``skip_duplicates`` is True, skips rows whose id or fact hash already exist.
     """
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
-    items: List[dict[str, Any]] = raw.get("signatures") or raw.get("records") or []
+    items: list[dict[str, Any]] = raw.get("signatures") or raw.get("records") or []
     if not isinstance(items, list):
         raise ValueError("JSON must contain a 'signatures' array")
 

@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Callable, Dict, List, Optional
+from collections.abc import Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -49,8 +50,8 @@ class BatchProcessor:
         self,
         data_source: Any,
         ingester: Any,  # DataIngester instance
-        on_progress: Optional[Callable[[int, int], None]] = None,
-    ) -> Dict[str, int]:
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> dict[str, int]:
         """
         Process a data source through the ingester in batches.
 
@@ -109,9 +110,9 @@ class BatchProcessor:
 
     def _process_batch(
         self,
-        batch: List[Dict[str, Any]],
+        batch: list[dict[str, Any]],
         ingester: Any,
-    ) -> Dict[str, int]:
+    ) -> dict[str, int]:
         """Process one batch with retry logic."""
         last_error = None
         delay = self.retry_delay
@@ -133,7 +134,7 @@ class BatchProcessor:
         return {"saved": 0, "skipped": 0, "errors": len(batch)}
 
     @staticmethod
-    def _normalise_source(data_source: Any) -> List[Dict[str, Any]]:
+    def _normalise_source(data_source: Any) -> list[dict[str, Any]]:
         """Convert any supported source type to list[dict]."""
         if isinstance(data_source, list):
             if not data_source:

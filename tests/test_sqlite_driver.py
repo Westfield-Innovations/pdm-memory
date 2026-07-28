@@ -2,8 +2,8 @@
 
 import pytest
 
-from pdm_memory.storage.sqlite_driver import SQLiteDriver
 from pdm_memory.core.signature import SignatureRecord
+from pdm_memory.storage.sqlite_driver import SQLiteDriver
 
 
 @pytest.fixture
@@ -171,10 +171,9 @@ class TestSQLiteDriverPersistence:
         sig_keep = make_sig(text="keep")
         driver.save(sig_keep)
         sig_rollback = make_sig(text="rollback")
-        with pytest.raises(RuntimeError, match="boom"):
-            with driver.transaction():
-                driver.save(sig_rollback)
-                raise RuntimeError("boom")
+        with pytest.raises(RuntimeError, match="boom"), driver.transaction():
+            driver.save(sig_rollback)
+            raise RuntimeError("boom")
         assert driver.get(sig_keep.id, user=sig_keep.user) is not None
         assert driver.get(sig_rollback.id, user=sig_rollback.user) is None
 

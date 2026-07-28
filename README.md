@@ -16,7 +16,7 @@ Your LLM forgets everything between conversations. The standard fix — stuff a 
 
 📖 **Documentation:** [azus.ai/support](https://azus.ai/support)
 
-**Benchmarks vs standard RAG:** [link] · Run yourself: `python -m pdm_memory.bench`
+**Benchmarks vs standard RAG:** [azus.ai/pdm/benchmarks](https://azus.ai/pdm/benchmarks)
 
 ---
 

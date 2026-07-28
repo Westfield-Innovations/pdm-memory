@@ -1,4 +1,5 @@
 from unittest.mock import MagicMock
+
 from pdm_memory import Memory
 from pdm_memory.core.signature import MemoryHit
 from pdm_memory.integrations.ollama_adapter import wrap_ollama

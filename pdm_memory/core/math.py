@@ -24,14 +24,12 @@ from __future__ import annotations
 
 import math
 import warnings
-from typing import Dict, List, Optional
-
 
 # ---------------------------------------------------------------------------
 # Domain half-lives (ported from kernel.py DOMAIN_HALF_LIVES)
 # ---------------------------------------------------------------------------
 
-DOMAIN_HALF_LIVES: Dict[str, float] = {
+DOMAIN_HALF_LIVES: dict[str, float] = {
     "market_signal": 1.0,    # 1 day
     "pattern": 14.0,         # 2 weeks
     "structural": 90.0,      # 3 months
@@ -80,7 +78,7 @@ def calculate_effective_spike(
     return min(P_MAX, max(P_FLOOR, raw))
 
 
-def resolve_half_life(domain: Optional[str]) -> float:
+def resolve_half_life(domain: str | None) -> float:
     """Map knowledge domain → half-life days (canonical decay clock)."""
     if not domain:
         return DEFAULT_HALF_LIFE
@@ -91,7 +89,7 @@ def calculate_decay_factor(
     days_since_retrieved: float,
     half_life: float = DEFAULT_HALF_LIFE,
     *,
-    days_since_created: Optional[float] = None,
+    days_since_created: float | None = None,
     t_persistence: float = 0.0,
 ) -> float:
     """
@@ -132,8 +130,8 @@ def calculate_v(correct: int, total: int) -> float:
 
 
 def calculate_intent_weight(
-    intent_tags: List[str],
-    query: Optional[str] = None,
+    intent_tags: list[str],
+    query: str | None = None,
 ) -> float:
     """
     Intent match weight: 0.8 base + 0.2 boost proportional to tag-query overlap.
@@ -199,7 +197,7 @@ def calculate_half_life_pressure(
     t_persistence: float,
     phase_privilege: float = 1.0,
     *,
-    days_since_created: Optional[float] = None,
+    days_since_created: float | None = None,
 ) -> tuple[float, float]:
     """
     Project stored pressure after canonical half-life decay.
@@ -341,7 +339,7 @@ def calculate_temporal_geometry(
 # ---------------------------------------------------------------------------
 
 
-def infer_domain(tags: List[str]) -> str:
+def infer_domain(tags: list[str]) -> str:
     """Infer memory domain from intent tags."""
     if not tags:
         return "insight"
@@ -361,7 +359,7 @@ def infer_domain(tags: List[str]) -> str:
     return "insight"
 
 
-def infer_regime(tags: List[str]) -> str:
+def infer_regime(tags: list[str]) -> str:
     """Infer question regime from intent tags."""
     tag_str = " ".join(tags).lower()
     if any(k in tag_str for k in ["trade", "stock", "market", "price"]):

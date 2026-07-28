@@ -28,7 +28,7 @@ from __future__ import annotations
 import csv
 import logging
 from io import StringIO
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from pdm_memory.core.math import calculate_effective_spike, infer_domain
 from pdm_memory.core.signature import SignatureRecord
@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 # Auto-detect common field name aliases
-_FIELD_ALIASES: Dict[str, str] = {
+_FIELD_ALIASES: dict[str, str] = {
     # compressed_fact aliases
     "text": "compressed_fact",
     "content": "compressed_fact",
@@ -89,15 +89,15 @@ class DataIngester:
         self,
         storage: BaseStorage,
         user: str = "default",
-        mapping: Optional[Dict[str, str]] = None,
-        llm_client: Optional[Any] = None,
+        mapping: dict[str, str] | None = None,
+        llm_client: Any | None = None,
     ) -> None:
         self._storage = storage
         self._user = user
         self._mapping = mapping
         self._llm_client = llm_client
 
-    def ingest_rows(self, rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    def ingest_rows(self, rows: list[dict[str, Any]]) -> dict[str, int]:
         """
         Ingest a list of dicts.  Returns {'saved': N, 'skipped': N, 'errors': N}.
         """
@@ -117,7 +117,7 @@ class DataIngester:
 
         return counts
 
-    def ingest_csv(self, csv_path_or_content: str) -> Dict[str, int]:
+    def ingest_csv(self, csv_path_or_content: str) -> dict[str, int]:
         """
         Ingest from a CSV file path or raw CSV string.
         """
@@ -134,7 +134,7 @@ class DataIngester:
     # Private
     # ------------------------------------------------------------------
 
-    def _row_to_signature(self, row: Dict[str, Any]) -> Optional[SignatureRecord]:
+    def _row_to_signature(self, row: dict[str, Any]) -> SignatureRecord | None:
         """Map one row to a SignatureRecord using auto-detect or explicit mapping."""
         # Build effective mapping
         field_map = self._build_field_map(row)
@@ -186,9 +186,9 @@ class DataIngester:
             drawer_domain=drawer,
         )
 
-    def _build_field_map(self, row: Dict[str, Any]) -> Dict[str, Any]:
+    def _build_field_map(self, row: dict[str, Any]) -> dict[str, Any]:
         """Apply explicit or auto mapping to a row."""
-        result: Dict[str, Any] = {}
+        result: dict[str, Any] = {}
 
         if self._mapping:
             # Explicit mapping
@@ -214,7 +214,7 @@ class DataIngester:
         result = gen.generate(raw)
         return result.compressed_fact if result else ""
 
-    def _generate_tags_via_llm(self, text: str) -> List[str]:
+    def _generate_tags_via_llm(self, text: str) -> list[str]:
         """Ask the LLM to generate 3+ tags for a text."""
         from pdm_memory.ingest.auto_signature import AutoSignatureGenerator
         gen = AutoSignatureGenerator(self._llm_client)
@@ -222,7 +222,7 @@ class DataIngester:
         return result.intent_tags if result else []
 
     @staticmethod
-    def _auto_tags_from_text(text: str) -> List[str]:
+    def _auto_tags_from_text(text: str) -> list[str]:
         """Extract simple keyword tags from text without an LLM."""
         import re
         words = re.findall(r"\b[a-zA-Z]{4,}\b", text.lower())
@@ -246,7 +246,7 @@ class DataIngester:
 # ---------------------------------------------------------------------------
 
 
-def _safe_float(val: Any, default: float = 0.0, min_v: float = None, max_v: float = None) -> float:
+def _safe_float(val: Any, default: float = 0.0, min_v: float | None = None, max_v: float | None = None) -> float:
     try:
         v = float(val)
         if min_v is not None:
@@ -258,7 +258,7 @@ def _safe_float(val: Any, default: float = 0.0, min_v: float = None, max_v: floa
         return default
 
 
-def _parse_tags(val: Any) -> List[str]:
+def _parse_tags(val: Any) -> list[str]:
     if val is None:
         return []
     if isinstance(val, list):

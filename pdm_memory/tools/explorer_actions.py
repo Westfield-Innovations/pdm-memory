@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any
 
 from pdm_memory.core.math import (
     calculate_decay_factor,
@@ -33,7 +33,7 @@ Write ONE authoritative reconciled fact that resolves the contradiction.
 Rules: max 480 characters, declarative tone, no preamble, no quotes."""
 
 
-def _days_since(dt: Optional[datetime], now: datetime) -> float:
+def _days_since(dt: datetime | None, now: datetime) -> float:
     if dt is None:
         return 0.0
     if dt.tzinfo is None:
@@ -115,7 +115,7 @@ def _try_ollama_reconcile(
     *,
     explanation: str,
     conflict_kind: str,
-) -> Optional[str]:
+) -> str | None:
     host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
     model = os.environ.get("PDM_EXPLORER_LLM_MODEL", "llama3.2")
     prompt = _RECONCILE_PROMPT.format(

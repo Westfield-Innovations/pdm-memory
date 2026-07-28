@@ -9,8 +9,8 @@ import pytest
 
 from pdm_memory import Memory
 from pdm_memory.models import TorsionReport
-from pdm_memory.storage.sqlite_driver import SQLiteDriver
 from pdm_memory.storage.cloud_driver import CloudDriver
+from pdm_memory.storage.sqlite_driver import SQLiteDriver
 
 
 @pytest.fixture
@@ -155,8 +155,8 @@ class TestTorsionJudge:
 
 class TestSyncAnyStorage:
     def test_sync_rejects_cloud_only_storage(self):
-        from pdm_memory.storage.cloud_driver import CloudDriver
         from pdm_memory.auth.jwt_handler import JWTAuth
+        from pdm_memory.storage.cloud_driver import CloudDriver
 
         auth = JWTAuth(token="fake-token-for-type-check")
         cloud = CloudDriver(auth=auth, base_url="http://localhost:8000", user="u")

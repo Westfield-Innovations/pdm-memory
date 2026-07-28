@@ -35,13 +35,16 @@ HOW USERS OBTAIN AND USE THE JWT KEYS:
    # to retrieve a new access token and retries the request seamlessly.
 """
 
-import time
 import base64
 import json
-import pytest
+import time
 from unittest.mock import MagicMock, patch
+
+import pytest
+
 from pdm_memory.auth.jwt_handler import JWTAuth
 from pdm_memory.storage.cloud_driver import CloudDriver
+
 
 def make_mock_jwt(expire_time: float) -> str:
     """Helper to generate a mock JWT token with a specific expiration timestamp."""

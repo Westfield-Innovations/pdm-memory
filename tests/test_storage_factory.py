@@ -6,7 +6,7 @@ import pytest
 
 from pdm_memory import Memory
 from pdm_memory.storage.base import BaseStorage
-from pdm_memory.storage.factory import create_storage, register_storage, companion_token_refresh_url
+from pdm_memory.storage.factory import companion_token_refresh_url, create_storage, register_storage
 from pdm_memory.storage.sqlite_driver import SQLiteDriver
 
 

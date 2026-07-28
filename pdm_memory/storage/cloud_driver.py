@@ -17,10 +17,11 @@ Only HTTP 404 on get() is soft (returns None) so sync can distinguish
 
 from __future__ import annotations
 
+import builtins
 import json
 import logging
 from datetime import datetime
-from typing import Any, List, Optional
+from typing import Any
 
 from pdm_memory.auth.jwt_handler import JWTAuth
 from pdm_memory.core.signature import DrawerInfo, SignatureRecord
@@ -85,7 +86,7 @@ class CloudDriver(BaseStorage):
         logger.debug("[PDM-Cloud] Saved signature %s", cloud_id)
         return str(cloud_id)
 
-    def get(self, memory_id: str, user: str = "default") -> Optional[SignatureRecord]:
+    def get(self, memory_id: str, user: str = "default") -> SignatureRecord | None:
         """
         GET /api/v1/pdm/signatures/<id>/
 
@@ -108,7 +109,7 @@ class CloudDriver(BaseStorage):
         self,
         idempotency_key: str,
         user: str = "default",
-    ) -> Optional[SignatureRecord]:
+    ) -> SignatureRecord | None:
         key = idempotency_key.strip()
         if not key:
             return None
@@ -172,10 +173,10 @@ class CloudDriver(BaseStorage):
         user: str = "default",
         limit: int = 100,
         min_pressure: float = 0.0,
-        drawer: Optional[str] = None,
-        cursor_id: Optional[str] = None,
+        drawer: str | None = None,
+        cursor_id: str | None = None,
         include_deleted: bool = False,
-    ) -> List[SignatureRecord]:
+    ) -> builtins.list[SignatureRecord]:
         """GET /api/v1/pdm/retrieve — client-side keyset when API has no cursor param."""
         fetch_limit = limit if cursor_id is None else max(limit * 4, 200)
         params: dict = {"limit": fetch_limit, "min_pressure": min_pressure}
@@ -204,7 +205,7 @@ class CloudDriver(BaseStorage):
 
         return records[:limit]
 
-    def list_drawers(self, user: str = "default") -> List[DrawerInfo]:
+    def list_drawers(self, user: str = "default") -> builtins.list[DrawerInfo]:
         """GET /api/v1/pdm/drawers — raises on failure."""
         resp = self._get("/api/v1/pdm/drawers")
         items = resp.json()
@@ -241,7 +242,7 @@ class CloudDriver(BaseStorage):
         self._raise_for_status(resp, path)
         return resp
 
-    def _get(self, path: str, params: Optional[dict] = None):
+    def _get(self, path: str, params: dict | None = None):
         import httpx
 
         self._auth.ensure_fresh()
@@ -334,7 +335,7 @@ class CloudDriver(BaseStorage):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _iso(dt: Optional[datetime]) -> Optional[str]:
+    def _iso(dt: datetime | None) -> str | None:
         if dt is None:
             return None
         return dt.isoformat()
@@ -418,7 +419,7 @@ class CloudDriver(BaseStorage):
             except (ValueError, json.JSONDecodeError):
                 tags = []
 
-        def _dt(val: Any) -> Optional[datetime]:
+        def _dt(val: Any) -> datetime | None:
             if not val:
                 return None
             if isinstance(val, datetime):

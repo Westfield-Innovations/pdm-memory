@@ -26,7 +26,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,7 @@ Raw input to compress:
 @dataclass
 class AutoSignatureResult:
     compressed_fact: str
-    intent_tags: List[str]
+    intent_tags: list[str]
     p_magnitude: float
     raw_response: str = ""
 
@@ -84,7 +84,7 @@ class AutoSignatureGenerator:
     def __init__(
         self,
         llm_client: Any,
-        model: Optional[str] = None,
+        model: str | None = None,
         max_tokens: int = 256,
     ) -> None:
         self._client = llm_client
@@ -92,7 +92,7 @@ class AutoSignatureGenerator:
         self._max_tokens = max_tokens
         self._provider = self._detect_provider()
 
-    def generate(self, raw_text: str) -> Optional[AutoSignatureResult]:
+    def generate(self, raw_text: str) -> AutoSignatureResult | None:
         """
         Generate a PDM signature for raw_text.
 
@@ -120,7 +120,7 @@ class AutoSignatureGenerator:
     # Provider-specific calls
     # ------------------------------------------------------------------
 
-    def _call_openai(self, prompt: str) -> Optional[AutoSignatureResult]:
+    def _call_openai(self, prompt: str) -> AutoSignatureResult | None:
         model = self._model or self.OPENAI_DEFAULT_MODEL
         resp = self._client.chat.completions.create(
             model=model,
@@ -131,7 +131,7 @@ class AutoSignatureGenerator:
         raw = resp.choices[0].message.content or ""
         return self._parse_response(raw)
 
-    def _call_anthropic(self, prompt: str) -> Optional[AutoSignatureResult]:
+    def _call_anthropic(self, prompt: str) -> AutoSignatureResult | None:
         model = self._model or self.ANTHROPIC_DEFAULT_MODEL
         resp = self._client.messages.create(
             model=model,
@@ -145,7 +145,7 @@ class AutoSignatureGenerator:
     # Parsing
     # ------------------------------------------------------------------
 
-    def _parse_response(self, raw: str) -> Optional[AutoSignatureResult]:
+    def _parse_response(self, raw: str) -> AutoSignatureResult | None:
         raw = raw.strip()
         # Strip markdown code fences if present
         if raw.startswith("```"):

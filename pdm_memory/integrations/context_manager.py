@@ -16,7 +16,6 @@ Usage:
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
 
 from pdm_memory.core.signature import MemoryHit
 
@@ -51,7 +50,7 @@ class ContextWindowManager:
     # Public API
     # ------------------------------------------------------------------
 
-    def fit(self, hits: List[MemoryHit]) -> List[MemoryHit]:
+    def fit(self, hits: list[MemoryHit]) -> list[MemoryHit]:
         """
         Return the highest-pressure subset of hits that fits within max_tokens.
 
@@ -70,7 +69,7 @@ class ContextWindowManager:
         # Sort highest pressure first (most important memories stay)
         sorted_hits = sorted(hits, key=lambda h: h.p_effective, reverse=True)
 
-        kept: List[MemoryHit] = []
+        kept: list[MemoryHit] = []
         used_tokens = 0
 
         for hit in sorted_hits:
@@ -92,7 +91,7 @@ class ContextWindowManager:
 
         return kept
 
-    def format_for_prompt(self, hits: List[MemoryHit]) -> str:
+    def format_for_prompt(self, hits: list[MemoryHit]) -> str:
         """
         Format a list of MemoryHit objects into a system prompt block.
 
@@ -126,7 +125,7 @@ class ContextWindowManager:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _load_encoder(model: str) -> Optional[object]:
+    def _load_encoder(model: str) -> object | None:
         try:
             import tiktoken
             try:

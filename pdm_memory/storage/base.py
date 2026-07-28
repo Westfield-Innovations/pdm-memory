@@ -14,11 +14,12 @@ knows which driver is active.
 
 from __future__ import annotations
 
+import builtins
 import hashlib
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Iterator, List, Optional
 
 from pdm_memory.core.signature import DrawerInfo, SignatureRecord
 
@@ -39,7 +40,7 @@ class BaseStorage(ABC):
         ...
 
     @abstractmethod
-    def get(self, memory_id: str, user: str = "default") -> Optional[SignatureRecord]:
+    def get(self, memory_id: str, user: str = "default") -> SignatureRecord | None:
         """Retrieve a single active (non-deleted) signature by ID."""
         ...
 
@@ -50,7 +51,7 @@ class BaseStorage(ABC):
 
     def update_batch(
         self,
-        updates: List[tuple[str, dict]],
+        updates: builtins.list[tuple[str, dict]],
         user: str = "default",
     ) -> None:
         for memory_id, fields in updates:
@@ -71,10 +72,10 @@ class BaseStorage(ABC):
         user: str = "default",
         limit: int = 100,
         min_pressure: float = 0.0,
-        drawer: Optional[str] = None,
-        cursor_id: Optional[str] = None,
+        drawer: str | None = None,
+        cursor_id: str | None = None,
         include_deleted: bool = False,
-    ) -> List[SignatureRecord]:
+    ) -> builtins.list[SignatureRecord]:
         """
         List signatures ordered by ``p_magnitude DESC, id DESC``.
 
@@ -83,14 +84,14 @@ class BaseStorage(ABC):
         ...
 
     @abstractmethod
-    def list_drawers(self, user: str = "default") -> List[DrawerInfo]:
+    def list_drawers(self, user: str = "default") -> builtins.list[DrawerInfo]:
         """List all drawers with aggregate stats."""
         ...
 
     def count(self, user: str = "default") -> int:
         return len(self.list(user=user, limit=10_000))
 
-    def find_by_hash(self, text_hash: str, user: str = "default") -> Optional[SignatureRecord]:
+    def find_by_hash(self, text_hash: str, user: str = "default") -> SignatureRecord | None:
         for rec in self.list(user=user, limit=10_000):
             fact = rec.compressed_fact or ""
             if fact.startswith("[HASH:") and fact.endswith("]"):
@@ -105,7 +106,7 @@ class BaseStorage(ABC):
         self,
         idempotency_key: str,
         user: str = "default",
-    ) -> Optional[SignatureRecord]:
+    ) -> SignatureRecord | None:
         key = idempotency_key.strip()
         if not key:
             return None

@@ -22,14 +22,15 @@ Usage:
 
 from __future__ import annotations
 
+import builtins
 import hashlib
 import json
 import logging
 import sqlite3
 import threading
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Iterator, List, Optional
 
 from pdm_memory.core.signature import DrawerInfo, SignatureRecord
 from pdm_memory.storage.base import BaseStorage
@@ -47,7 +48,7 @@ def _now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
 
-def _parse_dt(s: Optional[str]) -> Optional[datetime]:
+def _parse_dt(s: str | None) -> datetime | None:
     if not s:
         return None
     try:
@@ -190,14 +191,14 @@ class SQLiteDriver(BaseStorage):
         logger.debug("[PDM-SQLite] Saved signature %s (P=%.1f)", sig.id, sig.p_magnitude)
         return sig.id
 
-    def get(self, memory_id: str, user: str = "default") -> Optional[SignatureRecord]:
+    def get(self, memory_id: str, user: str = "default") -> SignatureRecord | None:
         row = self._conn().execute(
             "SELECT * FROM pdm_signatures WHERE id = ? AND user = ? AND is_deleted = 0",
             (memory_id, user),
         ).fetchone()
         return mapping_to_record(row) if row else None
 
-    def find_by_hash(self, text_hash: str, user: str = "default") -> Optional[SignatureRecord]:
+    def find_by_hash(self, text_hash: str, user: str = "default") -> SignatureRecord | None:
         row = self._conn().execute(
             "SELECT * FROM pdm_signatures WHERE user = ? AND compressed_fact_hash = ? "
             "AND is_deleted = 0 LIMIT 1",
@@ -209,7 +210,7 @@ class SQLiteDriver(BaseStorage):
         self,
         idempotency_key: str,
         user: str = "default",
-    ) -> Optional[SignatureRecord]:
+    ) -> SignatureRecord | None:
         row = self._conn().execute(
             "SELECT * FROM pdm_signatures WHERE user = ? AND idempotency_key = ? "
             "AND is_deleted = 0 LIMIT 1",
@@ -247,7 +248,7 @@ class SQLiteDriver(BaseStorage):
 
     def update_batch(
         self,
-        updates: List[tuple[str, dict]],
+        updates: builtins.list[tuple[str, dict]],
         user: str = "default",
     ) -> None:
         """Batch-update with the same whitelist + user scope as :meth:`update`."""
@@ -292,9 +293,7 @@ class SQLiteDriver(BaseStorage):
 
         prepared: dict = {}
         for col, value in fields.items():
-            if col == "intent_tags":
-                prepared[col] = json.dumps(value)
-            elif col == "metadata":
+            if col == "intent_tags" or col == "metadata":
                 prepared[col] = json.dumps(value)
             elif col in ("last_retrieved", "created_at", "t_deadline") and isinstance(
                 value, datetime
@@ -325,10 +324,10 @@ class SQLiteDriver(BaseStorage):
         user: str = "default",
         limit: int = 100,
         min_pressure: float = 0.0,
-        drawer: Optional[str] = None,
-        cursor_id: Optional[str] = None,
+        drawer: str | None = None,
+        cursor_id: str | None = None,
         include_deleted: bool = False,
-    ) -> List[SignatureRecord]:
+    ) -> builtins.list[SignatureRecord]:
         where = ["user = ?", "p_magnitude >= ?"]
         params: list = [user, min_pressure]
         if not include_deleted:
@@ -354,7 +353,7 @@ class SQLiteDriver(BaseStorage):
         rows = self._conn().execute(query, params).fetchall()
         return [mapping_to_record(r) for r in rows]
 
-    def list_drawers(self, user: str = "default") -> List[DrawerInfo]:
+    def list_drawers(self, user: str = "default") -> builtins.list[DrawerInfo]:
         rows = self._conn().execute(
             """
             SELECT

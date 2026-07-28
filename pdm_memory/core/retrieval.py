@@ -16,12 +16,13 @@ Three-phase search:
 
 from __future__ import annotations
 
-import re
-import math
 import logging
+import math
+import re
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from pdm_memory.types import TorsionJudge
@@ -75,7 +76,7 @@ _NEGATION_TOKENS: frozenset[str] = frozenset(
     }
 )
 # Applied before polarity checks — user text is messy
-_CONTRACTION_MAP: Tuple[Tuple[str, str], ...] = (
+_CONTRACTION_MAP: tuple[tuple[str, str], ...] = (
     ("don't", " do not "),
     ("doesn't", " does not "),
     ("didn't", " did not "),
@@ -91,7 +92,7 @@ _CONTRACTION_MAP: Tuple[Tuple[str, str], ...] = (
     ("cannot", " can not "),
     ("n't", " not "),
 )
-_ANTONYM_PAIRS: Tuple[Tuple[str, str], ...] = (
+_ANTONYM_PAIRS: tuple[tuple[str, str], ...] = (
     ("prefer", "avoid"),
     ("likes", "hates"),
     ("love", "hate"),
@@ -157,9 +158,9 @@ class RetrievalResult:
     threshold_used: float
     base_threshold: float
     search_cost: float
-    coupled_nodes: List[NodeCoupling] = field(default_factory=list)
-    damped_nodes: List[NodeCoupling] = field(default_factory=list)
-    top_node: Optional[NodeCoupling] = None
+    coupled_nodes: list[NodeCoupling] = field(default_factory=list)
+    damped_nodes: list[NodeCoupling] = field(default_factory=list)
+    top_node: NodeCoupling | None = None
     total_scanned: int = 0
     reinforced_count: int = 0
 
@@ -205,15 +206,15 @@ class RetrievalEngine:
 
     def recall(
         self,
-        records: List[SignatureRecord],
-        query: Optional[str] = None,
+        records: list[SignatureRecord],
+        query: str | None = None,
         k: int = 5,
         search_cost: float = 0.5,   # 0=TIGHT, 1=LOOSE
         base_threshold: float = THETA_BASE_DEFAULT,
         target_pressure: float = 50.0,
-        domain: Optional[str] = None,
-        regime: Optional[str] = None,
-    ) -> List[MemoryHit]:
+        domain: str | None = None,
+        regime: str | None = None,
+    ) -> list[MemoryHit]:
         """
         Retrieve top-k memories from a list of SignatureRecords.
 
@@ -238,8 +239,8 @@ class RetrievalEngine:
         # Phase 1: threshold lowering
         theta_eff = self._compute_threshold(base_threshold, search_cost)
 
-        coupled: List[tuple[NodeCoupling, MemoryHit]] = []
-        damped: List[NodeCoupling] = []
+        coupled: list[tuple[NodeCoupling, MemoryHit]] = []
+        damped: list[NodeCoupling] = []
 
         # Infer domain/regime from query if not specified
         query_tags = self._tokenize_query(query) if query else []
@@ -323,7 +324,7 @@ class RetrievalEngine:
         return len(fact_tokens & cue) / max(len(fact_tokens | cue), 1)
 
     @staticmethod
-    def _tags_overlap(cue: Set[str], tags: Set[str]) -> bool:
+    def _tags_overlap(cue: set[str], tags: set[str]) -> bool:
         if cue & tags:
             return True
         for q in cue:
@@ -360,11 +361,11 @@ class RetrievalEngine:
     def _compute_coupling(
         self,
         rec: SignatureRecord,
-        query_tags: List[str],
+        query_tags: list[str],
         p_eff: float,
         p_raw: float,
-        effective_domain: Optional[str],
-        effective_regime: Optional[str],
+        effective_domain: str | None,
+        effective_regime: str | None,
         target_pressure: float,
     ) -> NodeCoupling:
         sig_tags = [t.lower() for t in rec.intent_tags]
@@ -380,18 +381,14 @@ class RetrievalEngine:
             tag_overlap = 0.0
 
         # Domain match
-        if effective_domain is None:
-            domain_match = 1.0
-        elif (rec.domain or "").lower() == effective_domain.lower():
+        if effective_domain is None or (rec.domain or "").lower() == effective_domain.lower():
             domain_match = 1.0
         else:
             domain_match = 0.0
 
         # Regime match
         sig_regime = infer_regime(sig_tags)
-        if effective_regime is None:
-            regime_match = 1.0
-        elif sig_regime == effective_regime:
+        if effective_regime is None or sig_regime == effective_regime:
             regime_match = 1.0
         elif sig_regime == "neutral" or effective_regime == "neutral":
             regime_match = 0.5
@@ -424,7 +421,7 @@ class RetrievalEngine:
         )
 
     @staticmethod
-    def _days_since(dt: Optional[datetime], now: datetime) -> float:
+    def _days_since(dt: datetime | None, now: datetime) -> float:
         if dt is None:
             return 0.0
         if dt.tzinfo is None:
@@ -432,7 +429,7 @@ class RetrievalEngine:
         return max(0.0, (now - dt).total_seconds() / 86400.0)
 
     @staticmethod
-    def _tokenize_query(query: str) -> List[str]:
+    def _tokenize_query(query: str) -> list[str]:
         """Extract meaningful tokens from a query string for tag matching."""
         words = WORD_PATTERN.findall(query.lower())
         return [w for w in words if w not in _STOPWORDS]
@@ -445,8 +442,8 @@ class RetrievalEngine:
         self,
         records: Sequence[SignatureRecord],
         threshold: float = 0.7,
-        judge: Optional["TorsionJudge"] = None,
-    ) -> List[TorsionReport]:
+        judge: TorsionJudge | None = None,
+    ) -> list[TorsionReport]:
         """
         Find Reverse Resonance pairs: high topic similarity + opposing facts/pressure.
 
@@ -461,15 +458,15 @@ class RetrievalEngine:
         if len(records) < 2:
             return []
 
-        by_id: Dict[str, SignatureRecord] = {r.id: r for r in records if r.id}
-        clusters: Dict[str, List[SignatureRecord]] = {}
+        by_id: dict[str, SignatureRecord] = {r.id: r for r in records if r.id}
+        clusters: dict[str, list[SignatureRecord]] = {}
         for rec in by_id.values():
             key = self._torsion_cluster_key(rec)
             clusters.setdefault(key, []).append(rec)
 
-        reports: List[TorsionReport] = []
-        seen_pairs: Set[Tuple[str, str]] = set()
-        reported_pairs: Set[Tuple[str, str]] = set()
+        reports: list[TorsionReport] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        reported_pairs: set[tuple[str, str]] = set()
 
         for cluster_key, group in clusters.items():
             if len(group) < 2:
@@ -495,15 +492,15 @@ class RetrievalEngine:
 
     def _merge_judge_reports(
         self,
-        clusters: Dict[str, List[SignatureRecord]],
-        reports: List[TorsionReport],
+        clusters: dict[str, list[SignatureRecord]],
+        reports: list[TorsionReport],
         threshold: float,
-        judge: "TorsionJudge",
-        reported_pairs: Set[Tuple[str, str]],
-    ) -> List[TorsionReport]:
+        judge: TorsionJudge,
+        reported_pairs: set[tuple[str, str]],
+    ) -> list[TorsionReport]:
         """Append judge-flagged pairs not already reported by rules-only detection."""
         merged = list(reports)
-        seen_pairs: Set[Tuple[str, str]] = set()
+        seen_pairs: set[tuple[str, str]] = set()
         for group in clusters.values():
             if len(group) < 2:
                 continue
@@ -527,12 +524,12 @@ class RetrievalEngine:
     def _torsion_candidate_pairs(
         self,
         group: Sequence[SignatureRecord],
-    ) -> Iterable[Tuple[SignatureRecord, SignatureRecord]]:
+    ) -> Iterable[tuple[SignatureRecord, SignatureRecord]]:
         """Yield unordered unique pairs without full N² when the cluster is large."""
         by_id = {r.id: r for r in group}
-        yielded: Set[Tuple[str, str]] = set()
+        yielded: set[tuple[str, str]] = set()
 
-        def emit(id_a: str, id_b: str) -> Iterable[Tuple[SignatureRecord, SignatureRecord]]:
+        def emit(id_a: str, id_b: str) -> Iterable[tuple[SignatureRecord, SignatureRecord]]:
             if id_a == id_b:
                 return
             key = (id_a, id_b) if id_a < id_b else (id_b, id_a)
@@ -541,7 +538,7 @@ class RetrievalEngine:
             yielded.add(key)
             yield (by_id[key[0]], by_id[key[1]])
 
-        tag_index: Dict[str, List[str]] = {}
+        tag_index: dict[str, list[str]] = {}
         for rec in group:
             for tag in {t.lower() for t in (rec.intent_tags or []) if t}:
                 tag_index.setdefault(tag, []).append(rec.id)
@@ -572,7 +569,7 @@ class RetrievalEngine:
         b: SignatureRecord,
         *,
         cluster_key: str,
-    ) -> Optional[TorsionReport]:
+    ) -> TorsionReport | None:
         topic = self._topic_similarity(a, b)
         if topic < _TOPIC_GATE:
             return None
@@ -636,7 +633,7 @@ class RetrievalEngine:
         a: SignatureRecord,
         b: SignatureRecord,
         topic: float,
-    ) -> Tuple[str, float, str]:
+    ) -> tuple[str, float, str]:
         """Return (kind, strength, detail). Strength in [0, 1]."""
         # Prefer structured deadline over numeric bleed from the same dates in text
         if a.t_deadline is not None and b.t_deadline is not None:
@@ -795,7 +792,7 @@ class RetrievalEngine:
         return ", ".join(ordered)
 
     @staticmethod
-    def _fact_preview(text: Optional[str], max_len: int = 72) -> str:
+    def _fact_preview(text: str | None, max_len: int = 72) -> str:
         cleaned = " ".join((text or "").split())
         if not cleaned:
             return "empty"
@@ -809,7 +806,7 @@ class RetrievalEngine:
 
     def verify_alignment(
         self,
-        records: List[SignatureRecord],
+        records: list[SignatureRecord],
         intent_text: str,
         *,
         min_pressure: float = 60.0,

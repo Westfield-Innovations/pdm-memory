@@ -11,8 +11,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
-
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Storage records
@@ -40,17 +39,17 @@ class SignatureRecord:
     p_magnitude: float = 50.0         # Importance (0–100)
     t_persistence: float = 30.0       # Days it stays relevant
     phase_privilege: float = 1.0      # Nesting multiplier
-    effective_spike: Optional[float] = None  # Computed: p × t/30 × phase
+    effective_spike: float | None = None  # Computed: p × t/30 × phase
 
     # Classification
-    intent_tags: List[str] = field(default_factory=list)
+    intent_tags: list[str] = field(default_factory=list)
     question_regime: str = "neutral"
     domain: str = "insight"            # Inferred from tags
 
     # Retrieval tracking
     retrieval_count: int = 0
-    last_retrieved: Optional[datetime] = None
-    created_at: Optional[datetime] = None
+    last_retrieved: datetime | None = None
+    created_at: datetime | None = None
 
     # Validation coefficient fields
     validation_prediction_total: int = 0
@@ -60,18 +59,18 @@ class SignatureRecord:
     decay_rate: float = 0.9            # Legacy field; ignored by P_effective / decay()
 
     # Optional: temporal deadline
-    t_deadline: Optional[datetime] = None
+    t_deadline: datetime | None = None
     urgency_rate: float = 2.0
 
     # Optional: drawer (category) name
     drawer_domain: str = "general"
 
     # Extra metadata
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     # Storage / lifecycle (Tier 3)
     is_deleted: bool = False
-    idempotency_key: Optional[str] = None
+    idempotency_key: str | None = None
 
     def __post_init__(self) -> None:
         if self.created_at is None:
@@ -113,11 +112,11 @@ class MemoryHit:
     intent_weight: float
     v_coefficient: float
     quality: float
-    last_reinforced: Optional[datetime]
+    last_reinforced: datetime | None
     retrieval_count: int
 
     # Classification
-    intent_tags: List[str]
+    intent_tags: list[str]
     domain: str
 
     # Resonance detail (TAS engine output)
@@ -128,7 +127,7 @@ class MemoryHit:
     pressure_proximity: float = 0.0
 
     # Temporal (if deadline exists)
-    e_temporal: Optional[float] = None
+    e_temporal: float | None = None
     is_urgent: bool = False
 
     @classmethod
@@ -144,7 +143,7 @@ class MemoryHit:
         domain_match: float = 0.0,
         regime_match: float = 0.0,
         pressure_proximity: float = 0.0,
-    ) -> "MemoryHit":
+    ) -> MemoryHit:
         return cls(
             id=record.id,
             text=record.compressed_fact,
@@ -204,8 +203,8 @@ class ExplainReport:
     p_magnitude: float
     t_persistence: float
     effective_spike: float
-    created_at: Optional[datetime]
-    last_retrieved: Optional[datetime]
+    created_at: datetime | None
+    last_retrieved: datetime | None
     retrieval_count: int
 
     # Computed at explain time
@@ -213,19 +212,19 @@ class ExplainReport:
     half_life_days: float
     decay_factor: float
     v_coefficient: float
-    intent_weight: Optional[float]   # None if no query was given
+    intent_weight: float | None   # None if no query was given
     quality: float
     p_effective: float
 
     # Resonance breakdown
-    coupling_score: Optional[float]
-    tag_overlap: Optional[float]
-    domain_match: Optional[float]
-    regime_match: Optional[float]
-    pressure_proximity: Optional[float]
+    coupling_score: float | None
+    tag_overlap: float | None
+    domain_match: float | None
+    regime_match: float | None
+    pressure_proximity: float | None
 
     # Intent tags
-    intent_tags: List[str]
+    intent_tags: list[str]
     domain: str
 
     def render(self) -> str:

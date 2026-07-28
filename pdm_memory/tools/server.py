@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse
@@ -44,7 +44,7 @@ class ResolveTorsionBody(BaseModel):
     signature_a_id: str
     signature_b_id: str
     use_ai: bool = True
-    reconciled_text: Optional[str] = Field(default=None, max_length=500)
+    reconciled_text: str | None = Field(default=None, max_length=500)
 
 
 def _tag_jaccard(a: list[str], b: list[str]) -> float:
@@ -196,7 +196,7 @@ def create_app(
     @app.get("/api/v1/torsion")
     def torsion(
         threshold: float = Query(default=0.7, ge=0.0, le=1.0),
-        drawer: Optional[str] = Query(default=None),
+        drawer: str | None = Query(default=None),
     ) -> dict[str, Any]:
         """Return torsion reports; ``latest`` is the highest-scoring pair."""
         with Memory(store=app.state.store, user=app.state.user) as mem:

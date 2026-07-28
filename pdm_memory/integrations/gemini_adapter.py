@@ -22,7 +22,7 @@ Usage:
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -64,10 +64,10 @@ class PDMGeminiClient:
     def chat(
         self,
         message: str,
-        model: Optional[str] = None,
-        system_prompt: Optional[str] = None,
-        recall_k: Optional[int] = None,
-        save_reply: Optional[bool] = None,
+        model: str | None = None,
+        system_prompt: str | None = None,
+        recall_k: int | None = None,
+        save_reply: bool | None = None,
         **gemini_kwargs: Any,
     ) -> str:
         """

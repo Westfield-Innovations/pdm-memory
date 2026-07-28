@@ -13,8 +13,9 @@ suitable as a final gate before an agent ACT.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 from pdm_memory.core.math import calculate_intent_weight, infer_domain
 from pdm_memory.core.signature import SignatureRecord
@@ -158,9 +159,9 @@ def select_goal_anchors(
     *,
     min_pressure: float = DEFAULT_MIN_PRESSURE,
     k: int = DEFAULT_K_GOALS,
-) -> List[SignatureRecord]:
+) -> list[SignatureRecord]:
     """High-pressure stewardship/foundational signatures ranked by IAW."""
-    pool: List[tuple[float, SignatureRecord]] = []
+    pool: list[tuple[float, SignatureRecord]] = []
     for rec in records:
         if float(rec.p_magnitude or 0.0) < min_pressure:
             continue
@@ -232,7 +233,7 @@ def _forbidden_after_negation(goal_text: str) -> set[str]:
 
 
 def intent_goal_resonance(
-    engine: "RetrievalEngine",
+    engine: RetrievalEngine,
     intent_text: str,
     goal: SignatureRecord,
 ) -> float:
@@ -332,7 +333,7 @@ def _stem(token: str) -> str:
 
 
 def verify_alignment(
-    engine: "RetrievalEngine",
+    engine: RetrievalEngine,
     records: Sequence[SignatureRecord],
     intent_text: str,
     *,
@@ -365,7 +366,7 @@ def verify_alignment(
             anchor_count=0,
         )
 
-    scored: List[_AnchorScore] = []
+    scored: list[_AnchorScore] = []
     for goal in anchors:
         iaw = compute_iaw(goal)
         resonance = intent_goal_resonance(engine, text, goal)
@@ -456,7 +457,7 @@ def _explain_conflict(
     )
 
 
-def _tokenize(text: str) -> List[str]:
+def _tokenize(text: str) -> list[str]:
     words = _WORD_RE.findall((text or "").lower())
     stop = {
         "the", "and", "for", "how", "what", "that", "this", "with",
@@ -466,7 +467,7 @@ def _tokenize(text: str) -> List[str]:
     return [w for w in words if w not in stop]
 
 
-def _snip(text: Optional[str], max_len: int = 80) -> str:
+def _snip(text: str | None, max_len: int = 80) -> str:
     cleaned = " ".join((text or "").split())
     if not cleaned:
         return "empty"

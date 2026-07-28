@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-
 import pytest
 
 from pdm_memory import Memory
@@ -93,6 +92,7 @@ class TestStoragePing:
     def test_explorer_health_includes_storage(self, tmp_path):
         pytest.importorskip("fastapi")
         from fastapi.testclient import TestClient
+
         from pdm_memory.tools.server import create_app
 
         db = str(tmp_path / "health.db")

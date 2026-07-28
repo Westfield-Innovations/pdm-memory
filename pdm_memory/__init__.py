@@ -19,20 +19,20 @@ The public surface of the SDK:
 See README.md for full documentation.
 """
 
+from pdm_memory.core.signature import DrawerInfo, MemoryHit
 from pdm_memory.memory import Memory
-from pdm_memory.core.signature import MemoryHit, DrawerInfo
 from pdm_memory.models import AlignmentReport, SurfaceReport, TorsionReport
 from pdm_memory.storage.factory import create_storage, register_storage
 
 __version__ = "0.2.0"
 __all__ = [
+    "AlignmentReport",
+    "DrawerInfo",
     "Memory",
     "MemoryHit",
-    "DrawerInfo",
-    "AlignmentReport",
     "SurfaceReport",
     "TorsionReport",
+    "__version__",
     "create_storage",
     "register_storage",
-    "__version__",
 ]

@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -36,15 +35,15 @@ class JWTAuth:
     def __init__(
         self,
         token: str,
-        refresh_token: Optional[str] = None,
-        refresh_url: Optional[str] = None,
+        refresh_token: str | None = None,
+        refresh_url: str | None = None,
         expire_buffer: int = 60,
     ) -> None:
         self._token = token
         self._refresh_token = refresh_token
         self._refresh_url = refresh_url
         self._expire_buffer = expire_buffer
-        self._expires_at: Optional[float] = self._decode_exp(token)
+        self._expires_at: float | None = self._decode_exp(token)
 
     # ------------------------------------------------------------------
     # Public API
@@ -54,7 +53,7 @@ class JWTAuth:
     def token(self) -> str:
         return self._token
 
-    def headers(self) -> Dict[str, str]:
+    def headers(self) -> dict[str, str]:
         """Return Authorization headers for an HTTP request."""
         return {"Authorization": f"Bearer {self._token}"}
 
@@ -93,19 +92,18 @@ class JWTAuth:
 
     def ensure_fresh(self) -> None:
         """Refresh token if expired. Raises RuntimeError if refresh fails."""
-        if self.is_expired():
-            if not self.refresh():
-                raise RuntimeError(
-                    "PDM cloud auth: access token is expired and could not be refreshed. "
-                    "Please provide a new token via Memory(token=...)."
-                )
+        if self.is_expired() and not self.refresh():
+            raise RuntimeError(
+                "PDM cloud auth: access token is expired and could not be refreshed. "
+                "Please provide a new token via Memory(token=...)."
+            )
 
     # ------------------------------------------------------------------
     # Private
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _decode_exp(token: str) -> Optional[float]:
+    def _decode_exp(token: str) -> float | None:
         """Decode the 'exp' claim from a JWT without validating the signature."""
         try:
             import base64

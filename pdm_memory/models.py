@@ -11,7 +11,7 @@ Keep these stable: they are part of the public API surface for tooling/CLI.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any
 
 
 @dataclass(slots=True)
@@ -34,7 +34,7 @@ class TorsionReport:
     explanation: str
     conflict_kind: str  # deadline | factual | polarity | pressure | semantic
 
-    cluster_key: Optional[str] = None
+    cluster_key: str | None = None
 
     def render(self) -> str:
         """Human-readable one-liner for CLI / logs."""
@@ -59,7 +59,7 @@ class AlignmentReport:
 
     status: str
     score: float
-    conflicting_goals: List[str] = field(default_factory=list)
+    conflicting_goals: list[str] = field(default_factory=list)
     explanation: str = ""
     resonance: float = 0.0
     torsion: float = 0.0
@@ -92,8 +92,8 @@ class AlignmentReport:
 class MemoryListPage:
     """Keyset-paginated list of memories."""
 
-    items: List[Any]
-    next_cursor_id: Optional[str] = None
+    items: list[Any]
+    next_cursor_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -102,11 +102,11 @@ class SurfaceReport:
     Lite agent-loop snapshot: recall + torsion scan + alignment gate for one query.
     """
 
-    hits: List[Any]
+    hits: list[Any]
     torsion_count: int
     alignment: str
     alignment_score: float = 0.0
-    torsion_reports: List[TorsionReport] = field(default_factory=list)
+    torsion_reports: list[TorsionReport] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
