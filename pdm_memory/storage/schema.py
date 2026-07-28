@@ -219,9 +219,7 @@ def prepare_update_fields(fields: dict) -> dict:
 
     prepared: dict = {}
     for col, value in fields.items():
-        if col == "intent_tags":
-            prepared[col] = json.dumps(value)
-        elif col == "metadata":
+        if col in ("intent_tags", "metadata"):
             prepared[col] = json.dumps(value)
         elif col in ("last_retrieved", "created_at", "t_deadline") and isinstance(
             value, datetime
@@ -269,7 +267,7 @@ def mapping_to_record(row: Mapping[str, Any]) -> SignatureRecord:
     """Map a DB row (sqlite3.Row or psycopg dict) to SignatureRecord."""
 
     def col(name: str, default: Any = None) -> Any:
-        if hasattr(row, "keys") and name not in row.keys():
+        if hasattr(row, "keys") and name not in row.keys():  # noqa: SIM118
             return default
         try:
             return row[name]

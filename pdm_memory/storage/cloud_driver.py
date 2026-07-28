@@ -322,8 +322,8 @@ class CloudDriver(BaseStorage):
             detail = ""
             try:
                 detail = f" body={resp.text[:300]}"
-            except Exception:
-                pass
+            except Exception as err:
+                logger.debug("[PDM-Cloud] error reading body: %s", err)
             raise CloudStorageError(
                 f"Cloud HTTP {status} for {path}{detail}",
                 status_code=status,

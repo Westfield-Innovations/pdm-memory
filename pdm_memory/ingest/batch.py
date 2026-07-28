@@ -85,8 +85,8 @@ class BatchProcessor:
             if on_progress:
                 try:
                     on_progress(processed, total)
-                except Exception:
-                    pass
+                except Exception as err:
+                    logger.debug("[PDM-Batch] on_progress error: %s", err)
 
             logger.debug(
                 "[PDM-Batch] Batch %d/%d processed | saved=%d skipped=%d errors=%d",

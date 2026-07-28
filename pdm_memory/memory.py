@@ -35,10 +35,10 @@ from __future__ import annotations
 import builtins
 import logging
 import os
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, ContextManager
+from typing import Any
 
 from typing_extensions import Self
 
@@ -265,7 +265,7 @@ class Memory:
         errors = 0
 
         txn = getattr(self._storage, "transaction", None)
-        ctx: ContextManager[None] = txn() if callable(txn) else nullcontext()
+        ctx: AbstractContextManager[None] = txn() if callable(txn) else nullcontext()
 
         with ctx:
             for item in items:
@@ -631,7 +631,7 @@ class Memory:
         p_mag = min(100.0, max(rec_a.p_magnitude, rec_b.p_magnitude) + 8.0)
 
         txn = getattr(self._storage, "transaction", None)
-        ctx: ContextManager[None] = txn() if callable(txn) else nullcontext()
+        ctx: AbstractContextManager[None] = txn() if callable(txn) else nullcontext()
         with ctx:
             new_id = self.save(
                 text,
@@ -926,7 +926,7 @@ class Memory:
             )
 
         if isinstance(self._storage, CloudDriver):
-            raise RuntimeError(
+            raise RuntimeError(  # noqa: TRY004
                 "sync() requires a local storage backend (SQLite, PostgreSQL, etc.). "
                 "Cloud-only Memory cannot sync to itself."
             )

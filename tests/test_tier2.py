@@ -60,14 +60,18 @@ class TestExportImport:
         with Memory(store=db, user="default") as mem:
             mem.save("CLI export fact", tags=["cli", "io", "test"])
 
-        with patch("sys.argv", ["pdm-cli", "--store", db, "export", "--out", str(out)]):
-            with patch("sys.stdout", StringIO()):
-                main()
+        with (
+            patch("sys.argv", ["pdm-cli", "--store", db, "export", "--out", str(out)]),
+            patch("sys.stdout", StringIO()),
+        ):
+            main()
 
         db2 = str(tmp_path / "cli_io2.db")
-        with patch("sys.argv", ["pdm-cli", "--store", db2, "import", str(out)]):
-            with patch("sys.stdout", StringIO()):
-                main()
+        with (
+            patch("sys.argv", ["pdm-cli", "--store", db2, "import", str(out)]),
+            patch("sys.stdout", StringIO()),
+        ):
+            main()
 
         with Memory(store=db2, user="default") as mem:
             assert mem.count() == 1

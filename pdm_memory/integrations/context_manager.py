@@ -115,8 +115,8 @@ class ContextWindowManager:
         if self._encoder is not None:
             try:
                 return len(self._encoder.encode(text))
-            except Exception:
-                pass
+            except Exception as err:
+                logger.debug("[PDM] encode error fallback: %s", err)
         # Fallback: character approximation
         return max(1, int(len(text) / self._chars_per_token))
 

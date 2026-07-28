@@ -139,7 +139,7 @@ def import_signatures_json(
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     items: list[dict[str, Any]] = raw.get("signatures") or raw.get("records") or []
     if not isinstance(items, list):
-        raise ValueError("JSON must contain a 'signatures' array")
+        raise ValueError("JSON must contain a 'signatures' array")  # noqa: TRY004
 
     saved = 0
     skipped = 0
