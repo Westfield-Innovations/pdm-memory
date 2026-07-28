@@ -92,6 +92,22 @@ class TestMemorySaveRecall:
         assert mem.count() == 2
 
 
+class TestReconcileTorsion:
+    def test_reconcile_does_not_return_deleted_dedupe_id(self, mem):
+        """Reconciled text matching an existing fact must not reuse that ID."""
+        a = mem.save("Fact A", tags=["x", "y", "z"], p_magnitude=50)
+        b = mem.save("Fact B", tags=["x", "y", "z"], p_magnitude=45)
+        new_id = mem.reconcile_torsion(a, b, "Fact A")
+
+        assert new_id != a
+        merged = mem.get(new_id)
+        assert merged is not None
+        assert merged.text == "Fact A"
+        assert mem.get(a) is None
+        assert mem.get(b) is None
+        assert mem.count() == 1
+
+
 class TestMemoryFromEnv:
     def test_from_env_sqlite(self, tmp_path, monkeypatch):
         db = str(tmp_path / "env.db")

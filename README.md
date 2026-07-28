@@ -140,7 +140,7 @@ from pdm_memory.auth import JWTAuth
 auth = JWTAuth(
     token="eyJ...",
     refresh_token="eyJ...",
-    refresh_url="https://api.azus.ai/api/v1/accounts/auth/refresh/",
+    refresh_url="https://api.azus.ai/api/v1/accounts/token/refresh/",
 )
 ```
 

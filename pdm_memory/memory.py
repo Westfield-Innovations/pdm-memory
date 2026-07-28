@@ -96,6 +96,9 @@ class Memory:
         self._user = user
         self._engine = engine or RetrievalEngine()
         self._torsion_judge = torsion_judge
+        self._token = token
+        self._refresh_token = refresh_token
+        self._cloud_url = cloud_url
         self._cloud_driver: Optional[Any] = None   # lazy init
         if storage is not None:
             if not isinstance(storage, BaseStorage):
@@ -633,6 +636,7 @@ class Memory:
                 drawer=drawer,
                 p_magnitude=p_mag,
                 source="reconcile",
+                dedupe=False,
             )
             self._storage.delete(signature_a_id, user=self._user)
             self._storage.delete(signature_b_id, user=self._user)
@@ -1088,11 +1092,19 @@ class Memory:
     ) -> Optional[Any]:
         if self._cloud_driver:
             return self._cloud_driver
-        if token and cloud_url:
+        resolved_url = cloud_url or self._cloud_url
+        resolved_token = token or self._token
+        if resolved_token and resolved_url:
             from pdm_memory.auth.jwt_handler import JWTAuth
             from pdm_memory.storage.cloud_driver import CloudDriver
-            auth = JWTAuth(token=token)
-            return CloudDriver(auth=auth, base_url=cloud_url, user=self._user)
+            from pdm_memory.storage.factory import companion_token_refresh_url
+
+            auth = JWTAuth(
+                token=resolved_token,
+                refresh_token=self._refresh_token,
+                refresh_url=companion_token_refresh_url(resolved_url),
+            )
+            return CloudDriver(auth=auth, base_url=resolved_url, user=self._user)
         return None
 
     def _apply_torsion_v_penalty(self, reports: List[TorsionReport]) -> None:

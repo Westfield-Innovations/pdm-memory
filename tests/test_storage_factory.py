@@ -6,7 +6,7 @@ import pytest
 
 from pdm_memory import Memory
 from pdm_memory.storage.base import BaseStorage
-from pdm_memory.storage.factory import create_storage, register_storage
+from pdm_memory.storage.factory import create_storage, register_storage, companion_token_refresh_url
 from pdm_memory.storage.sqlite_driver import SQLiteDriver
 
 
@@ -65,6 +65,22 @@ class TestStorageFactory:
     def test_cloud_requires_token(self):
         with pytest.raises(ValueError, match="token"):
             create_storage("cloud")
+
+    def test_cloud_builds_jwt_refresh_url(self):
+        from pdm_memory.storage.cloud_driver import CloudDriver
+
+        driver = create_storage(
+            "cloud",
+            token="access-token",
+            refresh_token="refresh-token",
+            cloud_url="https://api.azus.ai/",
+        )
+        assert isinstance(driver, CloudDriver)
+        assert driver._auth._refresh_url == companion_token_refresh_url(
+            "https://api.azus.ai/"
+        )
+        assert driver._auth._refresh_url.endswith("/api/v1/accounts/token/refresh/")
+        driver.close()
 
     def test_postgres_requires_psycopg(self):
         with pytest.raises(ImportError, match="postgres"):

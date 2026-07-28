@@ -142,6 +142,22 @@ class TestJWTAuthUnit:
         assert "PDM cloud auth: access token is expired" in str(exc_info.value)
 
 class TestCloudDriverAuthIntegration:
+    def test_create_storage_cloud_wires_refresh_url(self):
+        from pdm_memory.storage.cloud_driver import CloudDriver
+        from pdm_memory.storage.factory import create_storage
+
+        driver = create_storage(
+            "cloud",
+            token="access",
+            refresh_token="refresh",
+            cloud_url="http://localhost:8000",
+        )
+        assert isinstance(driver, CloudDriver)
+        assert driver._auth._refresh_url == (
+            "http://localhost:8000/api/v1/accounts/token/refresh/"
+        )
+        driver.close()
+
     @patch("httpx.post")
     @patch("httpx.get")
     def test_cloud_driver_auto_retry_on_401(self, mock_get, mock_post):

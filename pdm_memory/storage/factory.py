@@ -36,6 +36,11 @@ _BUILTIN_SCHEMES: dict[str, StorageBuilder] = {}
 _CUSTOM_SCHEMES: dict[str, StorageBuilder] = {}
 
 
+def companion_token_refresh_url(cloud_url: str) -> str:
+    """Companion API JWT refresh endpoint derived from ``cloud_url`` base."""
+    return f"{cloud_url.rstrip('/')}/api/v1/accounts/token/refresh/"
+
+
 def register_storage(scheme: str, builder: StorageBuilder) -> None:
     """
     Register a custom storage backend for a URL scheme.
@@ -88,7 +93,11 @@ def _build_cloud(
     from pdm_memory.auth.jwt_handler import JWTAuth
     from pdm_memory.storage.cloud_driver import CloudDriver
 
-    auth = JWTAuth(token=token, refresh_token=refresh_token)
+    auth = JWTAuth(
+        token=token,
+        refresh_token=refresh_token,
+        refresh_url=companion_token_refresh_url(cloud_url),
+    )
     return CloudDriver(auth=auth, base_url=cloud_url, user=user)
 
 

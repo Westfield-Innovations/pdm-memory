@@ -9,7 +9,7 @@ Manages Bearer token authentication for cloud storage requests.
 Optionally handles refresh-token flows automatically on 401.
 
 Usage:
-    auth = JWTAuth(token="eyJ...", refresh_token="eyJ...", refresh_url="https://api.azus.ai/api/v1/accounts/auth/refresh/")
+    auth = JWTAuth(token="eyJ...", refresh_token="eyJ...", refresh_url="https://api.azus.ai/api/v1/accounts/token/refresh/")
     headers = auth.headers()
 """
 
