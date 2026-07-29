@@ -201,6 +201,107 @@ class TestTemporalRecall:
         urgent = next(h for h in hits if h.id == mid_a)
         assert (urgent.e_temporal or 0.0) > 0.0
 
+    def test_yesterday_query_prioritizes_t_event_at_window(self, mem):
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(tz=timezone.utc)
+        yesterday = datetime(now.year, now.month, now.day, 15, 0, tzinfo=timezone.utc) - timedelta(
+            days=1
+        )
+        last_month = now - timedelta(days=25)
+
+        id_y = mem.save(
+            "Architecture review action items from the daily sync",
+            tags=["architecture", "review", "sync", "meeting"],
+            p_magnitude=60,
+            event_at=yesterday,
+        )
+        id_old = mem.save(
+            "Architecture review backlog from the planning sync",
+            tags=["architecture", "review", "sync", "meeting"],
+            p_magnitude=90,
+            event_at=last_month,
+        )
+
+        hits = mem.recall(
+            "what happened yesterday in architecture review",
+            k=5,
+            search_cost=1.0,
+            reinforce=False,
+            diversity_bias=None,
+        )
+        ids = [h.id for h in hits]
+        assert id_y in ids
+        assert id_old in ids
+        # Window match beats higher pressure outside the window
+        assert ids.index(id_y) < ids.index(id_old)
+
+
+class TestAuditAndHeal:
+    def test_auto_reconciles_high_confidence_torsion(self, mem):
+        from datetime import datetime, timezone
+
+        a = mem.save(
+            "Project Alpha deadline is July 10",
+            tags=["project", "alpha", "deadline"],
+            drawer="projects",
+            p_magnitude=70,
+            deadline=datetime(2026, 7, 10, tzinfo=timezone.utc),
+            dedupe=False,
+        )
+        b = mem.save(
+            "Project Alpha deadline is July 15",
+            tags=["project", "alpha", "deadline"],
+            drawer="projects",
+            p_magnitude=72,
+            deadline=datetime(2026, 7, 15, tzinfo=timezone.utc),
+            dedupe=False,
+        )
+        assert mem.count() == 2
+
+        summary = mem.audit_and_heal(
+            torsion_threshold=0.5,
+            auto_reconcile_threshold=0.85,
+            run_decay=False,
+        )
+        assert summary["scanned_pairs"] >= 1
+        assert summary["reconciled"] == 1
+        assert mem.get(a) is None
+        assert mem.get(b) is None
+        assert mem.count() == 1
+        survivor = mem.list(limit=5).items[0]
+        assert "July" in survivor.text
+
+    def test_dry_run_does_not_write(self, mem):
+        from datetime import datetime, timezone
+
+        mem.save(
+            "Launch window is August 1",
+            tags=["launch", "window", "orion"],
+            drawer="product",
+            p_magnitude=70,
+            deadline=datetime(2026, 8, 1, tzinfo=timezone.utc),
+            dedupe=False,
+        )
+        mem.save(
+            "Launch window is August 8",
+            tags=["launch", "window", "orion"],
+            drawer="product",
+            p_magnitude=70,
+            deadline=datetime(2026, 8, 8, tzinfo=timezone.utc),
+            dedupe=False,
+        )
+        before = mem.count()
+        summary = mem.audit_and_heal(
+            torsion_threshold=0.5,
+            auto_reconcile_threshold=0.85,
+            run_decay=False,
+            dry_run=True,
+        )
+        assert summary["dry_run"] is True
+        assert summary["reconciled"] >= 1
+        assert mem.count() == before
+
 
 class TestMemoryFromEnv:
     def test_from_env_sqlite(self, tmp_path, monkeypatch):

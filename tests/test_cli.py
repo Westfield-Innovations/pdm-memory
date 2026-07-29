@@ -132,3 +132,81 @@ class TestCLIExplain:
         db = str(tmp_path / "explain_test2.db")
         _output, code = run_cli(["--store", db, "explain", "nonexistent-id-123456789abc"])
         assert code == 1
+
+
+class TestCLIHeal:
+    def test_heal_reconciles_deadline_torsion(self, tmp_path):
+        from datetime import datetime, timezone
+
+        from pdm_memory import Memory
+
+        db = str(tmp_path / "heal_test.db")
+        with Memory(store=db, user="default") as mem:
+            mem.save(
+                "Project Alpha deadline is July 10",
+                tags=["project", "alpha", "deadline"],
+                drawer="projects",
+                p_magnitude=70,
+                deadline=datetime(2026, 7, 10, tzinfo=timezone.utc),
+                dedupe=False,
+            )
+            mem.save(
+                "Project Alpha deadline is July 15",
+                tags=["project", "alpha", "deadline"],
+                drawer="projects",
+                p_magnitude=72,
+                deadline=datetime(2026, 7, 15, tzinfo=timezone.utc),
+                dedupe=False,
+            )
+            assert mem.count() == 2
+
+        output, code = run_cli(
+            [
+                "--store",
+                db,
+                "heal",
+                "--threshold",
+                "0.5",
+                "--no-decay",
+            ]
+        )
+        assert code == 0
+        assert "Heal complete" in output
+        assert "reconciled:" in output.lower() or "reconciled" in output.lower()
+
+        with Memory(store=db, user="default") as mem:
+            assert mem.count() == 1
+
+    def test_heal_dry_run(self, tmp_path):
+        from datetime import datetime, timezone
+
+        from pdm_memory import Memory
+
+        db = str(tmp_path / "heal_dry.db")
+        with Memory(store=db, user="default") as mem:
+            mem.save(
+                "Budget is 10000",
+                tags=["budget", "q3", "finance"],
+                drawer="finance",
+                p_magnitude=65,
+                deadline=datetime(2026, 9, 1, tzinfo=timezone.utc),
+                dedupe=False,
+            )
+            mem.save(
+                "Budget is 25000",
+                tags=["budget", "q3", "finance"],
+                drawer="finance",
+                p_magnitude=65,
+                deadline=datetime(2026, 9, 15, tzinfo=timezone.utc),
+                dedupe=False,
+            )
+            before = mem.count()
+
+        output, code = run_cli(
+            ["--store", db, "heal", "--threshold", "0.5", "--no-decay", "--dry-run"]
+        )
+        assert code == 0
+        assert "DRY-RUN" in output
+
+        with Memory(store=db, user="default") as mem:
+            assert mem.count() == before

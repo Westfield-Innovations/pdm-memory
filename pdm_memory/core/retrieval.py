@@ -21,7 +21,7 @@ import math
 import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -53,8 +53,10 @@ _SMALL_CLUSTER: int = 48
 # PDM-T: how hard urgency energy lifts ranking / Phase-1 gate
 _TEMPORAL_RANK_BOOST: float = 0.35
 _TEMPORAL_GATE_BOOST: float = 0.25
-# Recommended drawer share cap when enabling diversity_bias
+# Recommended / API-default drawer share cap for parliamentary breadth
 DEFAULT_DIVERSITY_BIAS: float = 0.40
+# Extra rank weight when t_event_at falls inside a query-relative window
+_EVENT_WINDOW_RANK_BOOST: float = 1.75
 _NEGATION_TOKENS: frozenset[str] = frozenset(
     {
         # English (incl. typo / no-apostrophe forms users actually type)
@@ -220,7 +222,7 @@ class RetrievalEngine:
         target_pressure: float = 50.0,
         domain: str | None = None,
         regime: str | None = None,
-        diversity_bias: float | None = None,
+        diversity_bias: float | None = DEFAULT_DIVERSITY_BIAS,
     ) -> list[MemoryHit]:
         """
         Retrieve top-k memories from a list of SignatureRecords.
@@ -234,10 +236,9 @@ class RetrievalEngine:
             target_pressure: Pressure proximity anchor for coupling.
             domain:          Optional domain filter (None = all).
             regime:          Optional regime filter (None = all).
-            diversity_bias:  Optional max fraction of top-k from one drawer
-                             (e.g. ``0.4`` → no drawer > 40% when other
-                             drawers have candidates). ``None`` disables
-                             diversity (pure score order).
+            diversity_bias:  Max fraction of top-k from one drawer
+                             (default ``0.4``). Pass ``None`` for pure
+                             score order; ``1.0`` disables the cap.
 
         Returns:
             List[MemoryHit] ranked by relevance, length ≤ k.
@@ -246,6 +247,7 @@ class RetrievalEngine:
             return []
 
         now = datetime.now(tz=timezone.utc)
+        event_window = self._parse_relative_event_window(query, now)
 
         # Phase 1: threshold lowering
         theta_eff = self._compute_threshold(base_threshold, search_cost)
@@ -313,17 +315,89 @@ class RetrievalEngine:
             else:
                 damped.append(coupling)
 
-        # Sort by coupling × P_eff × (1 + temporal urgency boost)
-        coupled.sort(
-            key=lambda t: (
-                t[0].coupling_score
-                * t[1].p_effective
-                * (1.0 + _TEMPORAL_RANK_BOOST * (t[1].e_temporal or 0.0))
-            ),
-            reverse=True,
-        )
+        # Sort: event-window matches first (when query is time-relative),
+        # then coupling × P_eff × (1 + deadline urgency + window boost).
+        def _rank_key(item: tuple[NodeCoupling, MemoryHit]) -> tuple[int, float]:
+            coupling, hit = item
+            in_window = 1 if self._hit_in_event_window(hit, event_window) else 0
+            window_boost = _EVENT_WINDOW_RANK_BOOST if in_window else 0.0
+            score = (
+                coupling.coupling_score
+                * hit.p_effective
+                * (1.0 + _TEMPORAL_RANK_BOOST * (hit.e_temporal or 0.0) + window_boost)
+            )
+            return (in_window, score)
+
+        coupled.sort(key=_rank_key, reverse=True)
+
+        # Soft filter: if the query named a window and we have in-window hits,
+        # prefer them for top-k; fill remainder from out-of-window by score.
+        if event_window is not None:
+            in_w = [(c, h) for c, h in coupled if self._hit_in_event_window(h, event_window)]
+            out_w = [(c, h) for c, h in coupled if not self._hit_in_event_window(h, event_window)]
+            if in_w:
+                coupled = in_w + out_w
 
         return self._select_with_diversity(coupled, k=k, diversity_bias=diversity_bias)
+
+    @staticmethod
+    def _parse_relative_event_window(
+        query: str | None,
+        now: datetime,
+    ) -> tuple[datetime, datetime] | None:
+        """
+        Map relative time phrases in *query* to a half-open UTC window
+        ``[start, end)`` for ``t_event_at`` prioritization.
+
+        Recognizes: today, yesterday, tomorrow, last week, this week,
+        last month, last year. Returns ``None`` when no temporal cue.
+        """
+        if not query or not query.strip():
+            return None
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+
+        text = query.lower()
+        day0 = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+
+        # Multi-word phrases first (order matters)
+        if re.search(r"\blast\s+year\b", text):
+            start = day0 - timedelta(days=365)
+            return start, day0 + timedelta(days=1)
+        if re.search(r"\blast\s+month\b", text):
+            start = day0 - timedelta(days=30)
+            return start, day0 + timedelta(days=1)
+        if re.search(r"\blast\s+week\b|\bpast\s+week\b", text):
+            start = day0 - timedelta(days=7)
+            return start, day0 + timedelta(days=1)
+        if re.search(r"\bthis\s+week\b", text):
+            # Monday-start ISO week through end of today
+            start = day0 - timedelta(days=day0.weekday())
+            return start, day0 + timedelta(days=1)
+        if re.search(r"\byesterday\b", text):
+            start = day0 - timedelta(days=1)
+            return start, day0
+        if re.search(r"\btomorrow\b", text):
+            start = day0 + timedelta(days=1)
+            return start, day0 + timedelta(days=2)
+        if re.search(r"\btoday\b", text):
+            return day0, day0 + timedelta(days=1)
+        return None
+
+    @staticmethod
+    def _hit_in_event_window(
+        hit: MemoryHit,
+        window: tuple[datetime, datetime] | None,
+    ) -> bool:
+        if window is None:
+            return False
+        event_at = hit.t_event_at
+        if event_at is None:
+            return False
+        if event_at.tzinfo is None:
+            event_at = event_at.replace(tzinfo=timezone.utc)
+        start, end = window
+        return start <= event_at < end
 
     @staticmethod
     def _select_with_diversity(

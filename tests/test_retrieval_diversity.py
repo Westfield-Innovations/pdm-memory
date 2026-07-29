@@ -9,6 +9,8 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime, timezone
 
+import pytest
+
 from pdm_memory.core.retrieval import NodeCoupling, RetrievalEngine
 from pdm_memory.core.signature import MemoryHit, SignatureRecord
 
@@ -116,6 +118,15 @@ class TestSelectWithDiversity:
             ranked, k=3, diversity_bias=1.0
         )
         assert [h.drawer for h in hits] == ["work", "work", "work"]
+
+    def test_engine_default_diversity_bias_is_point_four(self) -> None:
+        import inspect
+
+        from pdm_memory.core.retrieval import DEFAULT_DIVERSITY_BIAS
+
+        assert DEFAULT_DIVERSITY_BIAS == pytest.approx(0.4)
+        param = inspect.signature(RetrievalEngine.recall).parameters["diversity_bias"]
+        assert param.default == DEFAULT_DIVERSITY_BIAS
 
 
 class TestRecallDiversityBias:

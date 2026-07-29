@@ -52,7 +52,7 @@ from pdm_memory.core.math import (
     infer_domain,
     resolve_half_life,
 )
-from pdm_memory.core.retrieval import RetrievalEngine
+from pdm_memory.core.retrieval import DEFAULT_DIVERSITY_BIAS, RetrievalEngine
 from pdm_memory.core.signature import (
     DrawerInfo,
     ExplainReport,
@@ -513,7 +513,7 @@ class Memory:
         *,
         candidate_limit: int = 10_000,
         page_size: int = 500,
-        diversity_bias: float | None = None,
+        diversity_bias: float | None = DEFAULT_DIVERSITY_BIAS,
         on_recall: RecallHook | None = None,
     ) -> builtins.list[MemoryHit]:
         """
@@ -536,8 +536,8 @@ class Memory:
             reinforce:   If True, increment retrieval_count and update last_retrieved.
             candidate_limit: Max signatures loaded from storage for ranking (default 10_000).
             page_size:       Keyset page size when loading candidates (default 500).
-            diversity_bias:  Optional max fraction of top-k from one drawer
-                             (e.g. ``0.4``). ``None`` = pure score order.
+            diversity_bias:  Max fraction of top-k from one drawer (default ``0.4``).
+                             Pass ``None`` for pure score order.
             on_recall:       Optional callback invoked for each returned hit before reinforce.
 
         Returns:
@@ -743,6 +743,106 @@ class Memory:
             new_id[:8],
         )
         return new_id
+
+    def audit_and_heal(
+        self,
+        *,
+        torsion_threshold: float = 0.70,
+        auto_reconcile_threshold: float = 0.85,
+        run_decay: bool = True,
+        dry_run: bool = False,
+        drawer: str | None = None,
+        limit: int = 10_000,
+    ) -> dict[str, Any]:
+        """
+        Full-store self-maintenance: torsion scan, auto-reconcile, decay purge.
+
+        1. ``detect_torsion`` across the store (optional drawer filter).
+        2. Auto-reconcile pairs with ``torsion_score > auto_reconcile_threshold``
+           (default ``0.85``), highest score first; overlapping IDs skipped.
+        3. Optional ``decay()`` purge of low ``P_effective`` signatures.
+
+        Returns:
+            Dict with ``scanned_pairs``, ``reconciled``, ``skipped``,
+            ``reconciled_ids``, ``decay`` (nested decay counts or None).
+        """
+        reports = self.detect_torsion(
+            drawer=drawer,
+            threshold=torsion_threshold,
+            limit=limit,
+        )
+        # Strictly greater than threshold (architectural claim: score > 0.85)
+        candidates = sorted(
+            (r for r in reports if float(r.torsion_score) > float(auto_reconcile_threshold)),
+            key=lambda r: float(r.torsion_score),
+            reverse=True,
+        )
+
+        reconciled = 0
+        skipped = 0
+        reconciled_ids: list[str] = []
+        consumed: set[str] = set()
+
+        for report in candidates:
+            a_id = report.signature_a_id
+            b_id = report.signature_b_id
+            if a_id in consumed or b_id in consumed:
+                skipped += 1
+                continue
+            rec_a = self._storage.get(a_id, user=self._user)
+            rec_b = self._storage.get(b_id, user=self._user)
+            if rec_a is None or rec_b is None:
+                skipped += 1
+                continue
+
+            # Prefer the higher-pressure fact as the surviving narrative
+            if float(rec_a.p_magnitude) >= float(rec_b.p_magnitude):
+                text = (rec_a.compressed_fact or "").strip()
+            else:
+                text = (rec_b.compressed_fact or "").strip()
+            if not text:
+                skipped += 1
+                continue
+
+            if dry_run:
+                reconciled += 1
+                reconciled_ids.append(f"dry:{a_id[:8]}+{b_id[:8]}")
+                consumed.add(a_id)
+                consumed.add(b_id)
+                continue
+
+            try:
+                new_id = self.reconcile_torsion(a_id, b_id, text)
+            except ValueError as exc:
+                logger.warning(
+                    "[PDM] audit_and_heal skip pair %s+%s: %s",
+                    a_id[:8],
+                    b_id[:8],
+                    exc,
+                )
+                skipped += 1
+                continue
+
+            reconciled += 1
+            reconciled_ids.append(new_id)
+            consumed.add(a_id)
+            consumed.add(b_id)
+
+        decay_counts: dict[str, int] | None = None
+        if run_decay:
+            decay_counts = self.decay(dry_run=dry_run)
+
+        summary = {
+            "scanned_pairs": len(reports),
+            "auto_reconcile_threshold": float(auto_reconcile_threshold),
+            "reconciled": reconciled,
+            "skipped": skipped,
+            "reconciled_ids": reconciled_ids,
+            "decay": decay_counts,
+            "dry_run": dry_run,
+        }
+        logger.info("[PDM] audit_and_heal %s", summary)
+        return summary
 
     def verify_alignment(
         self,

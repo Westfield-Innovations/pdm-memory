@@ -187,6 +187,35 @@ def cmd_detect_torsion(args: argparse.Namespace) -> None:
             print(f"{i}. {report.render()}\n")
 
 
+def cmd_heal(args: argparse.Namespace) -> None:
+    """Full-store audit: detect torsion, auto-reconcile high-confidence pairs, decay."""
+    from pdm_memory import Memory
+
+    with Memory(store=args.store, user=args.user) as mem:
+        summary = mem.audit_and_heal(
+            torsion_threshold=args.threshold,
+            auto_reconcile_threshold=args.auto_reconcile_threshold,
+            run_decay=not args.no_decay,
+            dry_run=args.dry_run,
+            drawer=args.drawer or None,
+        )
+        mode = "DRY-RUN " if summary.get("dry_run") else ""
+        print(f"{mode}Heal complete:")
+        print(f"  scanned_pairs:  {summary['scanned_pairs']}")
+        print(f"  reconciled:     {summary['reconciled']} (threshold > {summary['auto_reconcile_threshold']})")
+        print(f"  skipped:        {summary['skipped']}")
+        if summary.get("reconciled_ids"):
+            print(f"  reconciled_ids: {', '.join(summary['reconciled_ids'][:10])}")
+        decay = summary.get("decay")
+        if decay is None:
+            print("  decay:          (skipped)")
+        else:
+            print(
+                f"  decay:          deleted={decay.get('deleted', 0)} "
+                f"skipped={decay.get('skipped', 0)}"
+            )
+
+
 def cmd_verify(args: argparse.Namespace) -> None:
     from pdm_memory import Memory
 
@@ -366,6 +395,38 @@ def main() -> None:
         help="Lower Validation Coefficient (V) on conflicting signatures",
     )
     p_torsion.set_defaults(func=cmd_detect_torsion)
+
+    # heal (audit_and_heal — torsion auto-reconcile + decay)
+    p_heal = subparsers.add_parser(
+        "heal",
+        parents=[sub_parent_parser],
+        help="Audit store: detect torsion, auto-reconcile pairs >0.85, run decay",
+    )
+    p_heal.add_argument("--drawer", type=str, default=None, help="Limit torsion scan to one drawer")
+    p_heal.add_argument(
+        "--threshold",
+        type=float,
+        default=0.7,
+        help="Minimum torsion_score to scan (default: 0.7)",
+    )
+    p_heal.add_argument(
+        "--auto-reconcile-threshold",
+        type=float,
+        default=0.85,
+        help="Auto-reconcile pairs with torsion_score > this value (default: 0.85)",
+    )
+    p_heal.add_argument(
+        "--no-decay",
+        action="store_true",
+        help="Skip the decay purge pass after reconciliation",
+    )
+    p_heal.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview reconciliations / decay without writing",
+    )
+    p_heal.set_defaults(func=cmd_heal)
+
     # verify (Goal-Anchor Alignment)
     p_verify = subparsers.add_parser(
         "verify",
