@@ -58,8 +58,12 @@ class SignatureRecord:
     # Decay config (schema compat — NOT used by pressure decay; half-life is canonical)
     decay_rate: float = 0.9            # Legacy field; ignored by P_effective / decay()
 
-    # Optional: temporal deadline
+    # Optional: temporal deadline + event time (PDM-T)
+    # t_deadline  — when pressure peaks / due (future cliff)
+    # t_event_at  — when the referenced event happened or will happen
+    #               (past OR future). Powers "what happened yesterday".
     t_deadline: datetime | None = None
+    t_event_at: datetime | None = None
     urgency_rate: float = 2.0
 
     # Optional: drawer (category) name
@@ -126,9 +130,11 @@ class MemoryHit:
     regime_match: float = 0.0
     pressure_proximity: float = 0.0
 
-    # Temporal (if deadline exists)
+    # Temporal (PDM-T)
     e_temporal: float | None = None
     is_urgent: bool = False
+    t_event_at: datetime | None = None
+    t_deadline: datetime | None = None
 
     @classmethod
     def from_record(
@@ -169,6 +175,8 @@ class MemoryHit:
             pressure_proximity=pressure_proximity,
             e_temporal=e_temporal,
             is_urgent=is_urgent,
+            t_event_at=record.t_event_at,
+            t_deadline=record.t_deadline,
         )
 
 

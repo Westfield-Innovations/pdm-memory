@@ -60,6 +60,7 @@ def record_to_dict(rec: SignatureRecord) -> dict[str, Any]:
         "validation_prediction_correct": rec.validation_prediction_correct,
         "decay_rate": rec.decay_rate,
         "t_deadline": _dt_to_iso(rec.t_deadline),
+        "t_event_at": _dt_to_iso(rec.t_event_at),
         "urgency_rate": rec.urgency_rate,
         "metadata": dict(rec.metadata or {}),
     }
@@ -92,6 +93,7 @@ def dict_to_record(data: dict[str, Any], *, user: str) -> SignatureRecord:
         validation_prediction_correct=int(data.get("validation_prediction_correct") or 0),
         decay_rate=float(data.get("decay_rate", 0.9)),
         t_deadline=_iso_to_dt(data.get("t_deadline")),
+        t_event_at=_iso_to_dt(data.get("t_event_at")),
         urgency_rate=float(data.get("urgency_rate", 2.0)),
         metadata=dict(data.get("metadata") or {}),
     )

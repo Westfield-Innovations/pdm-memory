@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional, Literal
 
 if TYPE_CHECKING:
     from pdm_memory.core.signature import MemoryHit, SignatureRecord
@@ -18,3 +18,20 @@ TorsionJudge = Callable[["SignatureRecord", "SignatureRecord"], Optional["Torsio
 
 # Called for each hit returned by recall() (before reinforce writes).
 RecallHook = Callable[["MemoryHit"], None]
+
+# -----------------------------
+# Internal Memory hook system
+# -----------------------------
+
+HookEvent = Literal["pre_save", "post_save", "post_recall"]
+
+# Called right before storage.save(sig).
+# Return a replacement SignatureRecord to mutate/override persistence.
+PreSaveHook = Callable[["SignatureRecord"], "SignatureRecord | None"]
+
+# Called after storage.save(sig) produced memory_id.
+PostSaveHook = Callable[["SignatureRecord", str], None]
+
+# Called at the end of recall(), after optional on_recall() + reinforcement writes.
+# Receives a context dict to avoid locking plugins to a specific parameter list.
+PostRecallHook = Callable[[dict[str, Any]], None]

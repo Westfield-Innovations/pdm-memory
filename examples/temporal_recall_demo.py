@@ -4,22 +4,22 @@
 temporal_recall_demo.py — Time Awareness (PDM-T)
 ================================================
 
-PDM does not expose a field named ``t_event_at``. Temporal events are stored
-via ``deadline=`` on ``save()`` (persisted as ``t_deadline``). That is the
-Westfield PDM-T temporal anchor.
+PDM temporal events use ``event_at=`` / ``t_event_at`` (when the event
+happened or will happen) and ``deadline=`` / ``t_deadline`` (due cliff).
 
 Westfield concepts used here
 ----------------------------
-  deadline / t_deadline — when the memory becomes due or expires.
-  Temporal geometry     — urgency ramp toward the deadline (E_T, P_T, S_T).
+  t_event_at            — chronological anchor for Life Radar / history queries.
+  deadline / t_deadline — when pressure peaks (PDM-T urgency ramp).
+  Temporal geometry     — urgency energy toward the deadline (E_T, P_T, S_T).
   search_cost (TAS)     — 0.0 = tight pressure window (only high P_eff);
                           1.0 = loose window (chronologically / pressure-wise
                           more of the store can surface).
 
 This demo saves:
-  • yesterday's meeting  — deadline already past (EXPIRED geometry)
-  • next week's plan     — deadline in the future (ACTIVE / URGENT ramp)
-  • a high-P evergreen fact — always available under a tight search_cost
+  • yesterday's meeting  — ``event_at`` in the past (history)
+  • next week's plan     — ``event_at`` + ``deadline`` in the future
+  • a high-P evergreen fact — no temporal fields
 
 Then shows how raising ``search_cost`` widens the recall window.
 
@@ -107,8 +107,9 @@ def main() -> None:
     print(f"  store → {db}")
     print(f"  now   → {now.isoformat()}")
     print(
-        "\n  Note: public API uses deadline= (column t_deadline).\n"
-        "  There is no t_event_at field — deadline is the temporal anchor."
+        "\n  t_event_at  = when the event happened / will happen\n"
+        "  t_deadline  = due cliff (urgency geometry)\n"
+        "  Public API: event_at= / deadline= on Memory.save()"
     )
 
     with Memory(store=str(db), user="demo") as mem:
@@ -119,7 +120,7 @@ def main() -> None:
             tags=["meeting", "architecture", "review", "examples"],
             drawer="meetings",
             p_magnitude=58,
-            deadline=yesterday,
+            event_at=yesterday,
             source="calendar",
             t_persistence=14.0,
         )
@@ -128,6 +129,7 @@ def main() -> None:
             tags=["plan", "examples", "publish", "dx"],
             drawer="planning",
             p_magnitude=75,
+            event_at=next_week,
             deadline=next_week,
             source="calendar",
             t_persistence=21.0,
@@ -142,21 +144,37 @@ def main() -> None:
         )
 
         print()
-        print(f"  {'Role':<12}  {'P':>5}  {'Deadline':<12}  id")
-        print(f"  {'─' * 12}  {'─' * 5}  {'─' * 12}  {'─' * 10}")
-        print(f"  {'yesterday':<12}  {58:5.0f}  {yesterday.date().isoformat():<12}  {id_past[:8]}…")
-        print(f"  {'next_week':<12}  {75:5.0f}  {next_week.date().isoformat():<12}  {id_future[:8]}…")
-        print(f"  {'evergreen':<12}  {90:5.0f}  {'(none)':<12}  {id_evergreen[:8]}…")
-
-        section("2. PDM-T geometry around those deadlines")
+        print(f"  {'Role':<12}  {'P':>5}  {'event_at':<12}  {'deadline':<12}  id")
+        print(f"  {'─' * 12}  {'─' * 5}  {'─' * 12}  {'─' * 12}  {'─' * 10}")
         print(
-            "  Pre-deadline: urgency energy E_T ramps as T_remaining shrinks.\n"
-            "  Post-deadline: status=EXPIRED, E_T collapses to 0."
+            f"  {'yesterday':<12}  {58:5.0f}  {yesterday.date().isoformat():<12}  "
+            f"{'(none)':<12}  {id_past[:8]}…"
+        )
+        print(
+            f"  {'next_week':<12}  {75:5.0f}  {next_week.date().isoformat():<12}  "
+            f"{next_week.date().isoformat():<12}  {id_future[:8]}…"
+        )
+        print(
+            f"  {'evergreen':<12}  {90:5.0f}  {'(none)':<12}  "
+            f"{'(none)':<12}  {id_evergreen[:8]}…"
+        )
+
+        past_hit = mem.get(id_past)
+        assert past_hit is not None and past_hit.t_event_at is not None
+        print(f"\n  verified get(yesterday).t_event_at = {past_hit.t_event_at.isoformat()}")
+
+        section("2. Event history vs deadline urgency")
+        print(
+            "  Past meeting: t_event_at only — history, no urgency cliff.\n"
+            "  Next week: event_at == deadline — E_T ramps as due date nears."
         )
         print()
-        show_geometry("Yesterday's meeting (past)", yesterday, now, p_raw=58.0)
+        print(f"  Yesterday's meeting")
+        print(f"    t_event_at   = {yesterday.isoformat()}")
+        print(f"    t_deadline   = (none)")
+        print(f"    role         = historical fact (Life Radar)")
         print()
-        show_geometry("Next week's plan (future)", next_week, now, p_raw=75.0)
+        show_geometry("Next week's plan (deadline geometry)", next_week, now, p_raw=75.0)
 
         section("3. Tight search_cost — narrow chronological / pressure window")
         print(

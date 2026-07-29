@@ -110,6 +110,36 @@ class TestReconcileTorsion:
 
 
 class TestTemporalRecall:
+    def test_save_event_at_round_trips(self, mem):
+        from datetime import datetime, timezone
+
+        event = datetime(2026, 7, 27, 9, 30, tzinfo=timezone.utc)
+        mid = mem.save(
+            "Yesterday's architecture review: ship PDM examples",
+            tags=["meeting", "architecture", "review"],
+            p_magnitude=60,
+            event_at=event,
+        )
+        hit = mem.get(mid)
+        assert hit is not None
+        assert hit.t_event_at is not None
+        assert hit.t_event_at.date().isoformat() == "2026-07-27"
+
+    def test_deadline_backfills_event_at(self, mem):
+        from datetime import datetime, timezone
+
+        due = datetime(2026, 8, 15, tzinfo=timezone.utc)
+        mid = mem.save(
+            "Orion launch deadline",
+            tags=["orion", "launch", "deadline"],
+            p_magnitude=70,
+            deadline=due,
+        )
+        rec = mem._storage.get(mid, user="test_user")
+        assert rec is not None
+        assert rec.t_deadline == due
+        assert rec.t_event_at == due
+
     def test_recall_populates_e_temporal_for_deadlines(self, mem):
         from datetime import datetime, timedelta, timezone
 

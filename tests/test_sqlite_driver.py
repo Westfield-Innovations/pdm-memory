@@ -45,6 +45,68 @@ class TestSQLiteDriverCRUD:
         driver.save(sig)
         assert driver.get(sig.id, user="bob") is None
 
+    def test_save_and_get_t_event_at(self, driver):
+        from datetime import datetime, timezone
+
+        event = datetime(2026, 7, 27, 15, 0, tzinfo=timezone.utc)
+        sig = make_sig(text="Yesterday standup notes")
+        sig.t_event_at = event
+        driver.save(sig)
+        got = driver.get(sig.id, user=sig.user)
+        assert got is not None
+        assert got.t_event_at is not None
+        assert got.t_event_at.isoformat().startswith("2026-07-27T15:00:00")
+
+    def test_migration_adds_t_event_at_column(self, db_path):
+        """Existing Tier-3 DBs get t_event_at via apply_sqlite_migrations on open."""
+        import sqlite3
+
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE pdm_signatures (
+                id TEXT PRIMARY KEY,
+                user TEXT,
+                compressed_fact TEXT,
+                compressed_fact_hash TEXT,
+                source TEXT,
+                p_magnitude REAL,
+                t_persistence REAL,
+                phase_privilege REAL,
+                effective_spike REAL,
+                intent_tags TEXT,
+                question_regime TEXT,
+                domain TEXT,
+                drawer_domain TEXT,
+                retrieval_count INTEGER,
+                last_retrieved TEXT,
+                created_at TEXT,
+                validation_prediction_total INTEGER,
+                validation_prediction_correct INTEGER,
+                decay_rate REAL,
+                t_deadline TEXT,
+                urgency_rate REAL,
+                metadata TEXT,
+                is_deleted INTEGER NOT NULL DEFAULT 0,
+                idempotency_key TEXT
+            );
+            CREATE TABLE pdm_drawers (
+                domain TEXT, user TEXT, description TEXT,
+                PRIMARY KEY (domain, user)
+            );
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        driver = SQLiteDriver(db_path=db_path)
+        cols = {
+            row[1]
+            for row in driver._conn().execute("PRAGMA table_info(pdm_signatures)")
+        }
+        assert "t_event_at" in cols
+        driver.close()
+
     def test_update(self, driver):
         sig = make_sig()
         driver.save(sig)

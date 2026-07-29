@@ -61,7 +61,7 @@ from pdm_memory.core.signature import (
 )
 from pdm_memory.models import AlignmentReport, MemoryListPage, SurfaceReport, TorsionReport
 from pdm_memory.storage.base import BaseStorage
-from pdm_memory.types import RecallHook, TorsionJudge
+from pdm_memory.types import HookEvent, PostRecallHook, PostSaveHook, PreSaveHook, RecallHook, TorsionJudge
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +99,9 @@ class Memory:
         self._user = user
         self._engine = engine or RetrievalEngine()
         self._torsion_judge = torsion_judge
+        self._pre_save_hooks: list[PreSaveHook] = []
+        self._post_save_hooks: list[PostSaveHook] = []
+        self._post_recall_hooks: list[PostRecallHook] = []
         self._token = token
         self._refresh_token = refresh_token
         self._cloud_url = cloud_url
@@ -114,6 +117,44 @@ class Memory:
                 store, token, refresh_token, cloud_url, store_raw
             )
         logger.debug("[PDM] Memory initialised | user=%s store=%s", user, store)
+
+    # ------------------------------------------------------------------
+    # Internal hooks (Lean Core / Middleware)
+    # ------------------------------------------------------------------
+
+    def add_hook(self, event: HookEvent, hook: Any) -> None:
+        """
+        Register an internal hook for Memory middleware.
+
+        Events:
+            - pre_save:  (SignatureRecord) -> SignatureRecord | None
+            - post_save: (SignatureRecord, memory_id) -> None
+            - post_recall:(ctx dict) -> None
+        """
+        match event:
+            case "pre_save":
+                self._pre_save_hooks.append(hook)
+            case "post_save":
+                self._post_save_hooks.append(hook)
+            case "post_recall":
+                self._post_recall_hooks.append(hook)
+            case _:
+                raise ValueError(f"Unknown hook event: {event!r}")
+
+    def _run_pre_save_hooks(self, sig: SignatureRecord) -> SignatureRecord:
+        for hook in self._pre_save_hooks:
+            updated = hook(sig)
+            if updated is not None:
+                sig = updated
+        return sig
+
+    def _run_post_save_hooks(self, sig: SignatureRecord, memory_id: str) -> None:
+        for hook in self._post_save_hooks:
+            hook(sig, memory_id)
+
+    def _run_post_recall_hooks(self, ctx: dict[str, Any]) -> None:
+        for hook in self._post_recall_hooks:
+            hook(ctx)
 
     @classmethod
     def from_env(cls, *, prefix: str = "PDM", **kwargs: Any) -> Memory:
@@ -165,6 +206,7 @@ class Memory:
         regime: str = "neutral",
         phase_privilege: float = 1.0,
         deadline: datetime | None = None,
+        event_at: datetime | None = None,
         metadata: dict[str, Any] | None = None,
         *,
         dedupe: bool = True,
@@ -186,7 +228,9 @@ class Memory:
             drawer:         Category drawer name (e.g. "preferences", "facts").
             regime:         Context regime: "neutral", "trading", "engineering", etc.
             phase_privilege: Nesting multiplier (usually 1.0).
-            deadline:       Optional datetime for time-sensitive memories (PDM-T).
+            deadline:       Optional due datetime (PDM-T ``t_deadline`` — pressure cliff).
+            event_at:       Optional event datetime (PDM-T ``t_event_at`` — when it
+                            happened / will happen; powers "what was yesterday").
             metadata:       Arbitrary extra data attached to the memory.
             dedupe:         If True, return existing ID when fact hash already stored.
             dedupe_reinforce: When dedupe hits, call reinforce() on the existing memory.
@@ -222,6 +266,12 @@ class Memory:
         domain = infer_domain(resolved_tags)
         eff_spike = calculate_effective_spike(p_magnitude, t_persistence, phase_privilege)
 
+        # Companion parity: a future deadline without event_at still needs an
+        # event timestamp for temporal-window recall.
+        resolved_event = event_at
+        if resolved_event is None and deadline is not None:
+            resolved_event = deadline
+
         sig = SignatureRecord(
             user=self._user,
             compressed_fact=text,
@@ -236,10 +286,13 @@ class Memory:
             drawer_domain=drawer,
             decay_rate=0.9,
             t_deadline=deadline,
+            t_event_at=resolved_event,
             metadata=metadata or {},
             idempotency_key=idempotency_key.strip() if idempotency_key else None,
         )
+        sig = self._run_pre_save_hooks(sig)
         memory_id = self._storage.save(sig)
+        self._run_post_save_hooks(sig, memory_id)
         logger.debug("[PDM] save() → %s (P=%.1f)", memory_id, p_magnitude)
         return memory_id
 
@@ -255,7 +308,7 @@ class Memory:
 
         Each item accepts the same keys as :meth:`save` (``text``, ``tags``,
         ``p_magnitude``, ``drawer``, ``source``, ``regime``, ``t_persistence``,
-        ``metadata``, ``deadline``).
+        ``metadata``, ``deadline``, ``event_at``).
 
         Returns:
             Dict with ``saved``, ``skipped``, ``errors`` counts.
@@ -295,6 +348,8 @@ class Memory:
                         t_persistence=float(item.get("t_persistence", 30.0)),
                         drawer=str(item.get("drawer") or item.get("drawer_domain") or "general"),
                         regime=str(item.get("regime") or item.get("question_regime") or "neutral"),
+                        deadline=item.get("deadline") or item.get("t_deadline"),
+                        event_at=item.get("event_at") or item.get("t_event_at"),
                         metadata=item.get("metadata"),
                         dedupe=False,
                     )
@@ -365,6 +420,8 @@ class Memory:
         regime: str | None = None,
         source: str | None = None,
         metadata: dict[str, Any] | None = None,
+        deadline: datetime | None = None,
+        event_at: datetime | None = None,
     ) -> MemoryHit:
         """
         Update whitelisted fields on an existing memory.
@@ -379,6 +436,8 @@ class Memory:
             regime:      New question regime.
             source:      New source label.
             metadata:    Shallow-merged into existing metadata dict.
+            deadline:    New ``t_deadline`` (pass to clear with care — use storage).
+            event_at:    New ``t_event_at`` event timestamp.
 
         Returns:
             Updated MemoryHit with live P_effective.
@@ -418,6 +477,13 @@ class Memory:
             fields["source"] = source
         if metadata is not None:
             fields["metadata"] = {**(rec.metadata or {}), **metadata}
+        if deadline is not None:
+            fields["t_deadline"] = deadline
+        if event_at is not None:
+            fields["t_event_at"] = event_at
+        elif deadline is not None and rec.t_event_at is None:
+            # Same backfill rule as save(): deadline implies event when unset
+            fields["t_event_at"] = deadline
 
         if not fields:
             raise ValueError("At least one field must be provided to update()")
@@ -447,6 +513,7 @@ class Memory:
         *,
         candidate_limit: int = 10_000,
         page_size: int = 500,
+        diversity_bias: float | None = None,
         on_recall: RecallHook | None = None,
     ) -> builtins.list[MemoryHit]:
         """
@@ -469,6 +536,8 @@ class Memory:
             reinforce:   If True, increment retrieval_count and update last_retrieved.
             candidate_limit: Max signatures loaded from storage for ranking (default 10_000).
             page_size:       Keyset page size when loading candidates (default 500).
+            diversity_bias:  Optional max fraction of top-k from one drawer
+                             (e.g. ``0.4``). ``None`` = pure score order.
             on_recall:       Optional callback invoked for each returned hit before reinforce.
 
         Returns:
@@ -481,6 +550,17 @@ class Memory:
             page_size=page_size,
         )
         if not records:
+            ctx: dict[str, Any] = {
+                "query": query,
+                "k": k,
+                "hits": [],
+                "reinforced": False,
+                "min_pressure": min_pressure,
+                "search_cost": search_cost,
+                "drawer": drawer,
+                "diversity_bias": diversity_bias,
+            }
+            self._run_post_recall_hooks(ctx)
             return []
 
         hits = self._engine.recall(
@@ -488,15 +568,28 @@ class Memory:
             query=query,
             k=k,
             search_cost=search_cost,
+            diversity_bias=diversity_bias,
         )
 
         if on_recall:
             for hit in hits:
                 on_recall(hit)
 
-        if reinforce and hits:
+        reinforced = bool(reinforce and hits)
+        if reinforced:
             self._apply_reinforcement(hits)
 
+        ctx = {
+            "query": query,
+            "k": k,
+            "hits": hits,
+            "reinforced": reinforced,
+            "min_pressure": min_pressure,
+            "search_cost": search_cost,
+            "drawer": drawer,
+            "diversity_bias": diversity_bias,
+        }
+        self._run_post_recall_hooks(ctx)
         return hits
 
     def surface(

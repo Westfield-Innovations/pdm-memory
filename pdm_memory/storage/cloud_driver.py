@@ -132,7 +132,7 @@ class CloudDriver(BaseStorage):
         fields.pop("user", None)
         fields.pop("id", None)
         # Serialise datetimes for JSON
-        for key in ("last_retrieved", "created_at", "t_deadline"):
+        for key in ("last_retrieved", "created_at", "t_deadline", "t_event_at"):
             if key in fields and isinstance(fields[key], datetime):
                 fields[key] = fields[key].isoformat()
         self._patch(f"/api/v1/pdm/signatures/{memory_id}/", fields)
@@ -375,6 +375,7 @@ class CloudDriver(BaseStorage):
             "created_at": cls._iso(sig.created_at),
             "effective_spike": sig.effective_spike,
             "decay_rate_sdk": sig.decay_rate,
+            "t_event_at": cls._iso(sig.t_event_at),
         }
 
         return {
@@ -397,6 +398,7 @@ class CloudDriver(BaseStorage):
             "validation_prediction_correct": sig.validation_prediction_correct,
             "decay_rate": cls._clamp_api_decay_rate(sig.decay_rate),
             "t_deadline": cls._iso(sig.t_deadline),
+            "t_event_at": cls._iso(sig.t_event_at),
             "urgency_rate": cls._clamp_api_urgency(sig.urgency_rate),
             "metadata": meta,
             # Companion ingest alias some clients use
@@ -491,6 +493,9 @@ class CloudDriver(BaseStorage):
                 sdk_bag.get("decay_rate_sdk", data.get("decay_rate", 0.9)) or 0.9
             ),
             "t_deadline": _dt(data.get("t_deadline")),
+            "t_event_at": _dt(
+                data.get("t_event_at") or sdk_bag.get("t_event_at")
+            ),
             "urgency_rate": float(data.get("urgency_rate", 2.0) or 2.0),
             "metadata": (
                 {k: v for k, v in meta.items() if k != "_pdm_sdk"}

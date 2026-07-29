@@ -53,6 +53,8 @@ _SMALL_CLUSTER: int = 48
 # PDM-T: how hard urgency energy lifts ranking / Phase-1 gate
 _TEMPORAL_RANK_BOOST: float = 0.35
 _TEMPORAL_GATE_BOOST: float = 0.25
+# Recommended drawer share cap when enabling diversity_bias
+DEFAULT_DIVERSITY_BIAS: float = 0.40
 _NEGATION_TOKENS: frozenset[str] = frozenset(
     {
         # English (incl. typo / no-apostrophe forms users actually type)
@@ -218,6 +220,7 @@ class RetrievalEngine:
         target_pressure: float = 50.0,
         domain: str | None = None,
         regime: str | None = None,
+        diversity_bias: float | None = None,
     ) -> list[MemoryHit]:
         """
         Retrieve top-k memories from a list of SignatureRecords.
@@ -231,9 +234,13 @@ class RetrievalEngine:
             target_pressure: Pressure proximity anchor for coupling.
             domain:          Optional domain filter (None = all).
             regime:          Optional regime filter (None = all).
+            diversity_bias:  Optional max fraction of top-k from one drawer
+                             (e.g. ``0.4`` → no drawer > 40% when other
+                             drawers have candidates). ``None`` disables
+                             diversity (pure score order).
 
         Returns:
-            List[MemoryHit] sorted by p_effective descending, length ≤ k.
+            List[MemoryHit] ranked by relevance, length ≤ k.
         """
         if not records:
             return []
@@ -316,7 +323,62 @@ class RetrievalEngine:
             reverse=True,
         )
 
-        return [hit for _, hit in coupled[:k]]
+        return self._select_with_diversity(coupled, k=k, diversity_bias=diversity_bias)
+
+    @staticmethod
+    def _select_with_diversity(
+        ranked: list[tuple[NodeCoupling, MemoryHit]],
+        *,
+        k: int,
+        diversity_bias: float | None,
+    ) -> list[MemoryHit]:
+        """
+        Cap how many top-k slots one drawer may occupy.
+
+        When ``diversity_bias`` is set and other drawers still have candidates,
+        a single drawer cannot take more than ``floor(k * bias)`` slots
+        (minimum 1). Remaining slots prefer other drawers by score order.
+        If not enough diverse candidates exist, overflow fills by pure score
+        so we never return fewer hits than available.
+        """
+        if k <= 0 or not ranked:
+            return []
+        if diversity_bias is None:
+            return [hit for _, hit in ranked[:k]]
+
+        bias = float(diversity_bias)
+        if not math.isfinite(bias):
+            raise ValueError("diversity_bias must be a finite float or None")
+        bias = max(0.0, min(1.0, bias))
+        # bias=1.0 → no effective cap; bias=0.0 → at most 1 per drawer while diversified
+        max_per_drawer = k if bias >= 1.0 else max(1, int(math.floor(k * bias)))
+
+        drawers_in_pool = {(hit.drawer or "general") for _, hit in ranked}
+        if len(drawers_in_pool) <= 1:
+            return [hit for _, hit in ranked[:k]]
+
+        selected: list[MemoryHit] = []
+        counts: dict[str, int] = {}
+        overflow: list[MemoryHit] = []
+
+        for _, hit in ranked:
+            if len(selected) >= k:
+                break
+            drawer = hit.drawer or "general"
+            used = counts.get(drawer, 0)
+            if used < max_per_drawer:
+                selected.append(hit)
+                counts[drawer] = used + 1
+            else:
+                overflow.append(hit)
+
+        if len(selected) < k:
+            for hit in overflow:
+                if len(selected) >= k:
+                    break
+                selected.append(hit)
+
+        return selected
 
     @staticmethod
     def _temporal_energy(

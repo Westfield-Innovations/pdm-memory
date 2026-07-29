@@ -15,6 +15,6 @@ python examples/temporal_recall_demo.py
 | `hello_pdm.py` | `save` / `recall` / `explain` — Pressure + Resonance |
 | `guarded_agent_logic.py` | `verify_alignment` (GAA) — TORSION vs ALIGNED before ACT |
 | `handling_contradictions.py` | `detect_torsion` / `reconcile_torsion` — self-healing |
-| `temporal_recall_demo.py` | `deadline` (PDM-T) + `search_cost` window |
+| `temporal_recall_demo.py` | `event_at` / `deadline` (PDM-T) + `search_cost` window |
 
 Each script uses `with Memory(...) as mem:` and a fresh temp SQLite file.

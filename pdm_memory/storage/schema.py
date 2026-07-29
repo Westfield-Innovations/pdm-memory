@@ -34,6 +34,7 @@ UPDATABLE_COLUMNS: frozenset[str] = frozenset(
         "validation_prediction_correct",
         "decay_rate",
         "t_deadline",
+        "t_event_at",
         "urgency_rate",
         "metadata",
         "is_deleted",
@@ -63,6 +64,7 @@ CREATE TABLE IF NOT EXISTS pdm_signatures (
     validation_prediction_correct   INTEGER NOT NULL DEFAULT 0,
     decay_rate                      REAL NOT NULL DEFAULT 0.9,
     t_deadline                      TEXT,
+    t_event_at                      TEXT,
     urgency_rate                    REAL NOT NULL DEFAULT 2.0,
     metadata                        TEXT NOT NULL DEFAULT '{}',
     is_deleted                      INTEGER NOT NULL DEFAULT 0,
@@ -115,6 +117,7 @@ CREATE TABLE IF NOT EXISTS pdm_signatures (
     validation_prediction_correct   INTEGER NOT NULL DEFAULT 0,
     decay_rate                      DOUBLE PRECISION NOT NULL DEFAULT 0.9,
     t_deadline                      TEXT,
+    t_event_at                      TEXT,
     urgency_rate                    DOUBLE PRECISION NOT NULL DEFAULT 2.0,
     metadata                        TEXT NOT NULL DEFAULT '{}',
     is_deleted                      INTEGER NOT NULL DEFAULT 0,
@@ -147,7 +150,7 @@ CREATE TABLE IF NOT EXISTS pdm_drawers (
 
 
 def apply_sqlite_migrations(conn: Any) -> None:
-    """Add Tier-3 columns/indexes to existing SQLite databases."""
+    """Add Tier-3 / temporal columns/indexes to existing SQLite databases."""
     cols = {row[1] for row in conn.execute("PRAGMA table_info(pdm_signatures)")}
     if "is_deleted" not in cols:
         conn.execute(
@@ -155,6 +158,8 @@ def apply_sqlite_migrations(conn: Any) -> None:
         )
     if "idempotency_key" not in cols:
         conn.execute("ALTER TABLE pdm_signatures ADD COLUMN idempotency_key TEXT")
+    if "t_event_at" not in cols:
+        conn.execute("ALTER TABLE pdm_signatures ADD COLUMN t_event_at TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pdm_user_active_pressure "
         "ON pdm_signatures (user, is_deleted, p_magnitude DESC, id DESC)"
@@ -164,15 +169,22 @@ def apply_sqlite_migrations(conn: Any) -> None:
         "ON pdm_signatures (user, idempotency_key) "
         "WHERE idempotency_key IS NOT NULL"
     )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pdm_user_event_at "
+        "ON pdm_signatures (user, t_event_at)"
+    )
 
 
 def apply_postgres_migrations(conn: Any) -> None:
-    """Add Tier-3 columns/indexes to existing PostgreSQL databases."""
+    """Add Tier-3 / temporal columns/indexes to existing PostgreSQL databases."""
     conn.execute(
         "ALTER TABLE pdm_signatures ADD COLUMN IF NOT EXISTS is_deleted INTEGER NOT NULL DEFAULT 0"
     )
     conn.execute(
         "ALTER TABLE pdm_signatures ADD COLUMN IF NOT EXISTS idempotency_key TEXT"
+    )
+    conn.execute(
+        "ALTER TABLE pdm_signatures ADD COLUMN IF NOT EXISTS t_event_at TEXT"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pdm_user_active_pressure "
@@ -182,6 +194,10 @@ def apply_postgres_migrations(conn: Any) -> None:
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_pdm_user_idempotency "
         'ON pdm_signatures ("user", idempotency_key) '
         "WHERE idempotency_key IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pdm_user_event_at "
+        'ON pdm_signatures ("user", t_event_at)'
     )
 
 
@@ -221,9 +237,12 @@ def prepare_update_fields(fields: dict) -> dict:
     for col, value in fields.items():
         if col in ("intent_tags", "metadata"):
             prepared[col] = json.dumps(value)
-        elif col in ("last_retrieved", "created_at", "t_deadline") and isinstance(
-            value, datetime
-        ):
+        elif col in (
+            "last_retrieved",
+            "created_at",
+            "t_deadline",
+            "t_event_at",
+        ) and isinstance(value, datetime):
             prepared[col] = value.isoformat()
         else:
             prepared[col] = value
@@ -256,6 +275,7 @@ def signature_insert_row(sig: SignatureRecord, *, store_raw: bool) -> tuple[Any,
         sig.validation_prediction_correct,
         sig.decay_rate,
         sig.t_deadline.isoformat() if sig.t_deadline else None,
+        sig.t_event_at.isoformat() if sig.t_event_at else None,
         sig.urgency_rate,
         json.dumps(sig.metadata),
         1 if getattr(sig, "is_deleted", False) else 0,
@@ -294,6 +314,7 @@ def mapping_to_record(row: Mapping[str, Any]) -> SignatureRecord:
         validation_prediction_correct=int(col("validation_prediction_correct", 0)),
         decay_rate=float(col("decay_rate", 0.9)),
         t_deadline=parse_dt(col("t_deadline")),
+        t_event_at=parse_dt(col("t_event_at")),
         urgency_rate=float(col("urgency_rate", 2.0)),
         metadata=json.loads(col("metadata") or "{}"),
         is_deleted=bool(col("is_deleted", 0)),

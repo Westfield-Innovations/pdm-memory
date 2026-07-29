@@ -143,7 +143,7 @@ class SQLiteDriver(BaseStorage):
                 intent_tags, question_regime, domain, drawer_domain,
                 retrieval_count, last_retrieved, created_at,
                 validation_prediction_total, validation_prediction_correct,
-                decay_rate, t_deadline, urgency_rate, metadata,
+                decay_rate, t_deadline, t_event_at, urgency_rate, metadata,
                 is_deleted, idempotency_key
             ) VALUES (
                 ?, ?, ?, ?, ?,
@@ -151,7 +151,7 @@ class SQLiteDriver(BaseStorage):
                 ?, ?, ?, ?,
                 ?, ?, ?,
                 ?, ?,
-                ?, ?, ?, ?,
+                ?, ?, ?, ?, ?,
                 ?, ?
             )
             """,
@@ -176,6 +176,7 @@ class SQLiteDriver(BaseStorage):
                 sig.validation_prediction_correct,
                 sig.decay_rate,
                 sig.t_deadline.isoformat() if sig.t_deadline else None,
+                sig.t_event_at.isoformat() if sig.t_event_at else None,
                 sig.urgency_rate,
                 json.dumps(sig.metadata),
                 1 if sig.is_deleted else 0,
@@ -295,9 +296,12 @@ class SQLiteDriver(BaseStorage):
         for col, value in fields.items():
             if col == "intent_tags" or col == "metadata":
                 prepared[col] = json.dumps(value)
-            elif col in ("last_retrieved", "created_at", "t_deadline") and isinstance(
-                value, datetime
-            ):
+            elif col in (
+                "last_retrieved",
+                "created_at",
+                "t_deadline",
+                "t_event_at",
+            ) and isinstance(value, datetime):
                 prepared[col] = value.isoformat()
             else:
                 prepared[col] = value

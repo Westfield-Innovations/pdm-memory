@@ -42,7 +42,7 @@ INSERT INTO pdm_signatures (
     intent_tags, question_regime, domain, drawer_domain,
     retrieval_count, last_retrieved, created_at,
     validation_prediction_total, validation_prediction_correct,
-    decay_rate, t_deadline, urgency_rate, metadata,
+    decay_rate, t_deadline, t_event_at, urgency_rate, metadata,
     is_deleted, idempotency_key
 ) VALUES (
     %s, %s, %s, %s, %s,
@@ -50,7 +50,7 @@ INSERT INTO pdm_signatures (
     %s, %s, %s, %s,
     %s, %s, %s,
     %s, %s,
-    %s, %s, %s, %s,
+    %s, %s, %s, %s, %s,
     %s, %s
 )
 """
