@@ -83,8 +83,24 @@ class TestStorageFactory:
         driver.close()
 
     def test_postgres_requires_psycopg(self):
-        with pytest.raises(ImportError, match="postgres"):
-            create_storage("postgresql://localhost/pdm")
+        from unittest.mock import patch
+
+        # Simulate missing optional dep even when psycopg is installed locally.
+        real_import = __import__
+
+        def _block_psycopg(name, *args, **kwargs):
+            if name == "psycopg" or name.startswith("psycopg."):
+                raise ImportError("No module named 'psycopg'")
+            if name == "pdm_memory.storage.postgres_driver":
+                raise ImportError(
+                    "PostgreSQL storage requires psycopg. "
+                    'Install with: pip install "pdm-memory[postgres]"'
+                )
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=_block_psycopg):
+            with pytest.raises(ImportError, match="postgres"):
+                create_storage("postgresql://localhost/pdm")
 
     def test_unknown_scheme(self):
         with pytest.raises(ValueError, match="Unsupported storage scheme"):

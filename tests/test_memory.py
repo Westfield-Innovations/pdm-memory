@@ -109,6 +109,69 @@ class TestReconcileTorsion:
         assert mem.count() == 1
 
 
+class TestTemporalRecall:
+    def test_recall_populates_e_temporal_for_deadlines(self, mem):
+        from datetime import datetime, timedelta, timezone
+
+        soon = datetime.now(tz=timezone.utc) + timedelta(days=2)
+        past = datetime.now(tz=timezone.utc) - timedelta(days=3)
+
+        mem.save(
+            "Ship the release notes tomorrow",
+            tags=["ship", "release", "notes"],
+            p_magnitude=70,
+            deadline=soon,
+        )
+        mem.save(
+            "Old standup notes from last week",
+            tags=["standup", "notes", "meeting"],
+            p_magnitude=70,
+            deadline=past,
+        )
+        mem.save(
+            "Evergreen: prefer short release notes",
+            tags=["release", "notes", "style"],
+            p_magnitude=70,
+        )
+
+        hits = mem.recall("release notes", k=5, search_cost=0.9, reinforce=False)
+        by_text = {h.text: h for h in hits}
+
+        upcoming = by_text.get("Ship the release notes tomorrow")
+        expired = by_text.get("Old standup notes from last week")
+        evergreen = by_text.get("Evergreen: prefer short release notes")
+
+        assert upcoming is not None
+        assert upcoming.e_temporal is not None and upcoming.e_temporal > 0.0
+        if expired is not None:
+            assert (expired.e_temporal or 0.0) == 0.0
+        if evergreen is not None:
+            assert (evergreen.e_temporal or 0.0) == 0.0
+
+    def test_near_deadline_ranks_above_equal_pressure_peer(self, mem):
+        from datetime import datetime, timedelta, timezone
+
+        soon = datetime.now(tz=timezone.utc) + timedelta(hours=36)
+        mid_a = mem.save(
+            "Deploy checklist for Orion release window",
+            tags=["deploy", "orion", "release"],
+            p_magnitude=65,
+            deadline=soon,
+        )
+        mid_b = mem.save(
+            "Deploy checklist for Orion general process",
+            tags=["deploy", "orion", "release"],
+            p_magnitude=65,
+        )
+
+        hits = mem.recall("Orion deploy checklist", k=5, search_cost=0.85, reinforce=False)
+        ids = [h.id for h in hits]
+        assert mid_a in ids and mid_b in ids
+        assert ids.index(mid_a) < ids.index(mid_b)
+        urgent = next(h for h in hits if h.id == mid_a)
+        assert (urgent.e_temporal or 0.0) > 0.0
+
+
 class TestMemoryFromEnv:
     def test_from_env_sqlite(self, tmp_path, monkeypatch):
         db = str(tmp_path / "env.db")

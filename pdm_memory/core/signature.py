@@ -11,7 +11,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
 # Storage records
@@ -143,7 +143,9 @@ class MemoryHit:
         domain_match: float = 0.0,
         regime_match: float = 0.0,
         pressure_proximity: float = 0.0,
-    ) -> MemoryHit:
+        e_temporal: Optional[float] = None,
+        is_urgent: bool = False,
+    ) -> "MemoryHit":
         return cls(
             id=record.id,
             text=record.compressed_fact,
@@ -165,6 +167,8 @@ class MemoryHit:
             domain_match=domain_match,
             regime_match=regime_match,
             pressure_proximity=pressure_proximity,
+            e_temporal=e_temporal,
+            is_urgent=is_urgent,
         )
 
 

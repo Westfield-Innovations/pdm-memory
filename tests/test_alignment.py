@@ -69,6 +69,39 @@ class TestGAAEngine:
         assert report.score >= 0.45
         assert report.is_safe_to_act is True
 
+    def test_unrelated_anchor_does_not_dilute_alignment(self) -> None:
+        """Extra stewardship goals must not tank resonance for a matching intent."""
+        engine = RetrievalEngine()
+        goals = [
+            _goal(
+                "Core goal: high reliability; never ignore production errors",
+                tags=["reliability", "errors", "goal", "integrity"],
+                iaw=0.9,
+            ),
+            _goal(
+                "Foundational principle: validate before deploy",
+                tags=["validation", "deploy", "principle", "quality"],
+                drawer="foundational",
+                p=88.0,
+                iaw=0.85,
+            ),
+            _goal(
+                "Protect audit trails; never wipe or delete audit logs",
+                tags=["audit", "security", "goal", "safety"],
+                p=90.0,
+                iaw=0.88,
+            ),
+        ]
+        report = verify_alignment(
+            engine,
+            goals,
+            "validate thoroughly then deploy with reliability checks",
+        )
+        assert report.status == "ALIGNED"
+        assert report.anchor_count == 3
+        assert report.is_safe_to_act is True
+        assert report.torsion == 0.0
+
     def test_no_anchors_fail_closed(self) -> None:
         engine = RetrievalEngine()
         noise = [

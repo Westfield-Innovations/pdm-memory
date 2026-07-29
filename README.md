@@ -241,6 +241,18 @@ mem.ingest(
 
 ## 🛠️ Developer Tools
 
+### Examples (DX walkthrough)
+
+```bash
+pip install .
+python examples/hello_pdm.py                 # save / recall / explain
+python examples/guarded_agent_logic.py       # GAA: TORSION vs ALIGNED
+python examples/handling_contradictions.py   # detect + reconcile torsion
+python examples/temporal_recall_demo.py      # deadline (PDM-T) + search_cost
+```
+
+See [`examples/README.md`](examples/README.md).
+
 ### The explain Method
 
 ```python

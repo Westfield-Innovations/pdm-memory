@@ -346,6 +346,10 @@ def verify_alignment(
     Compare a proposed intent to high-IAW goal anchors.
 
     Fail-closed when no anchors exist (guarded agents must not ACT blind).
+
+    Resonance is self-weighted by ``(resonance × IAW)`` so unrelated
+    stewardship goals do not dilute a strongly matching intent. Peak
+    torsion is still taken across *all* anchors (fail-closed on danger).
     """
     text = (intent_text or "").strip()
     if not text:
@@ -383,9 +387,16 @@ def verify_alignment(
             )
         )
 
-    # IAW-weighted mean resonance; peak torsion drives status
+    # IAW-weighted resonance that resists dilution from unrelated anchors:
+    # weight each goal by (resonance × IAW) so low-resonance stewardship
+    # goals (e.g. audit) do not tank a deploy/validate intent.
+    # Torsion still uses the peak across ALL anchors — fail-closed on danger.
     iaw_sum = sum(s.iaw for s in scored) or 1.0
-    resonance = sum(s.resonance * s.iaw for s in scored) / iaw_sum
+    soft_sum = sum(s.resonance * s.iaw for s in scored)
+    if soft_sum > 1e-9:
+        resonance = sum(s.resonance * s.resonance * s.iaw for s in scored) / soft_sum
+    else:
+        resonance = sum(s.resonance * s.iaw for s in scored) / iaw_sum
     peak = max(scored, key=lambda s: s.torsion)
     torsion = peak.torsion
 

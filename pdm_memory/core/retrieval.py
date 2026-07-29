@@ -32,6 +32,7 @@ from pdm_memory.core.math import (
     calculate_decay_factor,
     calculate_intent_weight,
     calculate_p_effective,
+    calculate_temporal_geometry,
     calculate_v,
     infer_domain,
     infer_regime,
@@ -49,6 +50,9 @@ NUMBER_PATTERN = re.compile(r"(?<![A-Za-z])-?\d+(?:\.\d+)?(?![A-Za-z])")
 # Reverse Resonance — topic/contradiction gates (surgical, not N² fishing)
 _TOPIC_GATE: float = 0.35
 _SMALL_CLUSTER: int = 48
+# PDM-T: how hard urgency energy lifts ranking / Phase-1 gate
+_TEMPORAL_RANK_BOOST: float = 0.35
+_TEMPORAL_GATE_BOOST: float = 0.25
 _NEGATION_TOKENS: frozenset[str] = frozenset(
     {
         # English (incl. typo / no-apostrophe forms users actually type)
@@ -265,9 +269,12 @@ class RetrievalEngine:
             p_eff = calculate_p_effective(
                 rec.p_magnitude, v, decay, i_weight, quality=0.80
             )
+            e_temporal, is_urgent = self._temporal_energy(rec, now)
+            # Urgent deadlines get a soft lift through the Phase-1 pressure gate
+            p_gate = p_eff * (1.0 + _TEMPORAL_GATE_BOOST * e_temporal)
 
             # Phase 1 gate
-            if p_eff < theta_eff:
+            if p_gate < theta_eff:
                 coupling = self._compute_coupling(
                     rec, query_tags, p_eff, rec.p_magnitude,
                     effective_domain, effective_regime, target_pressure,
@@ -292,15 +299,51 @@ class RetrievalEngine:
                     domain_match=coupling.domain_match,
                     regime_match=coupling.regime_match,
                     pressure_proximity=coupling.pressure_proximity,
+                    e_temporal=e_temporal,
+                    is_urgent=is_urgent,
                 )
                 coupled.append((coupling, hit))
             else:
                 damped.append(coupling)
 
-        # Sort by coupling_score × p_effective descending
-        coupled.sort(key=lambda t: t[0].coupling_score * t[1].p_effective, reverse=True)
+        # Sort by coupling × P_eff × (1 + temporal urgency boost)
+        coupled.sort(
+            key=lambda t: (
+                t[0].coupling_score
+                * t[1].p_effective
+                * (1.0 + _TEMPORAL_RANK_BOOST * (t[1].e_temporal or 0.0))
+            ),
+            reverse=True,
+        )
 
         return [hit for _, hit in coupled[:k]]
+
+    @staticmethod
+    def _temporal_energy(
+        rec: SignatureRecord,
+        now: datetime,
+    ) -> tuple[float, bool]:
+        """
+        PDM-T urgency for a signature.
+
+        Returns ``(e_temporal, is_urgent)``. No deadline → ``(0.0, False)``.
+        Past deadline → expired geometry (E_T = 0).
+        """
+        deadline = rec.t_deadline
+        if deadline is None:
+            return 0.0, False
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+        t_remaining = (deadline - now).total_seconds() / 86400.0
+        geo = calculate_temporal_geometry(
+            c_base=1.0,
+            s_base=1.0,
+            p_base=max(0.0, float(rec.p_magnitude or 0.0) / 100.0),
+            urgency_rate=max(1.0, float(rec.urgency_rate or 2.0)),
+            t_remaining_days=t_remaining,
+            persist_days=max(1.0, float(rec.t_persistence or 30.0)),
+        )
+        return float(geo["e_temporal"]), bool(geo["is_urgent"])
 
     @staticmethod
     def _semantic_query_overlap(rec: SignatureRecord, query_tags: Sequence[str]) -> float:

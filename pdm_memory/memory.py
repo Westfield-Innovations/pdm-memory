@@ -769,7 +769,16 @@ class Memory:
         )
         v = calculate_v(rec.validation_prediction_correct, rec.validation_prediction_total)
         p_eff = calculate_p_effective(rec.p_magnitude, v, decay, 1.0, 0.80)
-        return MemoryHit.from_record(rec, p_eff, decay, 1.0, v)
+        e_temporal, is_urgent = self._engine._temporal_energy(rec, now)
+        return MemoryHit.from_record(
+            rec,
+            p_eff,
+            decay,
+            1.0,
+            v,
+            e_temporal=e_temporal,
+            is_urgent=is_urgent,
+        )
 
     def detect_torsion(
         self,
