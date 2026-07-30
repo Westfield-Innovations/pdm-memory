@@ -169,10 +169,10 @@ def main() -> None:
             "  Next week: event_at == deadline — E_T ramps as due date nears."
         )
         print()
-        print(f"  Yesterday's meeting")
+        print("  Yesterday's meeting")
         print(f"    t_event_at   = {yesterday.isoformat()}")
-        print(f"    t_deadline   = (none)")
-        print(f"    role         = historical fact (Life Radar)")
+        print("    t_deadline   = (none)")
+        print("    role         = historical fact (Life Radar)")
         print()
         show_geometry("Next week's plan (deadline geometry)", next_week, now, p_raw=75.0)
 
