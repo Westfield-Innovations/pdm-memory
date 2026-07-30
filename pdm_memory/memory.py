@@ -645,13 +645,19 @@ class Memory:
 
     def reinforce(self, memory_id: str, coupling_score: float = 0.5) -> None:
         """
-        Manually reinforce a memory (raise its pressure).
+        Manually reinforce a memory (raise its pressure) and record a correct
+        prediction in the Validation Coefficient counters.
 
-        recall() does this automatically for all returned hits.
-        Use this method to manually signal that a memory was useful.
+        recall() calls this automatically for all returned hits when
+        ``reinforce=True`` (the default).  Call this explicitly to signal
+        that a memory-driven prediction turned out to be *correct*.
+
+        Each call increments both ``validation_prediction_total`` and
+        ``validation_prediction_correct``, which raises V and therefore
+        P_effective on the next retrieval.
 
         Args:
-            memory_id:     The memory UUID to reinforce.
+            memory_id:      The memory UUID to reinforce.
             coupling_score: Coupling strength (0–1), influences Δp magnitude.
         """
         now = datetime.now(tz=timezone.utc)
@@ -676,6 +682,8 @@ class Memory:
         )
         new_p = min(100.0, rec.p_magnitude + delta)
         new_spike = calculate_effective_spike(new_p, rec.t_persistence, rec.phase_privilege)
+        new_total = (rec.validation_prediction_total or 0) + 1
+        new_correct = (rec.validation_prediction_correct or 0) + 1
         self._storage.update(
             memory_id,
             user=self._user,
@@ -683,10 +691,61 @@ class Memory:
             effective_spike=new_spike,
             retrieval_count=(rec.retrieval_count or 0) + 1,
             last_retrieved=now,
+            validation_prediction_total=new_total,
+            validation_prediction_correct=new_correct,
         )
-        logger.debug("[PDM] reinforce(%s) Δp=+%.2f → P=%.1f", memory_id, delta, new_p)
+        logger.debug(
+            "[PDM] reinforce(%s) Δp=+%.2f → P=%.1f  V_total=%d V_correct=%d",
+            memory_id, delta, new_p, new_total, new_correct,
+        )
+
+    def penalize(self, memory_id: str, coupling_score: float = 0.5) -> None:
+        """
+        Penalise a memory after a *wrong* prediction and lower its authority.
+
+        This is the consequence signal **E*** described in the Correctability
+        Benchmark spec.  Call it when the memory that was used as the basis
+        for a prediction turned out to be **incorrect**.
+
+        Mechanically:
+        - Increments ``validation_prediction_total`` (prediction was made).
+        - Does **not** increment ``validation_prediction_correct`` (it was wrong).
+        - This lowers V = (correct+1)/(total+2), which lowers P_effective on
+          the next retrieval — the wrong signature loses authority over time.
+        - Also decrements ``p_magnitude`` by the same delta formula used in
+          reinforcement, so the raw pressure drops too.
+
+        Args:
+            memory_id:      The memory UUID to penalise.
+            coupling_score: Coupling strength (0–1), influences Δp magnitude.
+        """
+        rec = self._storage.get(memory_id, user=self._user)
+        if rec is None:
+            logger.warning("[PDM] penalize(%s): not found", memory_id)
+            return
+        delta = self._engine.compute_reinforcement_delta(
+            rec.p_magnitude, rec.retrieval_count, coupling_score
+        )
+        new_p = max(0.0, rec.p_magnitude - delta)
+        new_spike = calculate_effective_spike(new_p, rec.t_persistence, rec.phase_privilege)
+        new_total = (rec.validation_prediction_total or 0) + 1
+        # correct count stays the same — this was a wrong prediction
+        self._storage.update(
+            memory_id,
+            user=self._user,
+            p_magnitude=new_p,
+            effective_spike=new_spike,
+            retrieval_count=(rec.retrieval_count or 0) + 1,
+            last_retrieved=datetime.now(tz=timezone.utc),
+            validation_prediction_total=new_total,
+        )
+        logger.debug(
+            "[PDM] penalize(%s) Δp=-%.2f → P=%.1f  V_total=%d V_correct=%d",
+            memory_id, delta, new_p, new_total, rec.validation_prediction_correct or 0,
+        )
 
     def delete(self, memory_id: str) -> bool:
+
         """
         Soft-delete a signature (``is_deleted=True`` where supported).
 
@@ -1346,7 +1405,11 @@ class Memory:
                 logger.warning("[PDM] torsion V penalty batch failed: %s", e)
 
     def _apply_reinforcement(self, hits: builtins.list[MemoryHit]) -> None:
-        """Write retrieval reinforcement back to storage for all hits."""
+        """Write retrieval reinforcement back to storage for all hits.
+
+        Also increments Validation Coefficient counters so repeated successful
+        retrievals raise V and therefore P_effective over time.
+        """
         now = datetime.now(tz=timezone.utc)
         batch_updates: list[tuple[str, dict]] = []
         for hit in hits:
@@ -1368,6 +1431,8 @@ class Memory:
                         "effective_spike": new_spike,
                         "retrieval_count": (rec.retrieval_count or 0) + 1,
                         "last_retrieved": now,
+                        "validation_prediction_total": (rec.validation_prediction_total or 0) + 1,
+                        "validation_prediction_correct": (rec.validation_prediction_correct or 0) + 1,
                     }
                 ))
             except Exception as e:

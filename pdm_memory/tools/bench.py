@@ -3,20 +3,23 @@
 # MODIFICATION PROHIBITED. USE AS SHIPPED.
 
 """
-PDM Benchmark Harness — Task 5.2
+PDM Benchmark Harness
 
 Run with: python -m pdm_memory.bench
 
-Compares PDM recall vs a naive baseline (keyword recency search) on a
-built-in synthetic dataset (LoCoMo-style long-term memory scenarios).
+Two benchmark suites are available:
 
-All numbers come from the harness — nothing is made up.
-The full suite is reproducible: seed is fixed, dataset is embedded.
+  1. retrieval  (default) — PDM vs keyword+recency on static recall accuracy.
+     Usage: python -m pdm_memory.bench --suite retrieval
 
-Usage:
-    python -m pdm_memory.bench           # Full suite
-    python -m pdm_memory.bench --quick   # Smoke test (10 scenarios)
-    python -m pdm_memory.bench --output results.json
+  2. correctability — measures whether the system corrects itself after
+     wrong predictions (Memory Gravity, Crossover Round, Error Curve, etc).
+     Usage: python -m pdm_memory.bench --suite correctability --rounds 20 --seeds 5
+
+Full correctability spec:
+    python -m pdm_memory.bench --suite correctability --rounds 20 --seeds 5
+    python -m pdm_memory.bench --suite correctability --ablation
+    python -m pdm_memory.bench --suite correctability --mode vector_rag
 """
 
 from __future__ import annotations
@@ -83,7 +86,7 @@ def _baseline_recall(
     for i, mem in enumerate(memories):
         words = set(mem["text"].lower().split())
         overlap = len(query_words & words) / max(len(query_words), 1)
-        recency_score = (len(memories) - i) / len(memories)  # more recent = higher
+        recency_score = (len(memories) - i) / len(memories)
         score = 0.6 * overlap + 0.4 * recency_score
         scored.append((mem, score))
     scored.sort(key=lambda x: x[1], reverse=True)
@@ -98,7 +101,7 @@ def _pdm_recall(
 
 
 # ---------------------------------------------------------------------------
-# Benchmark results
+# Retrieval benchmark results
 # ---------------------------------------------------------------------------
 
 
@@ -158,18 +161,18 @@ class BenchmarkReport:
 
 
 # ---------------------------------------------------------------------------
-# Harness
+# Retrieval benchmark harness
 # ---------------------------------------------------------------------------
 
 
-def run_benchmark(
+def run_retrieval_benchmark(
     quick: bool = False,
     seed: int = 42,
     k: int = 3,
     output: str | None = None,
 ) -> BenchmarkReport:
     """
-    Run the PDM benchmark harness.
+    Run the PDM retrieval benchmark harness.
 
     Args:
         quick:  If True, run only 5 scenarios (smoke test).
@@ -188,12 +191,10 @@ def run_benchmark(
 
     queries = _BENCHMARK_QUERIES[:5] if quick else _BENCHMARK_QUERIES
 
-    # --- Set up PDM store ---
     tmp_db = tempfile.mktemp(suffix=".db")
     mem = Memory(store=tmp_db, user="bench")
 
-    # Seed memories with varying ages (simulate time-based pressure decay)
-    for idx, m in enumerate(_BENCHMARK_MEMORIES):
+    for m in _BENCHMARK_MEMORIES:
         mem.save(
             text=m["text"],
             tags=m["tags"],
@@ -203,16 +204,12 @@ def run_benchmark(
         )
 
     db_size = os.path.getsize(tmp_db)
-
-    # Baseline: raw text storage (full text, no compression)
     baseline_raw_size = sum(len(m["text"].encode()) for m in _BENCHMARK_MEMORIES)
-
     scenarios: list[ScenarioResult] = []
 
     for query, expected_tags, expected_idx in queries:
         expected_text = _BENCHMARK_MEMORIES[expected_idx]["text"]
 
-        # PDM recall
         t0 = time.perf_counter()
         pdm_hits = _pdm_recall(mem, query, k=k)
         pdm_ms = (time.perf_counter() - t0) * 1000
@@ -220,11 +217,8 @@ def run_benchmark(
         pdm_texts = [h.text for h in pdm_hits]
         pdm_found = expected_text in pdm_texts
         pdm_rank = pdm_texts.index(expected_text) + 1 if pdm_found else None
-
-        # Token approximation: count chars/4 for injected context
         pdm_tokens = sum(len(h.text) // 4 for h in pdm_hits)
 
-        # Baseline recall
         t0 = time.perf_counter()
         baseline_hits = _baseline_recall(_BENCHMARK_MEMORIES, query, k=k)
         baseline_ms = (time.perf_counter() - t0) * 1000
@@ -248,8 +242,9 @@ def run_benchmark(
         ))
 
     mem.close()
-    if os.path.exists(tmp_db):
-        os.remove(tmp_db)
+    import os as _os
+    if _os.path.exists(tmp_db):
+        _os.remove(tmp_db)
 
     n = len(scenarios)
     report = BenchmarkReport(
@@ -274,24 +269,116 @@ def run_benchmark(
     return report
 
 
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+
 def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="PDM Benchmark Harness — PDM vs baseline keyword RAG"
+        description="PDM Benchmark Harness — retrieval accuracy and correctability"
     )
+    parser.add_argument(
+        "--suite",
+        choices=["retrieval", "correctability"],
+        default="retrieval",
+        help="Which benchmark suite to run (default: retrieval)",
+    )
+
+    # --- Retrieval suite options ---
     parser.add_argument("--quick", action="store_true", help="Run only 5 scenarios (smoke test)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
     parser.add_argument("--k", type=int, default=3, help="Top-k memories per query (default: 3)")
+
+    # --- Correctability suite options ---
+    parser.add_argument(
+        "--mode",
+        choices=["pdm_enabled", "pdm_ablation", "vector_rag", "keyword_recency"],
+        default="pdm_enabled",
+        help="Backend mode for correctability suite (default: pdm_enabled)",
+    )
+    parser.add_argument(
+        "--rounds", type=int, default=20,
+        help="Rounds per scenario for correctability suite (default: 20)",
+    )
+    parser.add_argument(
+        "--seeds", type=int, default=5,
+        help="Number of random seeds for correctability suite (default: 5)",
+    )
+    parser.add_argument(
+        "--ablation", action="store_true",
+        help="Shorthand for --mode pdm_ablation (V disabled)",
+    )
+    parser.add_argument(
+        "--domains",
+        nargs="+",
+        choices=["science", "geography", "history", "tech"],
+        help="Restrict correctability suite to specific domains",
+    )
+
+    # --- Shared ---
     parser.add_argument("--output", type=str, help="Save results as JSON to this path")
+
     args = parser.parse_args()
 
-    print("Running PDM Benchmark Harness…\n")
-    report = run_benchmark(quick=args.quick, seed=args.seed, k=args.k, output=args.output)
-    print(report.render_table())
-    print(f"\nPDM accuracy:      {report.pdm_accuracy*100:.1f}%")
-    print(f"Baseline accuracy: {report.baseline_accuracy*100:.1f}%")
+    if args.suite == "retrieval":
+        print("Running PDM Retrieval Benchmark…\n")
+        report = run_retrieval_benchmark(
+            quick=args.quick, seed=args.seed, k=args.k, output=args.output
+        )
+        print(report.render_table())
+        print(f"\nPDM accuracy:      {report.pdm_accuracy*100:.1f}%")
+        print(f"Baseline accuracy: {report.baseline_accuracy*100:.1f}%")
+
+    elif args.suite == "correctability":
+        from pdm_memory.bench.correctability.harness import run_suite
+
+        mode = "pdm_ablation" if args.ablation else args.mode
+        seed_list = list(range(args.seeds))
+
+        print(f"Running PDM Correctability Benchmark…")
+        print(f"  mode={mode}  rounds={args.rounds}  seeds={seed_list}")
+        if args.domains:
+            print(f"  domains={args.domains}")
+        print()
+
+        completed_runs = [0]
+
+        def _progress(done: int, total: int) -> None:
+            if done % max(1, total // 10) == 0 or done == total:
+                pct = done / total * 100
+                print(f"  [{pct:5.1f}%] {done}/{total} runs complete…")
+
+        report = run_suite(
+            mode=mode,
+            rounds=args.rounds,
+            seeds=seed_list,
+            domains=args.domains,
+            output=args.output,
+            on_progress=_progress,
+        )
+
+        print()
+        print(report.render_table())
+
+        if args.output:
+            print(f"\nFull JSON report saved to: {args.output}")
+        else:
+            print(
+                "\nTip: use --output results.json to save full per-round traces "
+                "for external plotting."
+            )
 
 
 if __name__ == "__main__":
     main()
+
+
+# ---------------------------------------------------------------------------
+# Backwards-compatible alias (used by existing tests/test_bench.py)
+# ---------------------------------------------------------------------------
+#: Alias for run_retrieval_benchmark — preserved for backwards compatibility.
+run_benchmark = run_retrieval_benchmark
+
