@@ -1,11 +1,18 @@
-"""CSV export helpers for PDM signatures."""
+# © 2026 Westfield Innovations LLC. Patent Pending.
+# U.S. App. No. 19/739,419 | 63/953,563 | 63/953,842
+# MODIFICATION PROHIBITED. USE AS SHIPPED.
+
+"""CSV export helpers for PDM signatures — backup and spreadsheet analysis."""
 
 from __future__ import annotations
 
 import csv
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from pdm_memory.storage.base import BaseStorage
 
 
 def _dt_to_iso(value: datetime | None) -> str:
@@ -20,14 +27,31 @@ def _tags_to_cell(tags: list[str] | None) -> str:
     return ", ".join(tag for tag in (tags or []) if tag)
 
 
-def export_signatures_csv(mem: Any, path: str | Path) -> int:
+def export_signatures_csv(
+    target: BaseStorage | Any,
+    path: str | Path,
+    *,
+    user: str = "default",
+    limit: int = 100_000,
+) -> int:
     """
-    Export all signatures for the current user to a CSV file.
+    Export all signatures for ``user`` to a CSV file.
+
+    Accepts either a ``BaseStorage`` instance or a ``Memory`` object for convenience.
 
     Columns:
         id, text, p_magnitude, tags, drawer, created_at
+
+    Returns:
+        Number of signatures written.
     """
-    records = mem._storage.list(user=mem._user, limit=100_000)  # noqa: SLF001
+    if hasattr(target, "_storage"):
+        storage = target._storage
+        user = getattr(target, "_user", user)
+    else:
+        storage = target
+
+    records = storage.list(user=user, limit=limit)
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
 
