@@ -425,7 +425,7 @@ class RetrievalEngine:
             raise ValueError("diversity_bias must be a finite float or None")
         bias = max(0.0, min(1.0, bias))
         # bias=1.0 → no effective cap; bias=0.0 → at most 1 per drawer while diversified
-        max_per_drawer = k if bias >= 1.0 else max(1, int(math.floor(k * bias)))
+        max_per_drawer = k if bias >= 1.0 else max(1, math.floor(k * bias))
 
         drawers_in_pool = {(hit.drawer or "general") for _, hit in ranked}
         if len(drawers_in_pool) <= 1:

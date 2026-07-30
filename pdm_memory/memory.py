@@ -61,7 +61,14 @@ from pdm_memory.core.signature import (
 )
 from pdm_memory.models import AlignmentReport, MemoryListPage, SurfaceReport, TorsionReport
 from pdm_memory.storage.base import BaseStorage
-from pdm_memory.types import HookEvent, PostRecallHook, PostSaveHook, PreSaveHook, RecallHook, TorsionJudge
+from pdm_memory.types import (
+    HookEvent,
+    PostRecallHook,
+    PostSaveHook,
+    PreSaveHook,
+    RecallHook,
+    TorsionJudge,
+)
 
 logger = logging.getLogger(__name__)
 

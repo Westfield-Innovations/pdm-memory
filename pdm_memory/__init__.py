@@ -24,7 +24,7 @@ from pdm_memory.memory import Memory
 from pdm_memory.models import AlignmentReport, SurfaceReport, TorsionReport
 from pdm_memory.storage.factory import create_storage, register_storage
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 __all__ = [
     "AlignmentReport",
     "DrawerInfo",

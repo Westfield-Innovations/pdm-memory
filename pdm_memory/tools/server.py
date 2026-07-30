@@ -128,7 +128,7 @@ def create_app(
     app = FastAPI(
         title="PDM Explorer",
         description="Interactive Memory Console for Pressure-Driven Memory",
-        version="0.1.9",
+        version="0.2.3",
     )
     app.state.store = store
     app.state.user = user

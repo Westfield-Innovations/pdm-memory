@@ -98,9 +98,11 @@ class TestStorageFactory:
                 )
             return real_import(name, *args, **kwargs)
 
-        with patch("builtins.__import__", side_effect=_block_psycopg):
-            with pytest.raises(ImportError, match="postgres"):
-                create_storage("postgresql://localhost/pdm")
+        with (
+            patch("builtins.__import__", side_effect=_block_psycopg),
+            pytest.raises(ImportError, match="postgres"),
+        ):
+            create_storage("postgresql://localhost/pdm")
 
     def test_unknown_scheme(self):
         with pytest.raises(ValueError, match="Unsupported storage scheme"):
