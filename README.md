@@ -249,6 +249,7 @@ python examples/hello_pdm.py                 # save / recall / explain
 python examples/guarded_agent_logic.py       # GAA: TORSION vs ALIGNED
 python examples/handling_contradictions.py   # detect + reconcile torsion
 python examples/temporal_recall_demo.py      # event_at + deadline (PDM-T)
+python examples/industrial_safety_gate.py    # Oil Field: Auto-Discovery + heal
 ```
 
 See [`examples/README.md`](examples/README.md).

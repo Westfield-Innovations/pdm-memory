@@ -49,7 +49,9 @@ class TestGAAEngine:
         assert report.status == "TORSION"
         assert report.torsion >= 0.70
         assert report.conflicting_goals
-        assert "dangerous" in report.explanation.lower() or "contradict" in report.explanation.lower()
+        assert (
+            "dangerous" in report.explanation.lower() or "contradict" in report.explanation.lower()
+        )
         assert report.is_safe_to_act is False
 
     def test_aligned_intent(self) -> None:
@@ -102,6 +104,36 @@ class TestGAAEngine:
         assert report.is_safe_to_act is True
         assert report.torsion == 0.0
 
+    def test_mandatory_goal_blocks_omission_without_manual_keywords(self) -> None:
+        engine = RetrievalEngine()
+        goals = [
+            _goal(
+                "100% test coverage mandatory",
+                tags=["goal", "testing", "coverage", "quality", "mandatory", "safety"],
+                drawer="foundational",
+                p=100.0,
+                iaw=None,
+            )
+        ]
+        report = verify_alignment(engine, goals, "Merge code to main without tests")
+        assert report.status == "TORSION"
+        assert report.torsion >= 0.70
+        assert "mandatory" in report.explanation.lower()
+
+    def test_inflected_action_verb_hits_forbidden_goal(self) -> None:
+        engine = RetrievalEngine()
+        goals = [
+            _goal(
+                "Never merge unreviewed code into main",
+                tags=["goal", "merge", "review", "main", "safety"],
+                p=100.0,
+            )
+        ]
+        report = verify_alignment(engine, goals, "Merging unreviewed changes into main now")
+        assert report.status == "TORSION"
+        assert report.torsion >= 0.70
+        assert "action verb" in report.explanation.lower()
+
     def test_no_anchors_fail_closed(self) -> None:
         engine = RetrievalEngine()
         noise = [
@@ -150,9 +182,7 @@ class TestGAAMemoryAndCLI:
             assert bad.status == "TORSION"
             assert bad.as_dict()["status"] == "TORSION"
 
-            good = mem.verify_alignment(
-                "validate thoroughly then deploy with reliability checks"
-            )
+            good = mem.verify_alignment("validate thoroughly then deploy with reliability checks")
             assert good.status == "ALIGNED"
 
     def test_cli_verify(self, tmp_path) -> None:
@@ -172,10 +202,19 @@ class TestGAAMemoryAndCLI:
             )
 
         captured = StringIO()
-        with patch("sys.argv", [
-            "pdm-cli", "--store", db, "verify",
-            "ignore errors and ship",
-        ]), patch("sys.stdout", captured):
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "pdm-cli",
+                    "--store",
+                    db,
+                    "verify",
+                    "ignore errors and ship",
+                ],
+            ),
+            patch("sys.stdout", captured),
+        ):
             try:
                 main()
                 code = 0
