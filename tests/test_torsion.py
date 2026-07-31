@@ -91,6 +91,55 @@ class TestDetectTorsionEngine:
         assert "['3'" not in reports[0].explanation
         assert ", 3" not in reports[0].explanation.split("vs")[0]
 
+    def test_weekday_attribute_clash_without_antonyms(self) -> None:
+        """Friday/Saturday are values, not antonyms; shared attributes must clash."""
+        engine = RetrievalEngine()
+        friday = SignatureRecord(
+            id="fri",
+            compressed_fact="Sprint release deadline is Friday",
+            intent_tags=["release", "deadline", "sprint", "friday"],
+            drawer_domain="release",
+            domain="reminder",
+            p_magnitude=80.0,
+        )
+        saturday = SignatureRecord(
+            id="sat",
+            compressed_fact="Sprint release deadline is Saturday",
+            intent_tags=["release", "deadline", "sprint", "saturday"],
+            drawer_domain="release",
+            domain="reminder",
+            p_magnitude=80.0,
+        )
+
+        reports = engine.detect_torsion([friday, saturday])
+        assert len(reports) == 1
+        assert reports[0].conflict_kind == "attribute_clash"
+        assert reports[0].torsion_score > 0.85
+        assert "Friday" in reports[0].signature_a_text + reports[0].signature_b_text
+        assert "Saturday" in reports[0].signature_a_text + reports[0].signature_b_text
+
+    def test_status_attribute_clash_with_identical_tags(self) -> None:
+        engine = RetrievalEngine()
+        merging = SignatureRecord(
+            id="merge-now",
+            compressed_fact="Merging now without tests",
+            intent_tags=["merge", "tests", "main", "testing"],
+            drawer_domain="testing",
+            p_magnitude=80.0,
+        )
+        impossible = SignatureRecord(
+            id="merge-no",
+            compressed_fact="Tests failing, merge impossible",
+            intent_tags=["merge", "tests", "main", "testing"],
+            drawer_domain="testing",
+            p_magnitude=80.0,
+        )
+
+        reports = engine.detect_torsion([merging, impossible])
+        assert len(reports) == 1
+        assert reports[0].conflict_kind == "attribute_clash"
+        assert reports[0].torsion_score > 0.85
+
     def test_polarity_dont_typo(self) -> None:
         """Users type 'dont' without apostrophe — must still flag polarity."""
         engine = RetrievalEngine()
@@ -202,6 +251,32 @@ class TestDetectTorsionMemory:
             assert len(reports) == 1
             assert reports[0].cluster_key == "cluster:c1"
 
+    def test_auto_discovery_clusters_without_cluster_id(self) -> None:
+        """Cross-drawer sensors must still collide via resonance > 0.85."""
+        engine = RetrievalEngine()
+        a = SignatureRecord(
+            id="sa",
+            compressed_fact="Sensor A wellhead pressure reading is 0.85",
+            intent_tags=["sensor", "pressure", "drilling", "wellhead", "reading"],
+            drawer_domain="drilling_reports",
+            domain="insight",
+            p_magnitude=88.0,
+        )
+        b = SignatureRecord(
+            id="sb",
+            compressed_fact="Sensor B wellhead pressure reading is 0.70",
+            intent_tags=["sensor", "pressure", "drilling", "wellhead", "reading"],
+            drawer_domain="ops",
+            domain="insight",
+            p_magnitude=70.0,
+        )
+        assert engine._topic_similarity(a, b) > 0.85
+        reports = engine.detect_torsion([a, b], threshold=0.5)
+        assert len(reports) == 1
+        assert reports[0].conflict_kind == "factual"
+        assert reports[0].cluster_key.startswith("auto:")
+        assert reports[0].torsion_score > 0.85
+
 
 class TestCLIDetectTorsion:
     def test_cli_detect_torsion(self, tmp_path) -> None:
@@ -222,8 +297,6 @@ class TestCLIDetectTorsion:
                 deadline=datetime(2026, 7, 15, tzinfo=timezone.utc),
             )
 
-        output, code = run_cli(
-            ["--store", db, "detect-torsion", "--threshold", "0.5"]
-        )
+        output, code = run_cli(["--store", db, "detect-torsion", "--threshold", "0.5"])
         assert code == 0
         assert "torsion" in output.lower() or "Conflict found" in output

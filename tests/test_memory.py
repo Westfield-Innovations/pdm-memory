@@ -19,8 +19,14 @@ class TestMemorySaveRecall:
         assert len(mid) == 36  # UUID
 
     def test_recall_basic(self, mem):
-        mem.save("User prefers metric units", tags=["units", "preferences", "formatting"], p_magnitude=80)
-        mem.save("User dislikes long responses", tags=["brevity", "preferences", "formatting"], p_magnitude=70)
+        mem.save(
+            "User prefers metric units", tags=["units", "preferences", "formatting"], p_magnitude=80
+        )
+        mem.save(
+            "User dislikes long responses",
+            tags=["brevity", "preferences", "formatting"],
+            p_magnitude=70,
+        )
         hits = mem.recall("how should I format this?", k=5)
         assert len(hits) >= 1
         assert all(hasattr(h, "text") for h in hits)
@@ -236,6 +242,32 @@ class TestTemporalRecall:
         # Window match beats higher pressure outside the window
         assert ids.index(id_y) < ids.index(id_old)
 
+    def test_absolute_month_year_window_prioritizes_event(self, mem):
+        from datetime import datetime, timezone
+
+        jan = mem.save(
+            "Capacity planning notes from the ops review",
+            tags=["capacity", "planning", "ops", "review"],
+            p_magnitude=55,
+            event_at=datetime(2024, 1, 15, tzinfo=timezone.utc),
+        )
+        decoy = mem.save(
+            "Capacity planning backlog from the ops review",
+            tags=["capacity", "planning", "ops", "review"],
+            p_magnitude=95,
+            event_at=datetime(2025, 6, 1, tzinfo=timezone.utc),
+        )
+        hits = mem.recall(
+            "capacity planning ops review in January 2024",
+            k=5,
+            search_cost=1.0,
+            reinforce=False,
+            diversity_bias=None,
+        )
+        ids = [h.id for h in hits]
+        assert jan in ids and decoy in ids
+        assert ids.index(jan) < ids.index(decoy)
+
 
 class TestAuditAndHeal:
     def test_auto_reconciles_high_confidence_torsion(self, mem):
@@ -266,6 +298,8 @@ class TestAuditAndHeal:
         )
         assert summary["scanned_pairs"] >= 1
         assert summary["reconciled"] == 1
+        assert "narrative" in summary
+        assert "resolved" in summary["narrative"].lower()
         assert mem.get(a) is None
         assert mem.get(b) is None
         assert mem.count() == 1
@@ -334,7 +368,9 @@ class TestMemoryReinforce:
 
 class TestMemoryDecay:
     def test_decay_returns_counts(self, mem):
-        mem.save("Memory to decay", tags=["old", "stale", "memory"], p_magnitude=35, t_persistence=0.001)
+        mem.save(
+            "Memory to decay", tags=["old", "stale", "memory"], p_magnitude=35, t_persistence=0.001
+        )
         counts = mem.decay()
         assert "decayed" in counts
         assert "deleted" in counts
@@ -363,7 +399,9 @@ class TestMemoryDecay:
 
 class TestMemoryExplain:
     def test_explain_returns_report(self, mem):
-        mid = mem.save("User prefers metric units", tags=["units", "preferences", "formatting"], p_magnitude=75)
+        mid = mem.save(
+            "User prefers metric units", tags=["units", "preferences", "formatting"], p_magnitude=75
+        )
         report = mem.explain(mid)
         assert report.memory_id == mid
         assert report.p_magnitude == pytest.approx(75.0)
@@ -406,6 +444,7 @@ class TestMemoryContextManager:
             assert mem.count() == 1
         # After close, file should still exist
         import os
+
         assert os.path.exists(db)
 
 

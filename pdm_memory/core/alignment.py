@@ -17,6 +17,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from pdm_memory.core.constraints import detect_constraint_violation
 from pdm_memory.core.math import calculate_intent_weight, infer_domain
 from pdm_memory.core.signature import SignatureRecord
 from pdm_memory.models import AlignmentReport
@@ -86,6 +87,8 @@ _INTENT_VS_GOAL_OPPOSITION: tuple[tuple[str, str], ...] = (
 _NEGATION: frozenset[str] = frozenset(
     {"not", "never", "no", "without", "ignore", "skip", "avoid", "disable", "bypass"}
 )
+_REQUIRED_CUES: frozenset[str] = frozenset({"mandatory", "must", "required", "requires", "require"})
+_ACTION_VERBS: frozenset[str] = frozenset({"deploy", "drill", "merge", "release", "ship", "start"})
 
 DEFAULT_MIN_PRESSURE: float = 60.0
 DEFAULT_K_GOALS: int = 8
@@ -172,7 +175,12 @@ def select_goal_anchors(
     return [rec for _, rec in pool[: max(1, k)]]
 
 
-def intent_goal_torsion(intent_text: str, goal: SignatureRecord) -> tuple[float, str]:
+def intent_goal_torsion(
+    intent_text: str,
+    goal: SignatureRecord,
+    *,
+    occupancy_records: Sequence[SignatureRecord] = (),
+) -> tuple[float, str]:
     """
     Deviation of a proposed intent from one Goal Signature.
     Returns (torsion in [0,1], short detail).
@@ -182,14 +190,23 @@ def intent_goal_torsion(intent_text: str, goal: SignatureRecord) -> tuple[float,
     goal_l = f"{goal_text} {' '.join(goal.intent_tags or [])}".lower()
     intent_tokens = set(_tokenize(intent_l))
     goal_tokens = set(_tokenize(goal_l))
+    intent_bag = _normalize_bag(intent_tokens)
+    goal_bag = _normalize_bag(goal_tokens)
 
     best = 0.0
     detail = ""
 
+    constraint = detect_constraint_violation(
+        goal,
+        intent_text,
+        occupancy_records=occupancy_records,
+    )
+    if constraint is not None:
+        best = constraint.strength
+        detail = constraint.explanation
+
     for intent_cue, goal_cue in _INTENT_VS_GOAL_OPPOSITION:
-        if intent_cue in intent_tokens and (
-            goal_cue in goal_tokens or goal_cue in goal_l
-        ):
+        if intent_cue in intent_tokens and (goal_cue in goal_tokens or goal_cue in goal_l):
             strength = 0.85
             if strength > best:
                 best = strength
@@ -201,10 +218,7 @@ def intent_goal_torsion(intent_text: str, goal: SignatureRecord) -> tuple[float,
         strength = min(1.0, 0.45 + 0.10 * len(shared))
         if strength > best:
             best = strength
-            detail = (
-                "intent negates topics affirmed by the goal "
-                f"({', '.join(sorted(shared)[:4])})"
-            )
+            detail = f"intent negates topics affirmed by the goal ({', '.join(sorted(shared)[:4])})"
 
     # Goal forbids scoped predicates after never/not ("never ignore errors")
     forbidden = _forbidden_after_negation(goal_text)
@@ -214,6 +228,36 @@ def intent_goal_torsion(intent_text: str, goal: SignatureRecord) -> tuple[float,
         if strength > best:
             best = strength
             detail = f"intent performs what the goal forbids ({', '.join(sorted(hit)[:3])})"
+
+    # Morphology-safe action gate: "merging"/"shipping"/"starting" must still
+    # collide with a forbidden "merge"/"ship"/"start" stewardship rule.
+    forbidden_actions = {
+        action for token in forbidden if (action := _canonical_action(token)) is not None
+    }
+    intent_actions = {
+        action for token in intent_bag if (action := _canonical_action(token)) is not None
+    }
+    action_hit = forbidden_actions & intent_actions
+    if action_hit:
+        strength = min(1.0, 0.88 + 0.04 * len(action_hit))
+        if strength > best:
+            best = strength
+            detail = f"intent performs forbidden action verb ({', '.join(sorted(action_hit)[:3])})"
+
+    # Positive mandatory goals are also constraints. "100% test coverage
+    # mandatory" versus "merge without tests" is a hard safety deviation even
+    # though the goal itself contains no lexical "never".
+    normalized_shared = intent_bag & goal_bag
+    required_goal = bool(_REQUIRED_CUES & goal_tokens)
+    omission = bool(_NEGATION & intent_tokens)
+    if required_goal and omission and normalized_shared:
+        strength = min(1.0, 0.85 + 0.03 * len(normalized_shared))
+        if strength > best:
+            best = strength
+            detail = (
+                "intent omits a mandatory goal requirement "
+                f"({', '.join(sorted(normalized_shared)[:3])})"
+            )
 
     return round(best, 4), detail
 
@@ -230,6 +274,28 @@ def _forbidden_after_negation(goal_text: str) -> set[str]:
                 continue
             forbidden.add(nxt)
     return forbidden
+
+
+def _canonical_action(token: str) -> str | None:
+    """Map action morphology to a stable safety verb."""
+    value = (token or "").lower().strip()
+    aliases = {
+        "deployed": "deploy",
+        "deploying": "deploy",
+        "drilled": "drill",
+        "drilling": "drill",
+        "merged": "merge",
+        "merges": "merge",
+        "merging": "merge",
+        "released": "release",
+        "releasing": "release",
+        "shipped": "ship",
+        "shipping": "ship",
+        "started": "start",
+        "starting": "start",
+    }
+    canonical = aliases.get(value, value)
+    return canonical if canonical in _ACTION_VERBS else None
 
 
 def intent_goal_resonance(
@@ -292,10 +358,7 @@ def intent_goal_resonance(
             0.0,
             min(
                 1.0,
-                0.20 * coupling.tag_overlap
-                + 0.15 * i_norm
-                + 0.30 * tok_j
-                + 0.35 * coverage,
+                0.20 * coupling.tag_overlap + 0.15 * i_norm + 0.30 * tok_j + 0.35 * coverage,
             ),
         ),
         4,
@@ -374,9 +437,19 @@ def verify_alignment(
     for goal in anchors:
         iaw = compute_iaw(goal)
         resonance = intent_goal_resonance(engine, text, goal)
-        torsion, detail = intent_goal_torsion(text, goal)
+        constraint = detect_constraint_violation(
+            goal,
+            text,
+            occupancy_records=records,
+        )
+        torsion, detail = intent_goal_torsion(text, goal, occupancy_records=records)
         # Weight deviation by IAW — contradicting a strong identity anchor hurts more
-        torsion_w = min(1.0, torsion * (0.55 + 0.45 * iaw))
+        # Hard numerical/role/occupancy constraints are not advisory and cannot be diluted.
+        torsion_w = (
+            constraint.strength
+            if constraint is not None
+            else min(1.0, torsion * (0.55 + 0.45 * iaw))
+        )
         scored.append(
             _AnchorScore(
                 record=goal,
@@ -402,9 +475,7 @@ def verify_alignment(
 
     score = round(max(0.0, min(1.0, resonance * (1.0 - torsion))), 4)
     conflicting = [
-        (s.record.compressed_fact or "").strip()
-        for s in scored
-        if s.torsion >= conflict_threshold
+        (s.record.compressed_fact or "").strip() for s in scored if s.torsion >= conflict_threshold
     ]
     conflicting = [c for c in conflicting if c]
 
@@ -440,6 +511,8 @@ def _explain_torsion(intent_text: str, peak: _AnchorScore) -> str:
     goal_snip = _snip(peak.record.compressed_fact)
     intent_snip = _snip(intent_text)
     why = peak.detail or "semantic opposition to a core goal"
+    if why.startswith(("Intent violates", "Intent assigns", "Entity Exclusion")):
+        return f"{why} Conflicting Goal Anchor: '{goal_snip}'. Block ACT."
     return (
         f"This intent is dangerous for system integrity: "
         f"'{intent_snip}' contradicts Goal Anchor '{goal_snip}' ({why}). "
@@ -471,9 +544,27 @@ def _explain_conflict(
 def _tokenize(text: str) -> list[str]:
     words = _WORD_RE.findall((text or "").lower())
     stop = {
-        "the", "and", "for", "how", "what", "that", "this", "with",
-        "are", "was", "can", "will", "from", "have", "been",
-        "should", "would", "could", "which", "when", "where",
+        "the",
+        "and",
+        "for",
+        "how",
+        "what",
+        "that",
+        "this",
+        "with",
+        "are",
+        "was",
+        "can",
+        "will",
+        "from",
+        "have",
+        "been",
+        "should",
+        "would",
+        "could",
+        "which",
+        "when",
+        "where",
     }
     return [w for w in words if w not in stop]
 

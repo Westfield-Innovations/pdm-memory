@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import math
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
@@ -27,6 +27,13 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from pdm_memory.types import TorsionJudge
 
+from pdm_memory.core.constraints import (
+    collect_occupants,
+    detect_constraint_violation,
+    entity_exclusion_pair,
+    parse_exclusive_slot,
+    parse_presence,
+)
 from pdm_memory.core.math import (
     P_MAX,
     calculate_decay_factor,
@@ -49,7 +56,75 @@ NUMBER_PATTERN = re.compile(r"(?<![A-Za-z])-?\d+(?:\.\d+)?(?![A-Za-z])")
 
 # Reverse Resonance — topic/contradiction gates (surgical, not N² fishing)
 _TOPIC_GATE: float = 0.35
+_SAME_DRAWER_TOPIC_GATE: float = 0.25
 _SMALL_CLUSTER: int = 48
+# Auto-discover virtual clusters when metadata.cluster_id is absent
+_AUTO_CLUSTER_RESONANCE: float = 0.85
+_ATTRIBUTE_TAG_OVERLAP: float = 0.80
+_ATTRIBUTE_ROLE_TAGS: frozenset[str] = frozenset(
+    {"goal", "anchor", "principle", "policy", "stewardship", "foundational"}
+)
+_ATTRIBUTE_HINT_TAGS: frozenset[str] = frozenset(
+    {
+        "date",
+        "deadline",
+        "pressure",
+        "reading",
+        "release",
+        "schedule",
+        "state",
+        "status",
+        "time",
+        "value",
+        "version",
+    }
+)
+_TEMPORAL_ATTRIBUTE_VALUES: frozenset[str] = frozenset(
+    {
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+        "today",
+        "tomorrow",
+        "yesterday",
+    }
+)
+_STATUS_ATTRIBUTE_VALUES: frozenset[str] = frozenset(
+    {
+        "active",
+        "approved",
+        "blocked",
+        "cancelled",
+        "closed",
+        "complete",
+        "completed",
+        "delayed",
+        "done",
+        "failed",
+        "failing",
+        "impossible",
+        "inactive",
+        "merged",
+        "moved",
+        "open",
+        "pending",
+        "ready",
+        "rejected",
+        "scheduled",
+        "started",
+        "stopped",
+    }
+)
+_INTEGRITY_DRAWERS: frozenset[str] = frozenset(
+    {"anchors", "foundational", "goals", "mission", "principles", "stewardship"}
+)
+_INTEGRITY_TAGS: frozenset[str] = frozenset(
+    {"anchor", "foundational", "goal", "policy", "principle", "rule", "stewardship"}
+)
 # PDM-T: how hard urgency energy lifts ranking / Phase-1 gate
 _TEMPORAL_RANK_BOOST: float = 0.35
 _TEMPORAL_GATE_BOOST: float = 0.25
@@ -114,9 +189,28 @@ _ANTONYM_PAIRS: tuple[tuple[str, str], ...] = (
 )
 _STOPWORDS: frozenset[str] = frozenset(
     {
-        "the", "and", "for", "how", "what", "that", "this", "with",
-        "are", "was", "not", "can", "will", "from", "have", "been",
-        "should", "would", "could", "which", "when", "where",
+        "the",
+        "and",
+        "for",
+        "how",
+        "what",
+        "that",
+        "this",
+        "with",
+        "are",
+        "was",
+        "not",
+        "can",
+        "will",
+        "from",
+        "have",
+        "been",
+        "should",
+        "would",
+        "could",
+        "which",
+        "when",
+        "where",
     }
 )
 
@@ -124,11 +218,11 @@ _STOPWORDS: frozenset[str] = frozenset(
 # TAS constants (mirrors threshold_search/engine.py)
 # ---------------------------------------------------------------------------
 
-ALPHA_DEFAULT: float = 0.7          # Threshold-lowering aggressiveness
-THETA_FLOOR: float = 5.0            # Absolute minimum effective threshold
-THETA_BASE_DEFAULT: float = 30.0    # Default base threshold
+ALPHA_DEFAULT: float = 0.7  # Threshold-lowering aggressiveness
+THETA_FLOOR: float = 5.0  # Absolute minimum effective threshold
+THETA_BASE_DEFAULT: float = 30.0  # Default base threshold
 
-COUPLING_MIN_DEFAULT: float = 0.3   # Minimum coupling score to count as "coupled"
+COUPLING_MIN_DEFAULT: float = 0.3  # Minimum coupling score to count as "coupled"
 
 W_TAGS: float = 0.50
 W_DOMAIN: float = 0.20
@@ -162,6 +256,7 @@ class NodeCoupling:
 @dataclass
 class RetrievalResult:
     """Full result from the TAS retrieval engine."""
+
     found: bool
     threshold_used: float
     base_threshold: float
@@ -217,7 +312,7 @@ class RetrievalEngine:
         records: list[SignatureRecord],
         query: str | None = None,
         k: int = 5,
-        search_cost: float = 0.5,   # 0=TIGHT, 1=LOOSE
+        search_cost: float = 0.5,  # 0=TIGHT, 1=LOOSE
         base_threshold: float = THETA_BASE_DEFAULT,
         target_pressure: float = 50.0,
         domain: str | None = None,
@@ -275,9 +370,7 @@ class RetrievalEngine:
             )
             v = calculate_v(rec.validation_prediction_correct, rec.validation_prediction_total)
             i_weight = calculate_intent_weight(rec.intent_tags, query)
-            p_eff = calculate_p_effective(
-                rec.p_magnitude, v, decay, i_weight, quality=0.80
-            )
+            p_eff = calculate_p_effective(rec.p_magnitude, v, decay, i_weight, quality=0.80)
             e_temporal, is_urgent = self._temporal_energy(rec, now)
             # Urgent deadlines get a soft lift through the Phase-1 pressure gate
             p_gate = p_eff * (1.0 + _TEMPORAL_GATE_BOOST * e_temporal)
@@ -285,16 +378,26 @@ class RetrievalEngine:
             # Phase 1 gate
             if p_gate < theta_eff:
                 coupling = self._compute_coupling(
-                    rec, query_tags, p_eff, rec.p_magnitude,
-                    effective_domain, effective_regime, target_pressure,
+                    rec,
+                    query_tags,
+                    p_eff,
+                    rec.p_magnitude,
+                    effective_domain,
+                    effective_regime,
+                    target_pressure,
                 )
                 damped.append(coupling)
                 continue
 
             # Phase 2: impedance matching
             coupling = self._compute_coupling(
-                rec, query_tags, p_eff, rec.p_magnitude,
-                effective_domain, effective_regime, target_pressure,
+                rec,
+                query_tags,
+                p_eff,
+                rec.p_magnitude,
+                effective_domain,
+                effective_regime,
+                target_pressure,
             )
 
             if coupling.is_coupled:
@@ -302,7 +405,11 @@ class RetrievalEngine:
                     damped.append(coupling)
                     continue
                 hit = MemoryHit.from_record(
-                    rec, p_eff, decay, i_weight, v,
+                    rec,
+                    p_eff,
+                    decay,
+                    i_weight,
+                    v,
                     coupling_score=coupling.coupling_score,
                     tag_overlap=coupling.tag_overlap,
                     domain_match=coupling.domain_match,
@@ -346,11 +453,12 @@ class RetrievalEngine:
         now: datetime,
     ) -> tuple[datetime, datetime] | None:
         """
-        Map relative time phrases in *query* to a half-open UTC window
+        Map temporal phrases in *query* to a half-open UTC window
         ``[start, end)`` for ``t_event_at`` prioritization.
 
-        Recognizes: today, yesterday, tomorrow, last week, this week,
-        last month, last year. Returns ``None`` when no temporal cue.
+        Recognizes relative cues (today, yesterday, tomorrow, last week,
+        this week, last month, last year) and absolute month/year windows
+        (``January 2024``, ``Dec 2026``, ``2024-01``).
         """
         if not query or not query.strip():
             return None
@@ -359,6 +467,10 @@ class RetrievalEngine:
 
         text = query.lower()
         day0 = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+
+        absolute = RetrievalEngine._parse_absolute_month_year_window(text)
+        if absolute is not None:
+            return absolute
 
         # Multi-word phrases first (order matters)
         if re.search(r"\blast\s+year\b", text):
@@ -382,6 +494,65 @@ class RetrievalEngine:
             return start, day0 + timedelta(days=2)
         if re.search(r"\btoday\b", text):
             return day0, day0 + timedelta(days=1)
+        return None
+
+    @staticmethod
+    def _parse_absolute_month_year_window(
+        text: str,
+    ) -> tuple[datetime, datetime] | None:
+        """Parse ``January 2024`` / ``Dec 2026`` / ``2024-01`` into ``[start, end)``."""
+        months = {
+            "jan": 1,
+            "january": 1,
+            "feb": 2,
+            "february": 2,
+            "mar": 3,
+            "march": 3,
+            "apr": 4,
+            "april": 4,
+            "may": 5,
+            "jun": 6,
+            "june": 6,
+            "jul": 7,
+            "july": 7,
+            "aug": 8,
+            "august": 8,
+            "sep": 9,
+            "sept": 9,
+            "september": 9,
+            "oct": 10,
+            "october": 10,
+            "nov": 11,
+            "november": 11,
+            "dec": 12,
+            "december": 12,
+        }
+        named = re.search(
+            r"\b(" + "|".join(sorted(months, key=len, reverse=True)) + r")\s+(20\d{2})\b",
+            text,
+        )
+        if named is not None:
+            month = months[named.group(1)]
+            year = int(named.group(2))
+            start = datetime(year, month, 1, tzinfo=timezone.utc)
+            end_month = month + 1
+            end_year = year
+            if end_month == 13:
+                end_month = 1
+                end_year += 1
+            return start, datetime(end_year, end_month, 1, tzinfo=timezone.utc)
+
+        iso = re.search(r"\b(20\d{2})-(0[1-9]|1[0-2])\b", text)
+        if iso is not None:
+            year = int(iso.group(1))
+            month = int(iso.group(2))
+            start = datetime(year, month, 1, tzinfo=timezone.utc)
+            end_month = month + 1
+            end_year = year
+            if end_month == 13:
+                end_month = 1
+                end_year += 1
+            return start, datetime(end_year, end_month, 1, tzinfo=timezone.utc)
         return None
 
     @staticmethod
@@ -626,11 +797,21 @@ class RetrievalEngine:
         """
         Find Reverse Resonance pairs: high topic similarity + opposing facts/pressure.
 
-        Search space is limited to drawer/domain (or metadata ``cluster_id``) buckets.
-        Within a bucket, candidates come from a tag inverted index (shared intent tags).
-        Small buckets may also compare all pairs. Never runs blind global N².
+        Clustering (in order):
+          1. Explicit ``metadata['cluster_id']`` buckets.
+          2. Fallback ``drawer|domain`` buckets for records without cluster_id.
+          3. Auto-Discovery: records lacking ``cluster_id`` with
+             ``topic_similarity > 0.85`` are unioned into temporary virtual
+             clusters (so related sensors/facts compare even across drawers).
+          4. Shared-location spatial clusters (e.g. Server Room presence).
+          5. Exclusive-slot Entity Exclusion for capacity-1 places.
 
-        Optional ``judge`` callback may flag pairs rules-only detection missed (e.g. paraphrase).
+        Within a bucket, candidates come from a tag inverted index (shared intent
+        tags). Small buckets may also compare all pairs. Integrity anchors use a
+        deliberate anchors × signals pass across drawers; ordinary records never
+        run blind global N².
+
+        Optional ``judge`` callback may flag pairs rules-only detection missed.
         """
         if threshold < 0.0 or threshold > 1.0:
             raise ValueError("threshold must be in [0.0, 1.0]")
@@ -638,14 +819,42 @@ class RetrievalEngine:
             return []
 
         by_id: dict[str, SignatureRecord] = {r.id: r for r in records if r.id}
-        clusters: dict[str, list[SignatureRecord]] = {}
-        for rec in by_id.values():
-            key = self._torsion_cluster_key(rec)
-            clusters.setdefault(key, []).append(rec)
+        clusters = self._build_torsion_clusters(list(by_id.values()))
 
         reports: list[TorsionReport] = []
         seen_pairs: set[tuple[str, str]] = set()
         reported_pairs: set[tuple[str, str]] = set()
+
+        # Rules are asymmetric: every stewardship/foundational anchor must be
+        # checked against signals from every other drawer.
+        for rule, signal in self._integrity_candidate_pairs(list(by_id.values())):
+            pair_key = (rule.id, signal.id) if rule.id < signal.id else (signal.id, rule.id)
+            report = self._score_integrity_violation(
+                rule,
+                signal,
+                occupancy_records=list(by_id.values()),
+            )
+            if report is None:
+                continue
+            seen_pairs.add(pair_key)
+            if report.torsion_score >= threshold:
+                reports.append(report)
+                reported_pairs.add(pair_key)
+
+        # Exclusive spatial slots: multiple occupants of a capacity-1 place are
+        # Entity Exclusion even when cluster_id was never supplied.
+        for report in self._entity_exclusion_reports(list(by_id.values())):
+            pair_key = (
+                (report.signature_a_id, report.signature_b_id)
+                if report.signature_a_id < report.signature_b_id
+                else (report.signature_b_id, report.signature_a_id)
+            )
+            if pair_key in seen_pairs:
+                continue
+            seen_pairs.add(pair_key)
+            if report.torsion_score >= threshold:
+                reports.append(report)
+                reported_pairs.add(pair_key)
 
         for cluster_key, group in clusters.items():
             if len(group) < 2:
@@ -662,12 +871,211 @@ class RetrievalEngine:
                     reported_pairs.add(pair_key)
 
         if judge is not None:
-            reports = self._merge_judge_reports(
-                clusters, reports, threshold, judge, reported_pairs
-            )
+            reports = self._merge_judge_reports(clusters, reports, threshold, judge, reported_pairs)
 
         reports.sort(key=lambda r: r.torsion_score, reverse=True)
         return reports
+
+    def _integrity_candidate_pairs(
+        self,
+        records: Sequence[SignatureRecord],
+    ) -> Iterator[tuple[SignatureRecord, SignatureRecord]]:
+        anchors = [record for record in records if self._is_integrity_anchor(record)]
+        signals = [record for record in records if not self._is_integrity_anchor(record)]
+        for anchor in anchors:
+            for signal in signals:
+                yield anchor, signal
+
+    @staticmethod
+    def _is_integrity_anchor(record: SignatureRecord) -> bool:
+        metadata = record.metadata or {}
+        if metadata.get("is_anchor") or metadata.get("role") in {
+            "anchor",
+            "goal",
+            "stewardship",
+        }:
+            return True
+        drawer = (record.drawer_domain or "").strip().lower()
+        tags = {tag.lower() for tag in (record.intent_tags or []) if tag}
+        return drawer in _INTEGRITY_DRAWERS or bool(tags & _INTEGRITY_TAGS)
+
+    def _score_integrity_violation(
+        self,
+        rule: SignatureRecord,
+        signal: SignatureRecord,
+        *,
+        occupancy_records: Sequence[SignatureRecord] | None = None,
+    ) -> TorsionReport | None:
+        violation = detect_constraint_violation(
+            rule,
+            signal.compressed_fact or "",
+            candidate_tags=signal.intent_tags or [],
+            occupancy_records=occupancy_records or (),
+        )
+        if violation is None:
+            return None
+
+        rule_text = (rule.compressed_fact or "")[:500]
+        signal_text = (signal.compressed_fact or "")[:500]
+        explanation = (
+            f"Integrity Violation: {violation.explanation} "
+            f"Rule: '{self._fact_preview(rule_text)}'. "
+            f"Signal: '{self._fact_preview(signal_text)}'."
+        )
+        kind = "integrity_violation" if violation.kind != "entity_exclusion" else "entity_exclusion"
+        return TorsionReport(
+            signature_a_id=rule.id,
+            signature_b_id=signal.id,
+            signature_a_text=rule_text,
+            signature_b_text=signal_text,
+            drawer=rule.drawer_domain or "stewardship",
+            domain=rule.domain or signal.domain or "structural",
+            torsion_score=round(violation.strength, 4),
+            topic_similarity=round(violation.topic_similarity, 4),
+            contradiction_strength=round(violation.strength, 4),
+            explanation=explanation,
+            conflict_kind=kind,
+            cluster_key=f"integrity:{rule.id[:8]}",
+        )
+
+    def _entity_exclusion_reports(
+        self,
+        records: Sequence[SignatureRecord],
+    ) -> list[TorsionReport]:
+        """Pairwise Entity Exclusion for exclusive spatial slots."""
+        reports: list[TorsionReport] = []
+        by_id = {record.id: record for record in records if record.id}
+        for rule in records:
+            slot = parse_exclusive_slot(rule.compressed_fact or "")
+            if slot is None:
+                continue
+            occupants = collect_occupants(records, location=slot.location)
+            if len(occupants) <= slot.capacity:
+                continue
+            for i, left in enumerate(occupants):
+                for right in occupants[i + 1 :]:
+                    violation = entity_exclusion_pair(left, right, slot=slot)
+                    if violation is None:
+                        continue
+                    left_rec = by_id.get(left.source_id or "")
+                    right_rec = by_id.get(right.source_id or "")
+                    if left_rec is None or right_rec is None:
+                        continue
+                    reports.append(
+                        TorsionReport(
+                            signature_a_id=left_rec.id,
+                            signature_b_id=right_rec.id,
+                            signature_a_text=(left_rec.compressed_fact or "")[:500],
+                            signature_b_text=(right_rec.compressed_fact or "")[:500],
+                            drawer=left_rec.drawer_domain or right_rec.drawer_domain or "general",
+                            domain=left_rec.domain or right_rec.domain or "insight",
+                            torsion_score=1.0,
+                            topic_similarity=1.0,
+                            contradiction_strength=1.0,
+                            explanation=(
+                                f"{violation.explanation} "
+                                f"Rule: '{self._fact_preview(rule.compressed_fact)}'."
+                            ),
+                            conflict_kind="entity_exclusion",
+                            cluster_key=f"slot:{slot.location}",
+                        )
+                    )
+        return reports
+
+    def _build_torsion_clusters(
+        self,
+        records: Sequence[SignatureRecord],
+    ) -> dict[str, list[SignatureRecord]]:
+        """
+        Build torsion comparison buckets.
+
+        Explicit ``cluster_id`` wins. Unclustered records get ``drawer|domain``
+        buckets PLUS auto-discovered virtual clusters when resonance > 0.85,
+        PLUS shared-location spatial clusters (Server Room occupancy, etc.).
+        """
+        clusters: dict[str, list[SignatureRecord]] = {}
+        unclustered: list[SignatureRecord] = []
+
+        for rec in records:
+            meta = rec.metadata or {}
+            cluster_id = meta.get("cluster_id")
+            if cluster_id is not None and str(cluster_id).strip():
+                key = f"cluster:{str(cluster_id).strip()}"
+                clusters.setdefault(key, []).append(rec)
+            else:
+                unclustered.append(rec)
+                # Keep legacy coarse bucket so mid-resonance same-drawer pairs still compare
+                coarse = self._torsion_drawer_domain_key(rec)
+                clusters.setdefault(coarse, []).append(rec)
+
+        for key, group in self._auto_discover_resonance_clusters(unclustered).items():
+            clusters[key] = group
+
+        for key, group in self._auto_discover_location_clusters(unclustered).items():
+            clusters[key] = group
+
+        return clusters
+
+    def _auto_discover_location_clusters(
+        self,
+        records: Sequence[SignatureRecord],
+    ) -> dict[str, list[SignatureRecord]]:
+        """Group presence facts that share the same place (no cluster_id needed)."""
+        by_location: dict[str, list[SignatureRecord]] = {}
+        for record in records:
+            presence = parse_presence(record.compressed_fact or "", source_id=record.id)
+            if presence is None:
+                continue
+            by_location.setdefault(presence.location, []).append(record)
+        return {
+            f"slot:{location}": members
+            for location, members in by_location.items()
+            if len(members) >= 2
+        }
+
+    def _auto_discover_resonance_clusters(
+        self,
+        records: Sequence[SignatureRecord],
+        *,
+        min_resonance: float = _AUTO_CLUSTER_RESONANCE,
+    ) -> dict[str, list[SignatureRecord]]:
+        """
+        Union-Find virtual clusters for records with topic_similarity > min_resonance.
+
+        Candidate edges come from the same surgical tag/token index used for
+        torsion pairs — never blind global N².
+        """
+        if len(records) < 2:
+            return {}
+
+        by_id = {r.id: r for r in records if r.id}
+        parent: dict[str, str] = {rid: rid for rid in by_id}
+
+        def find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: str, b: str) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        for a, b in self._torsion_candidate_pairs(list(by_id.values())):
+            if self._topic_similarity(a, b) > min_resonance:
+                union(a.id, b.id)
+
+        groups: dict[str, list[SignatureRecord]] = {}
+        for rid, rec in by_id.items():
+            groups.setdefault(find(rid), []).append(rec)
+
+        out: dict[str, list[SignatureRecord]] = {}
+        for idx, (root, members) in enumerate(groups.items()):
+            if len(members) < 2:
+                continue
+            out[f"auto:{idx}:{root[:8]}"] = members
+        return out
 
     def _merge_judge_reports(
         self,
@@ -750,7 +1158,9 @@ class RetrievalEngine:
         cluster_key: str,
     ) -> TorsionReport | None:
         topic = self._topic_similarity(a, b)
-        if topic < _TOPIC_GATE:
+        same_drawer = self._same_drawer(a, b)
+        topic_gate = _SAME_DRAWER_TOPIC_GATE if same_drawer else _TOPIC_GATE
+        if topic < topic_gate:
             return None
 
         kind, strength, detail = self._contradiction_signals(a, b, topic)
@@ -758,6 +1168,13 @@ class RetrievalEngine:
             return None
 
         score = round(max(0.0, min(1.0, topic * strength)), 4)
+        # A structured date disagreement or high-overlap attribute clash in the
+        # same drawer is stronger evidence than lexical topic similarity alone.
+        # Keep these visible at the default detect_torsion(threshold=0.7).
+        if same_drawer and kind == "deadline":
+            score = max(score, round(min(1.0, 0.85 + 0.10 * strength), 4))
+        elif same_drawer and kind == "attribute_clash":
+            score = max(score, round(min(0.95, 0.75 + 0.20 * strength), 4))
         explanation = self._humanize_torsion(a, b, kind=kind, detail=detail)
         return TorsionReport(
             signature_a_id=a.id,
@@ -840,6 +1257,16 @@ class RetrievalEngine:
             if strength > best_strength:
                 best_kind, best_strength, best_detail = "factual", strength, detail
 
+        attribute = self._attribute_clash(a, b)
+        if attribute is not None:
+            strength, detail = attribute
+            if strength > best_strength:
+                best_kind, best_strength, best_detail = (
+                    "attribute_clash",
+                    strength,
+                    detail,
+                )
+
         # Negation / antonym polarity on shared content
         norm_a = self._normalize_polarity_text(a.compressed_fact or "")
         norm_b = self._normalize_polarity_text(b.compressed_fact or "")
@@ -891,15 +1318,94 @@ class RetrievalEngine:
 
         return best_kind, best_strength, best_detail
 
+    def _attribute_clash(
+        self,
+        a: SignatureRecord,
+        b: SignatureRecord,
+    ) -> tuple[float, str] | None:
+        """
+        Detect different attribute values for the same entity/topic.
+
+        This is deliberately scoped to the same drawer and requires at least
+        80% tag-overlap after removing role tags and mutable weekday/status
+        values. It catches "Release Friday" vs "Release Saturday" without
+        pretending Friday/Saturday are linguistic antonyms.
+        """
+        if not self._same_drawer(a, b):
+            return None
+
+        tags_a = self._attribute_identity_tags(a)
+        tags_b = self._attribute_identity_tags(b)
+        if not tags_a or not tags_b:
+            return None
+        overlap = len(tags_a & tags_b) / max(min(len(tags_a), len(tags_b)), 1)
+        if overlap < _ATTRIBUTE_TAG_OVERLAP:
+            return None
+
+        tokens_a = set(self._tokenize_query(a.compressed_fact or ""))
+        tokens_b = set(self._tokenize_query(b.compressed_fact or ""))
+        values_a = tokens_a & (_TEMPORAL_ATTRIBUTE_VALUES | _STATUS_ATTRIBUTE_VALUES)
+        values_b = tokens_b & (_TEMPORAL_ATTRIBUTE_VALUES | _STATUS_ATTRIBUTE_VALUES)
+        categorical_diff = values_a != values_b and bool(values_a or values_b)
+
+        tail_a = self._trailing_attribute(a.compressed_fact or "")
+        tail_b = self._trailing_attribute(b.compressed_fact or "")
+        trailing_diff = bool(tail_a and tail_b and tail_a != tail_b)
+        has_attribute_context = bool((tags_a | tags_b) & _ATTRIBUTE_HINT_TAGS)
+        # Arbitrary different nouns are not automatically conflicting attributes
+        # ("football" vs "thing" belongs to an optional semantic judge).
+        if trailing_diff and not categorical_diff and not has_attribute_context:
+            trailing_diff = False
+        if not categorical_diff and not trailing_diff:
+            return None
+
+        strength = 0.85
+        if categorical_diff:
+            strength = 1.0
+        detail_values_a = sorted(values_a) or ([tail_a] if tail_a else [])
+        detail_values_b = sorted(values_b) or ([tail_b] if tail_b else [])
+        detail = (
+            f"shared tags={overlap:.0%}; "
+            f"attribute values {detail_values_a or ['unknown']} "
+            f"vs {detail_values_b or ['unknown']}"
+        )
+        return strength, detail
+
+    @staticmethod
+    def _same_drawer(a: SignatureRecord, b: SignatureRecord) -> bool:
+        drawer_a = (a.drawer_domain or "general").strip().lower() or "general"
+        drawer_b = (b.drawer_domain or "general").strip().lower() or "general"
+        return drawer_a == drawer_b
+
+    @staticmethod
+    def _attribute_identity_tags(rec: SignatureRecord) -> set[str]:
+        return {
+            tag.lower().strip()
+            for tag in (rec.intent_tags or [])
+            if tag
+            and tag.lower().strip() not in _ATTRIBUTE_ROLE_TAGS
+            and tag.lower().strip() not in _TEMPORAL_ATTRIBUTE_VALUES
+            and tag.lower().strip() not in _STATUS_ATTRIBUTE_VALUES
+        }
+
+    def _trailing_attribute(self, text: str) -> str | None:
+        tokens = self._tokenize_query(text)
+        return tokens[-1] if tokens else None
+
+    @staticmethod
+    def _torsion_drawer_domain_key(rec: SignatureRecord) -> str:
+        drawer = (rec.drawer_domain or "general").strip().lower() or "general"
+        domain = (rec.domain or "insight").strip().lower() or "insight"
+        return f"{drawer}|{domain}"
+
     @staticmethod
     def _torsion_cluster_key(rec: SignatureRecord) -> str:
+        """Legacy single-key helper (explicit cluster_id or drawer|domain)."""
         meta = rec.metadata or {}
         cluster_id = meta.get("cluster_id")
         if cluster_id is not None and str(cluster_id).strip():
             return f"cluster:{str(cluster_id).strip()}"
-        drawer = (rec.drawer_domain or "general").strip().lower() or "general"
-        domain = (rec.domain or "insight").strip().lower() or "insight"
-        return f"{drawer}|{domain}"
+        return RetrievalEngine._torsion_drawer_domain_key(rec)
 
     @staticmethod
     def _humanize_torsion(
@@ -912,15 +1418,16 @@ class RetrievalEngine:
         """Plain-English conflict line (Morning Brief style, English-only)."""
         a_snip = RetrievalEngine._fact_preview(a.compressed_fact)
         b_snip = RetrievalEngine._fact_preview(b.compressed_fact)
-        base = (
-            f"Conflict found between Signature A ({a_snip}) "
-            f"and Signature B ({b_snip})"
-        )
+        base = f"Conflict found between Signature A ({a_snip}) and Signature B ({b_snip})"
         match kind:
             case "deadline":
                 return f"{base}: deadlines disagree ({detail})."
             case "factual":
                 return f"{base}: conflicting numeric/factual claims ({detail})."
+            case "attribute_clash":
+                return f"{base}: potential entity-attribute clash ({detail})."
+            case "entity_exclusion":
+                return f"{base}: exclusive-slot occupancy clash ({detail})."
             case "polarity":
                 return f"{base}: opposing polarity on the same topic ({detail})."
             case "pressure":

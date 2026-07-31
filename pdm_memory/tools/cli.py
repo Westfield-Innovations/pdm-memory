@@ -205,6 +205,8 @@ def cmd_heal(args: argparse.Namespace) -> None:
         )
         mode = "DRY-RUN " if summary.get("dry_run") else ""
         print(f"{mode}Heal complete:")
+        if summary.get("narrative"):
+            print(f"  narrative:      {summary['narrative']}")
         print(f"  scanned_pairs:  {summary['scanned_pairs']}")
         print(f"  reconciled:     {summary['reconciled']} (threshold > {summary['auto_reconcile_threshold']})")
         print(f"  skipped:        {summary['skipped']}")

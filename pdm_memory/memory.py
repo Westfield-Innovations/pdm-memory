@@ -112,7 +112,7 @@ class Memory:
         self._token = token
         self._refresh_token = refresh_token
         self._cloud_url = cloud_url
-        self._cloud_driver: Any | None = None   # lazy init
+        self._cloud_driver: Any | None = None  # lazy init
         if storage is not None:
             if not isinstance(storage, BaseStorage):
                 raise TypeError(
@@ -120,9 +120,7 @@ class Memory:
                 )
             self._storage = storage
         else:
-            self._storage = self._init_storage(
-                store, token, refresh_token, cloud_url, store_raw
-            )
+            self._storage = self._init_storage(store, token, refresh_token, cloud_url, store_raw)
         logger.debug("[PDM] Memory initialised | user=%s store=%s", user, store)
 
     # ------------------------------------------------------------------
@@ -516,9 +514,7 @@ class Memory:
         new_p = fields.get("p_magnitude", rec.p_magnitude)
         new_t = fields.get("t_persistence", rec.t_persistence)
         if "p_magnitude" in fields or "t_persistence" in fields:
-            fields["effective_spike"] = calculate_effective_spike(
-                new_p, new_t, rec.phase_privilege
-            )
+            fields["effective_spike"] = calculate_effective_spike(new_p, new_t, rec.phase_privilege)
 
         self._storage.update(memory_id, user=self._user, **fields)
         updated = self._storage.get(memory_id, user=self._user)
@@ -848,7 +844,7 @@ class Memory:
 
         Returns:
             Dict with ``scanned_pairs``, ``reconciled``, ``skipped``,
-            ``reconciled_ids``, ``decay`` (nested decay counts or None).
+            ``reconciled_ids``, ``decay``, ``narrative``, ``dry_run``.
         """
         reports = self.detect_torsion(
             drawer=drawer,
@@ -865,6 +861,8 @@ class Memory:
         reconciled = 0
         skipped = 0
         reconciled_ids: list[str] = []
+        reconciled_drawers: list[str] = []
+        reconciled_kinds: list[str] = []
         consumed: set[str] = set()
 
         for report in candidates:
@@ -891,6 +889,8 @@ class Memory:
             if dry_run:
                 reconciled += 1
                 reconciled_ids.append(f"dry:{a_id[:8]}+{b_id[:8]}")
+                reconciled_drawers.append(report.drawer or "general")
+                reconciled_kinds.append(report.conflict_kind or "semantic")
                 consumed.add(a_id)
                 consumed.add(b_id)
                 continue
@@ -909,6 +909,8 @@ class Memory:
 
             reconciled += 1
             reconciled_ids.append(new_id)
+            reconciled_drawers.append(report.drawer or "general")
+            reconciled_kinds.append(report.conflict_kind or "semantic")
             consumed.add(a_id)
             consumed.add(b_id)
 
@@ -916,6 +918,12 @@ class Memory:
         if run_decay:
             decay_counts = self.decay(dry_run=dry_run)
 
+        narrative = self._heal_narrative(
+            reconciled=reconciled,
+            drawers=reconciled_drawers,
+            kinds=reconciled_kinds,
+            decay=decay_counts,
+        )
         summary = {
             "scanned_pairs": len(reports),
             "auto_reconcile_threshold": float(auto_reconcile_threshold),
@@ -923,10 +931,45 @@ class Memory:
             "skipped": skipped,
             "reconciled_ids": reconciled_ids,
             "decay": decay_counts,
+            "narrative": narrative,
             "dry_run": dry_run,
         }
         logger.info("[PDM] audit_and_heal %s", summary)
         return summary
+
+    @staticmethod
+    def _heal_narrative(
+        *,
+        reconciled: int,
+        drawers: list[str],
+        kinds: list[str],
+        decay: dict[str, int] | None,
+    ) -> str:
+        """Human-readable heal summary for agents / CLI / ops dashboards."""
+        parts: list[str] = []
+        if reconciled > 0:
+            drawer = drawers[0] if drawers else "general"
+            # Prefer a single drawer label when all matches agree
+            if drawers and len(set(drawers)) == 1:
+                drawer = drawers[0]
+            elif drawers and len(set(drawers)) > 1:
+                drawer = ", ".join(sorted(set(drawers))[:3])
+            kind = kinds[0] if kinds else "factual"
+            if kinds and len(set(kinds)) > 1:
+                kind = "mixed"
+            noun = "contradiction" if reconciled == 1 else "contradictions"
+            parts.append(f"Detected and resolved {reconciled} {kind} {noun} in '{drawer}'.")
+        else:
+            parts.append("No high-confidence torsion pairs required reconciliation.")
+
+        purged = int((decay or {}).get("deleted", 0) or 0)
+        if purged > 0:
+            residue = "residue" if purged == 1 else "residues"
+            parts.append(f"Purged {purged} low-pressure {residue}.")
+        elif decay is not None:
+            parts.append("No low-pressure residues required purge.")
+
+        return " ".join(parts)
 
     def verify_alignment(
         self,
@@ -989,9 +1032,7 @@ class Memory:
         counts = {"decayed": 0, "deleted": 0, "skipped": 0}
 
         for rec in records:
-            days_since_touch = self._days_since(
-                rec.last_retrieved or rec.created_at, now
-            )
+            days_since_touch = self._days_since(rec.last_retrieved or rec.created_at, now)
             days_since_created = self._days_since(rec.created_at, now)
             domain = rec.domain or infer_domain(rec.intent_tags)
             half_life = resolve_half_life(domain)
@@ -1068,9 +1109,11 @@ class Memory:
         """
         Detect Reverse Resonance — high topic similarity with opposing facts/pressure.
 
-        Compares signatures within the same drawer/domain (or metadata ``cluster_id``),
-        not the full store N². Optional ``apply_v_penalty`` records a validation miss
-        on each involved signature so future ``P_effective`` drops via Laplace V.
+        Compares signatures within ``cluster_id`` buckets, ``drawer|domain``
+        fallbacks, and auto-discovered virtual clusters (topic similarity > 0.85
+        when ``cluster_id`` is absent). Optional ``apply_v_penalty`` records a
+        validation miss on each involved signature so future ``P_effective``
+        drops via Laplace V.
 
         Args:
             drawer:    Limit to one drawer (``drawer_domain``). None = all drawers.
@@ -1133,7 +1176,9 @@ class Memory:
         v = calculate_v(rec.validation_prediction_correct, rec.validation_prediction_total)
         i_weight = calculate_intent_weight(rec.intent_tags, query) if query else None
         p_eff = calculate_p_effective(
-            rec.p_magnitude, v, decay,
+            rec.p_magnitude,
+            v,
+            decay,
             i_weight if i_weight is not None else 1.0,
             0.80,
         )
@@ -1141,9 +1186,7 @@ class Memory:
         # TAS coupling for the query
         coupling_score = tag_overlap = domain_match = regime_match = press_prox = None
         if query:
-            hits = self._engine.recall(
-                records=[rec], query=query, k=1, search_cost=1.0
-            )
+            hits = self._engine.recall(records=[rec], query=query, k=1, search_cost=1.0)
             if hits:
                 h = hits[0]
                 coupling_score = h.coupling_score
@@ -1439,20 +1482,18 @@ class Memory:
                     rec.p_magnitude, rec.retrieval_count, hit.coupling_score
                 )
                 new_p = min(100.0, rec.p_magnitude + delta)
-                new_spike = calculate_effective_spike(
-                    new_p, rec.t_persistence, rec.phase_privilege
+                new_spike = calculate_effective_spike(new_p, rec.t_persistence, rec.phase_privilege)
+                batch_updates.append(
+                    (
+                        hit.id,
+                        {
+                            "p_magnitude": new_p,
+                            "effective_spike": new_spike,
+                            "retrieval_count": (rec.retrieval_count or 0) + 1,
+                            "last_retrieved": now,
+                        },
+                    )
                 )
-                batch_updates.append((
-                    hit.id,
-                    {
-                        "p_magnitude": new_p,
-                        "effective_spike": new_spike,
-                        "retrieval_count": (rec.retrieval_count or 0) + 1,
-                        "last_retrieved": now,
-                        "validation_prediction_total": (rec.validation_prediction_total or 0) + 1,
-                        "validation_prediction_correct": (rec.validation_prediction_correct or 0) + 1,
-                    }
-                ))
             except Exception as e:
                 logger.warning("[PDM] reinforcement check failed for %s: %s", hit.id, e)
 
