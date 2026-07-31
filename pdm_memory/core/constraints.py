@@ -577,7 +577,7 @@ def _topic_label(shared: set[str], rule_tokens: set[str]) -> str:
         "degrees",
     }
     text_candidates = candidates & (rule_tokens - _TOPIC_STOPWORDS)
-    raw_topic = sorted(text_candidates or candidates or shared)[0]
+    raw_topic = min(text_candidates or candidates or shared)
     topic = raw_topic.upper() if len(raw_topic) <= 3 else raw_topic
     if "budget" in rule_tokens or "spend" in rule_tokens:
         return f"{topic} budget"

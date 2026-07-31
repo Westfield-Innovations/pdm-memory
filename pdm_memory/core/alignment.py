@@ -511,9 +511,7 @@ def _explain_torsion(intent_text: str, peak: _AnchorScore) -> str:
     goal_snip = _snip(peak.record.compressed_fact)
     intent_snip = _snip(intent_text)
     why = peak.detail or "semantic opposition to a core goal"
-    if why.startswith("Intent violates") or why.startswith("Intent assigns"):
-        return f"{why} Conflicting Goal Anchor: '{goal_snip}'. Block ACT."
-    if why.startswith("Entity Exclusion"):
+    if why.startswith(("Intent violates", "Intent assigns", "Entity Exclusion")):
         return f"{why} Conflicting Goal Anchor: '{goal_snip}'. Block ACT."
     return (
         f"This intent is dangerous for system integrity: "
