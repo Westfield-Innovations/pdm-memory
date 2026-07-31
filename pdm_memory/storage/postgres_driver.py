@@ -250,24 +250,37 @@ class PostgresDriver(BaseStorage):
     ) -> None:
         if not updates:
             return
-        conn = self._conn()
+
+        grouped_updates: dict[tuple[str, ...], list[tuple[object, ...]]] = {}
         for memory_id, fields in updates:
             prepared = prepare_update_fields(fields)
             if not prepared:
                 continue
-            set_clause = ", ".join(f"{col} = %s" for col in prepared)
-            values = list(prepared.values()) + [memory_id, user]
-            cur = conn.execute(
-                f'UPDATE pdm_signatures SET {set_clause} WHERE id = %s AND "user" = %s',
-                values,
+            columns = tuple(sorted(prepared))
+            grouped_updates.setdefault(columns, []).append(
+                tuple(prepared[column] for column in columns) + (memory_id, user)
             )
-            if cur.rowcount == 0:
-                logger.warning(
-                    "[PDM-Postgres] update_batch(%s) affected 0 rows (user=%s)",
-                    memory_id,
-                    user,
+
+        if not grouped_updates:
+            return
+
+        conn = self._conn()
+        with self.transaction():
+            for columns, rows in grouped_updates.items():
+                set_clause = ", ".join(f"{col} = %s" for col in columns)
+                cur = conn.cursor()
+                cur.executemany(
+                    f'UPDATE pdm_signatures SET {set_clause} WHERE id = %s AND "user" = %s',
+                    rows,
                 )
-        self._commit_if_idle(conn)
+                if cur.rowcount not in (-1, len(rows)):
+                    logger.warning(
+                        "[PDM-Postgres] update_batch touched %s/%s rows (user=%s columns=%s)",
+                        cur.rowcount,
+                        len(rows),
+                        user,
+                        list(columns),
+                    )
 
     def delete(self, memory_id: str, user: str = "default") -> None:
         conn = self._conn()

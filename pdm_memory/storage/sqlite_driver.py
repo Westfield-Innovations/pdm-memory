@@ -255,24 +255,36 @@ class SQLiteDriver(BaseStorage):
         """Batch-update with the same whitelist + user scope as :meth:`update`."""
         if not updates:
             return
-        conn = self._conn()
+
+        grouped_updates: dict[tuple[str, ...], list[tuple[object, ...]]] = {}
         for memory_id, fields in updates:
             prepared = self._prepare_update_fields(fields)
             if not prepared:
                 continue
-            set_clause = ", ".join(f"{col} = ?" for col in prepared)
-            values = list(prepared.values()) + [memory_id, user]
-            cur = conn.execute(
-                f"UPDATE pdm_signatures SET {set_clause} WHERE id = ? AND user = ?",
-                values,
+            columns = tuple(sorted(prepared))
+            grouped_updates.setdefault(columns, []).append(
+                tuple(prepared[column] for column in columns) + (memory_id, user)
             )
-            if cur.rowcount == 0:
-                logger.warning(
-                    "[PDM-SQLite] update_batch(%s) affected 0 rows (user=%s)",
-                    memory_id,
-                    user,
+
+        if not grouped_updates:
+            return
+
+        conn = self._conn()
+        with self.transaction():
+            for columns, rows in grouped_updates.items():
+                set_clause = ", ".join(f"{col} = ?" for col in columns)
+                cur = conn.executemany(
+                    f"UPDATE pdm_signatures SET {set_clause} WHERE id = ? AND user = ?",
+                    rows,
                 )
-        self._commit_if_idle(conn)
+                if cur.rowcount not in (-1, len(rows)):
+                    logger.warning(
+                        "[PDM-SQLite] update_batch touched %s/%s rows (user=%s columns=%s)",
+                        cur.rowcount,
+                        len(rows),
+                        user,
+                        list(columns),
+                    )
 
     @staticmethod
     def _prepare_update_fields(fields: dict) -> dict:

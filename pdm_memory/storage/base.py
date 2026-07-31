@@ -54,8 +54,11 @@ class BaseStorage(ABC):
         updates: builtins.list[tuple[str, dict]],
         user: str = "default",
     ) -> None:
-        for memory_id, fields in updates:
-            self.update(memory_id, user=user, **fields)
+        if not updates:
+            return
+        with self.transaction():
+            for memory_id, fields in updates:
+                self.update(memory_id, user=user, **fields)
 
     @abstractmethod
     def delete(self, memory_id: str, user: str = "default") -> None:
