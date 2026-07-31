@@ -385,6 +385,24 @@ class Memory:
         logger.info("[PDM] export_json → %s (%d signatures)", path, count)
         return count
 
+    def export_csv(
+        self,
+        path: str | Path,
+        *,
+        limit: int = 100_000,
+    ) -> int:
+        """Export all user signatures to a CSV file."""
+        from pdm_memory.io.csv_transfer import export_signatures_csv
+
+        count = export_signatures_csv(
+            self._storage,
+            path,
+            user=self._user,
+            limit=limit,
+        )
+        logger.info("[PDM] export_csv → %s (%d signatures)", path, count)
+        return count
+
     def import_json(
         self,
         path: str | Path,
