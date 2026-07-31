@@ -153,9 +153,13 @@ def cmd_search(args: argparse.Namespace) -> None:
 
 def cmd_export(args: argparse.Namespace) -> None:
     from pdm_memory import Memory
+    from pdm_memory.io import export_signatures_csv
 
     with Memory(store=args.store, user=args.user) as mem:
-        count = mem.export_json(args.out)
+        if args.format == "csv":
+            count = export_signatures_csv(mem, args.out)
+        else:
+            count = mem.export_json(args.out)
     print(f"Exported {count} signature(s) → {args.out}")
 
 
@@ -360,9 +364,15 @@ def main() -> None:
     p_export = subparsers.add_parser(
         "export",
         parents=[sub_parent_parser],
-        help="Export all signatures to JSON backup",
+        help="Export all signatures to JSON or CSV backup",
     )
-    p_export.add_argument("--out", required=True, help="Output .json path")
+    p_export.add_argument("--out", required=True, help="Output .json or .csv path")
+    p_export.add_argument(
+        "--format",
+        choices=["json", "csv"],
+        default="json",
+        help="Export file format (default: json)",
+    )
     p_export.set_defaults(func=cmd_export)
 
     p_import = subparsers.add_parser(

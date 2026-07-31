@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import csv
 from io import StringIO
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -38,6 +40,29 @@ class TestExportImport:
             hit = mem.get(mid)
             assert hit is not None
             assert hit.text == "Export me"
+
+    def test_export_csv(self, tmp_path):
+        from pdm_memory.io.csv_transfer import export_signatures_csv
+
+        db = str(tmp_path / "csv.db")
+        export_path = tmp_path / "backup.csv"
+
+        with Memory(store=db, user="alice") as mem:
+            mem.save(
+                "Excel-friendly fact",
+                tags=["csv", "export", "test"],
+                drawer="reports",
+                p_magnitude=88,
+            )
+            count = export_signatures_csv(mem, export_path)
+
+        assert count == 1
+        with Path(export_path).open(encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+        assert len(rows) == 1
+        assert rows[0]["text"] == "Excel-friendly fact"
+        assert rows[0]["tags"] == "csv, export, test"
+        assert rows[0]["drawer"] == "reports"
 
     def test_import_skip_duplicates(self, tmp_path):
         db = str(tmp_path / "dup.db")
@@ -75,6 +100,29 @@ class TestExportImport:
 
         with Memory(store=db2, user="default") as mem:
             assert mem.count() == 1
+
+    def test_cli_export_csv(self, tmp_path):
+        from pdm_memory.tools.cli import main
+
+        db = str(tmp_path / "cli_csv.db")
+        out = tmp_path / "cli_backup.csv"
+
+        with Memory(store=db, user="default") as mem:
+            mem.save("CLI export csv fact", tags=["cli", "csv", "test"], drawer="notes")
+
+        with (
+            patch(
+                "sys.argv",
+                ["pdm-cli", "--store", db, "export", "--out", str(out), "--format", "csv"],
+            ),
+            patch("sys.stdout", StringIO()),
+        ):
+            main()
+
+        with out.open(encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+        assert len(rows) == 1
+        assert rows[0]["text"] == "CLI export csv fact"
 
 
 class TestSaveMany:
