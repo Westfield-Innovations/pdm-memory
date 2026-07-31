@@ -267,33 +267,19 @@ class Memory:
                 logger.debug("[PDM] save() dedupe → %s", existing.id[:8])
                 return existing.id
 
-        resolved_tags = tags or []
-        domain = infer_domain(resolved_tags)
-        eff_spike = calculate_effective_spike(p_magnitude, t_persistence, phase_privilege)
-
-        # Companion parity: a future deadline without event_at still needs an
-        # event timestamp for temporal-window recall.
-        resolved_event = event_at
-        if resolved_event is None and deadline is not None:
-            resolved_event = deadline
-
-        sig = SignatureRecord(
-            user=self._user,
-            compressed_fact=text,
+        sig = self._build_signature_record(
+            text=text,
             source=source,
+            tags=tags,
             p_magnitude=p_magnitude,
             t_persistence=t_persistence,
+            drawer=drawer,
+            regime=regime,
             phase_privilege=phase_privilege,
-            effective_spike=eff_spike,
-            intent_tags=resolved_tags,
-            question_regime=regime,
-            domain=domain,
-            drawer_domain=drawer,
-            decay_rate=0.9,
-            t_deadline=deadline,
-            t_event_at=resolved_event,
-            metadata=metadata or {},
-            idempotency_key=idempotency_key.strip() if idempotency_key else None,
+            deadline=deadline,
+            event_at=event_at,
+            metadata=metadata,
+            idempotency_key=idempotency_key,
         )
         sig = self._run_pre_save_hooks(sig)
         memory_id = self._storage.save(sig)
@@ -321,6 +307,8 @@ class Memory:
         saved = 0
         skipped = 0
         errors = 0
+        sigs_to_save: list[SignatureRecord] = []
+        seen_idempotency_keys: set[str] = set()
 
         txn = getattr(self._storage, "transaction", None)
         ctx: AbstractContextManager[None] = txn() if callable(txn) else nullcontext()
@@ -332,6 +320,20 @@ class Memory:
                     if not text:
                         errors += 1
                         continue
+
+                    idempotency_key = str(item.get("idempotency_key") or "").strip()
+                    if idempotency_key:
+                        if idempotency_key in seen_idempotency_keys:
+                            skipped += 1
+                            continue
+                        existing = self._storage.find_by_idempotency_key(
+                            idempotency_key,
+                            user=self._user,
+                        )
+                        if existing is not None:
+                            skipped += 1
+                            continue
+                        seen_idempotency_keys.add(idempotency_key)
 
                     from pdm_memory.storage.schema import hash_fact_text
 
@@ -345,7 +347,7 @@ class Memory:
                             skipped += 1
                             continue
 
-                    self.save(
+                    sig = self._build_signature_record(
                         text,
                         source=str(item.get("source") or "batch"),
                         tags=item.get("tags") or item.get("intent_tags"),
@@ -356,11 +358,35 @@ class Memory:
                         deadline=item.get("deadline") or item.get("t_deadline"),
                         event_at=item.get("event_at") or item.get("t_event_at"),
                         metadata=item.get("metadata"),
-                        dedupe=False,
+                        phase_privilege=float(item.get("phase_privilege", 1.0)),
+                        idempotency_key=idempotency_key or None,
                     )
-                    saved += 1
+                    sig = self._run_pre_save_hooks(sig)
+                    sigs_to_save.append(sig)
                 except Exception:
                     errors += 1
+
+            if sigs_to_save:
+                try:
+                    save_results = self._storage.save_many(sigs_to_save)
+                except Exception as exc:
+                    logger.warning("[PDM] save_many storage batch failed: %s", exc)
+                    errors += len(sigs_to_save)
+                else:
+                    if len(save_results) != len(sigs_to_save):
+                        logger.warning(
+                            "[PDM] save_many result mismatch saved=%d returned=%d",
+                            len(sigs_to_save),
+                            len(save_results),
+                        )
+                    for sig, result in zip(sigs_to_save, save_results):
+                        if result.error is None:
+                            saved += 1
+                            self._run_post_save_hooks(sig, result.id or sig.id)
+                        else:
+                            errors += 1
+                    if len(save_results) < len(sigs_to_save):
+                        errors += len(sigs_to_save) - len(save_results)
 
         logger.info("[PDM] save_many saved=%d skipped=%d errors=%d", saved, skipped, errors)
         return {"saved": saved, "skipped": skipped, "errors": errors}
@@ -1397,6 +1423,51 @@ class Memory:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _build_signature_record(
+        self,
+        text: str,
+        *,
+        source: str = "chat",
+        tags: builtins.list[str] | None = None,
+        p_magnitude: float = 50.0,
+        t_persistence: float = 30.0,
+        drawer: str = "general",
+        regime: str = "neutral",
+        phase_privilege: float = 1.0,
+        deadline: datetime | None = None,
+        event_at: datetime | None = None,
+        metadata: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+    ) -> SignatureRecord:
+        resolved_tags = tags or []
+        domain = infer_domain(resolved_tags)
+        eff_spike = calculate_effective_spike(p_magnitude, t_persistence, phase_privilege)
+
+        # Companion parity: a future deadline without event_at still needs an
+        # event timestamp for temporal-window recall.
+        resolved_event = event_at
+        if resolved_event is None and deadline is not None:
+            resolved_event = deadline
+
+        return SignatureRecord(
+            user=self._user,
+            compressed_fact=text,
+            source=source,
+            p_magnitude=p_magnitude,
+            t_persistence=t_persistence,
+            phase_privilege=phase_privilege,
+            effective_spike=eff_spike,
+            intent_tags=resolved_tags,
+            question_regime=regime,
+            domain=domain,
+            drawer_domain=drawer,
+            decay_rate=0.9,
+            t_deadline=deadline,
+            t_event_at=resolved_event,
+            metadata=metadata or {},
+            idempotency_key=idempotency_key.strip() if idempotency_key else None,
+        )
 
     def _build_update_fields(
         self,

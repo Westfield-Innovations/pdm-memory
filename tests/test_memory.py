@@ -3,6 +3,7 @@
 import pytest
 
 from pdm_memory import Memory
+from pdm_memory.storage.base import SaveManyResult
 
 
 @pytest.fixture
@@ -491,8 +492,178 @@ class TestMemoryGetUpdate:
         with pytest.raises(ValueError, match="cannot be empty"):
             mem.update(mid, text="   ")
 
+    def test_update_batch_updates_multiple_memories(self, mem):
+        first_id = mem.save(
+            "Patent memo",
+            tags=["patent", "review", "legal"],
+            metadata={"owner": "ops"},
+        )
+        second_id = mem.save(
+            "License memo",
+            tags=["license", "review", "legal"],
+            metadata={"owner": "legal"},
+        )
+
+        counts = mem.update_batch(
+            [
+                (
+                    first_id,
+                    {
+                        "tags": ["patent", "granted", "legal"],
+                        "metadata": {"license": "pending"},
+                    },
+                ),
+                (
+                    second_id,
+                    {
+                        "drawer": "licensing",
+                        "metadata": {"license": "apache-2.0"},
+                    },
+                ),
+            ]
+        )
+
+        assert counts == {"updated": 2, "skipped": 0, "errors": 0}
+
+        first = mem.get(first_id)
+        second = mem.get(second_id)
+        assert first is not None
+        assert second is not None
+        assert first.intent_tags == ["patent", "granted", "legal"]
+        assert second.drawer == "licensing"
+
+        first_rec = mem._storage.get(first_id, user="test_user")
+        second_rec = mem._storage.get(second_id, user="test_user")
+        assert first_rec.metadata == {"owner": "ops", "license": "pending"}
+        assert second_rec.metadata == {"owner": "legal", "license": "apache-2.0"}
+
+    def test_update_batch_tracks_skips_and_errors(self, mem):
+        mid = mem.save("Fact", tags=["a", "b", "c"])
+
+        counts = mem.update_batch(
+            [
+                (mid, {}),
+                ("00000000-0000-0000-0000-000000000000", {"tags": ["x", "y", "z"]}),
+            ]
+        )
+
+        assert counts == {"updated": 0, "skipped": 1, "errors": 1}
+
+    def test_update_many_uses_id_or_memory_id(self, mem):
+        first_id = mem.save("Patent memo", tags=["patent", "review", "legal"])
+        second_id = mem.save("License memo", tags=["license", "review", "legal"])
+
+        counts = mem.update_many(
+            [
+                {"id": first_id, "tags": ["patent", "approved", "legal"]},
+                {"memory_id": second_id, "drawer": "licensing"},
+                {"tags": ["missing", "id", "entry"]},
+            ]
+        )
+
+        assert counts == {"updated": 2, "skipped": 0, "errors": 1}
+        assert mem.get(first_id).intent_tags == ["patent", "approved", "legal"]
+        assert mem.get(second_id).drawer == "licensing"
+
+    def test_update_many_batches_updates(self, mem):
+        first_id = mem.save(
+            "Patent memo",
+            tags=["patent", "review", "legal"],
+            metadata={"owner": "ops"},
+        )
+        second_id = mem.save(
+            "License memo",
+            tags=["license", "review", "legal"],
+            metadata={"owner": "legal"},
+        )
+
+        counts = mem.update_many(
+            [
+                {
+                    "id": first_id,
+                    "tags": ["patent", "granted", "legal"],
+                    "metadata": {"license": "pending"},
+                },
+                {
+                    "memory_id": second_id,
+                    "drawer": "licensing",
+                    "metadata": {"license": "apache-2.0"},
+                },
+            ]
+        )
+
+        assert counts == {"updated": 2, "skipped": 0, "errors": 0}
+
+        first = mem.get(first_id)
+        second = mem.get(second_id)
+        assert first is not None
+        assert second is not None
+        assert first.intent_tags == ["patent", "granted", "legal"]
+        assert second.drawer == "licensing"
+
+        first_rec = mem._storage.get(first_id, user="test_user")
+        second_rec = mem._storage.get(second_id, user="test_user")
+        assert first_rec.metadata == {"owner": "ops", "license": "pending"}
+        assert second_rec.metadata == {"owner": "legal", "license": "apache-2.0"}
+
+    def test_update_many_tracks_skipped_and_errors(self, mem):
+        mid = mem.save("Fact", tags=["a", "b", "c"])
+
+        counts = mem.update_many(
+            [
+                {"id": mid},
+                {"id": "00000000-0000-0000-0000-000000000000", "tags": ["x", "y", "z"]},
+                {"tags": ["no", "id", "here"]},
+            ]
+        )
+
+        assert counts == {"updated": 0, "skipped": 1, "errors": 2}
+
 
 class TestMemoryIngest:
+    def test_save_many_uses_storage_batch_api(self, mem):
+        captured = {}
+
+        def fake_save_many(sigs):
+            captured["facts"] = [sig.compressed_fact for sig in sigs]
+            return [
+                SaveManyResult(index=0, id="sig-1"),
+                SaveManyResult(index=1, id="sig-2"),
+            ]
+
+        mem._storage.save_many = fake_save_many
+
+        counts = mem.save_many(
+            [
+                {"text": "First batch fact", "tags": ["one", "two", "three"]},
+                {"text": "Second batch fact", "tags": ["alpha", "beta", "gamma"]},
+            ],
+            dedupe=False,
+        )
+
+        assert counts == {"saved": 2, "skipped": 0, "errors": 0}
+        assert captured["facts"] == ["First batch fact", "Second batch fact"]
+
+    def test_save_many_dedupes_idempotency_key(self, mem):
+        counts = mem.save_many(
+            [
+                {
+                    "text": "First idem fact",
+                    "tags": ["one", "two", "three"],
+                    "idempotency_key": "idem-123",
+                },
+                {
+                    "text": "Second idem fact",
+                    "tags": ["four", "five", "six"],
+                    "idempotency_key": "idem-123",
+                },
+            ],
+            dedupe=False,
+        )
+
+        assert counts == {"saved": 1, "skipped": 1, "errors": 0}
+        assert mem.count() == 1
+
     def test_ingest_list_of_dicts(self, mem):
         data = [
             {"text": "User prefers dark mode", "tags": ["ui", "dark_mode", "preferences"]},

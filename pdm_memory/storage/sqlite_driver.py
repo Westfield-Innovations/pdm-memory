@@ -33,15 +33,42 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from pdm_memory.core.signature import DrawerInfo, SignatureRecord
-from pdm_memory.storage.base import BaseStorage
+from pdm_memory.storage.base import BaseStorage, SaveManyResult
 from pdm_memory.storage.schema import (
     SCHEMA_SQLITE,
     UPDATABLE_COLUMNS,
     apply_sqlite_migrations,
     mapping_to_record,
+    signature_insert_row,
 )
 
 logger = logging.getLogger(__name__)
+
+
+_INSERT_SIGNATURE_SQL = """
+INSERT INTO pdm_signatures (
+    id, user, compressed_fact, compressed_fact_hash, source,
+    p_magnitude, t_persistence, phase_privilege, effective_spike,
+    intent_tags, question_regime, domain, drawer_domain,
+    retrieval_count, last_retrieved, created_at,
+    validation_prediction_total, validation_prediction_correct,
+    decay_rate, t_deadline, t_event_at, urgency_rate, metadata,
+    is_deleted, idempotency_key
+) VALUES (
+    ?, ?, ?, ?, ?,
+    ?, ?, ?, ?,
+    ?, ?, ?, ?,
+    ?, ?, ?,
+    ?, ?,
+    ?, ?, ?, ?, ?,
+    ?, ?
+)
+"""
+
+_INSERT_DRAWER_SQL = """
+INSERT OR IGNORE INTO pdm_drawers (domain, user, description)
+VALUES (?, ?, ?)
+"""
 
 
 def _now_iso() -> str:
@@ -191,6 +218,70 @@ class SQLiteDriver(BaseStorage):
         self._commit_if_idle(conn)
         logger.debug("[PDM-SQLite] Saved signature %s (P=%.1f)", sig.id, sig.p_magnitude)
         return sig.id
+
+    def save_many(self, sigs: builtins.list[SignatureRecord]) -> builtins.list[SaveManyResult]:
+        if not sigs:
+            return []
+
+        results = [SaveManyResult(index=i, id=None) for i in range(len(sigs))]
+        seen_ids: set[str] = set()
+        pending: list[tuple[int, SignatureRecord]] = []
+        for index, sig in enumerate(sigs):
+            if sig.id in seen_ids:
+                results[index] = SaveManyResult(
+                    index=index,
+                    id=None,
+                    error="Duplicate id in batch",
+                )
+                continue
+            seen_ids.add(sig.id)
+            pending.append((index, sig))
+
+        if not pending:
+            return results
+
+        conn = self._conn()
+        with self.transaction():
+            for start in range(0, len(pending), 500):
+                chunk = pending[start : start + 500]
+                grouped: dict[str, list[tuple[int, SignatureRecord]]] = {}
+                for index, sig in chunk:
+                    grouped.setdefault(sig.user, []).append((index, sig))
+
+                write_rows: list[tuple[int, SignatureRecord]] = []
+                drawer_rows: list[tuple[str, str, str]] = []
+                for user, user_chunk in grouped.items():
+                    ids = [sig.id for _, sig in user_chunk]
+                    placeholders = ", ".join("?" for _ in ids)
+                    existing_rows = conn.execute(
+                        f"SELECT id FROM pdm_signatures WHERE user = ? AND id IN ({placeholders})",
+                        [user, *ids],
+                    ).fetchall()
+                    existing_ids = {row["id"] for row in existing_rows}
+
+                    for index, sig in user_chunk:
+                        if sig.id in existing_ids:
+                            results[index] = SaveManyResult(
+                                index=index,
+                                id=None,
+                                error="Duplicate id already exists",
+                            )
+                            continue
+                        write_rows.append((index, sig))
+                        drawer_rows.append((sig.drawer_domain, sig.user, ""))
+
+                if not write_rows:
+                    continue
+
+                conn.executemany(
+                    _INSERT_SIGNATURE_SQL,
+                    [signature_insert_row(sig, store_raw=self.store_raw) for _, sig in write_rows],
+                )
+                conn.executemany(_INSERT_DRAWER_SQL, drawer_rows)
+                for index, sig in write_rows:
+                    results[index] = SaveManyResult(index=index, id=sig.id)
+
+        return results
 
     def get(self, memory_id: str, user: str = "default") -> SignatureRecord | None:
         row = self._conn().execute(

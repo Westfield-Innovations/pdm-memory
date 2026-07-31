@@ -146,6 +146,19 @@ class TestSQLiteDriverCRUD:
         # Bob's row must be untouched (wrong owner on batch)
         assert driver.get(bob.id, user="bob").p_magnitude == pytest.approx(50.0)
 
+    def test_save_many_inserts_multiple_rows(self, driver):
+        sigs = [
+            make_sig(text="Bulk fact 1", drawer="bulk"),
+            make_sig(text="Bulk fact 2", drawer="bulk"),
+            make_sig(text="Bulk fact 3", drawer="bulk"),
+        ]
+
+        results = driver.save_many(sigs)
+
+        assert [result.error for result in results] == [None, None, None]
+        assert [result.id for result in results] == [sig.id for sig in sigs]
+        assert driver.count(user="test_user") == 3
+
     def test_delete(self, driver):
         sig = make_sig()
         driver.save(sig)

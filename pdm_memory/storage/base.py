@@ -20,10 +20,18 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 from pdm_memory.core.signature import DrawerInfo, SignatureRecord
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SaveManyResult:
+    index: int
+    id: str | None
+    error: str | None = None
 
 
 class BaseStorage(ABC):
