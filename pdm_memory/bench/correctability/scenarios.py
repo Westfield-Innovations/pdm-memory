@@ -21,10 +21,7 @@ for adaptive memory systems.
 
 from __future__ import annotations
 
-import uuid
 from dataclasses import dataclass, field
-from typing import List
-
 
 # ---------------------------------------------------------------------------
 # Scenario dataclass
@@ -52,8 +49,8 @@ class BenchScenario:
     query: str
     wrong_answer: str
     correct_answer: str
-    tags_wrong: List[str] = field(default_factory=list)
-    tags_correct: List[str] = field(default_factory=list)
+    tags_wrong: list[str] = field(default_factory=list)
+    tags_correct: list[str] = field(default_factory=list)
     drawer: str = "correctability"
 
 
@@ -69,7 +66,7 @@ P_CORRECT: float = 40.0  # Signature B — correct but low authority
 # Scenario definitions
 # ---------------------------------------------------------------------------
 
-_SCENARIOS_RAW: List[dict] = [
+_SCENARIOS_RAW: list[dict] = [
     # ------------------------------------------------------------------ science
     {
         "id": "sci_001", "domain": "science",
@@ -800,7 +797,7 @@ def _build(raw: dict) -> BenchScenario:
 
 
 #: Full list of 100 benchmark scenarios — one module-level constant.
-ALL_SCENARIOS: List[BenchScenario] = [_build(r) for r in _SCENARIOS_RAW]
+ALL_SCENARIOS: list[BenchScenario] = [_build(r) for r in _SCENARIOS_RAW]
 
 #: Scenarios grouped by domain for easy filtering.
 SCENARIOS_BY_DOMAIN: dict = {
@@ -809,7 +806,7 @@ SCENARIOS_BY_DOMAIN: dict = {
 }
 
 
-def get_scenarios(domains: List[str] | None = None) -> List[BenchScenario]:
+def get_scenarios(domains: list[str] | None = None) -> list[BenchScenario]:
     """
     Return scenarios, optionally filtered to specific domains.
 

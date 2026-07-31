@@ -18,10 +18,7 @@ call them interchangeably.
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
-from typing import List, Optional
-
 
 # ---------------------------------------------------------------------------
 # Shared record type
@@ -35,7 +32,7 @@ class _BaselineRecord:
     memory_id: str
     text: str
     p_magnitude: float          # Static — never changes for RAG baseline
-    tags: List[str] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
     created_order: int = 0      # Insertion order for recency ranking
 
 
@@ -71,13 +68,13 @@ class VectorRAGBaseline:
     """
 
     def __init__(self) -> None:
-        self._records: List[_BaselineRecord] = []
+        self._records: list[_BaselineRecord] = []
         self._counter: int = 0
 
     def save(
         self,
         text: str,
-        tags: Optional[List[str]] = None,
+        tags: list[str] | None = None,
         p_magnitude: float = 50.0,
         **_kwargs,
     ) -> str:
@@ -100,7 +97,7 @@ class VectorRAGBaseline:
         query: str,
         k: int = 1,
         **_kwargs,
-    ) -> List[_BaselineHit]:
+    ) -> list[_BaselineHit]:
         """
         Retrieve top-k by static p_magnitude.
 
@@ -136,7 +133,7 @@ class VectorRAGBaseline:
     def penalize(self, memory_id: str, coupling_score: float = 0.5) -> None:
         """No-op — vector RAG has no authority update mechanism."""
 
-    def get_pressure(self, memory_id: str) -> Optional[float]:
+    def get_pressure(self, memory_id: str) -> float | None:
         """Return current p_magnitude for a given ID (always static)."""
         for rec in self._records:
             if rec.memory_id == memory_id:
@@ -165,13 +162,13 @@ class KeywordRecencyBaseline:
     """
 
     def __init__(self) -> None:
-        self._records: List[_BaselineRecord] = []
+        self._records: list[_BaselineRecord] = []
         self._counter: int = 0
 
     def save(
         self,
         text: str,
-        tags: Optional[List[str]] = None,
+        tags: list[str] | None = None,
         p_magnitude: float = 50.0,
         **_kwargs,
     ) -> str:
@@ -193,7 +190,7 @@ class KeywordRecencyBaseline:
         query: str,
         k: int = 1,
         **_kwargs,
-    ) -> List[_BaselineHit]:
+    ) -> list[_BaselineHit]:
         """Rank by keyword overlap + recency (static, no feedback)."""
         query_words = set(query.lower().split())
         n = max(1, len(self._records))
@@ -222,7 +219,7 @@ class KeywordRecencyBaseline:
     def penalize(self, memory_id: str, coupling_score: float = 0.5) -> None:
         """No-op."""
 
-    def get_pressure(self, memory_id: str) -> Optional[float]:
+    def get_pressure(self, memory_id: str) -> float | None:
         for rec in self._records:
             if rec.memory_id == memory_id:
                 return rec.p_magnitude

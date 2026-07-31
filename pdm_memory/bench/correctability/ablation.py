@@ -21,8 +21,10 @@ Usage in harness:
 from __future__ import annotations
 
 import logging
-from typing import Any, List, Optional
+from typing import Any
 from unittest.mock import patch
+
+from typing_extensions import Self
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +60,7 @@ class AblationMemory:
     def save(self, *args: Any, **kwargs: Any) -> str:
         return self._mem.save(*args, **kwargs)
 
-    def recall(self, *args: Any, **kwargs: Any) -> List[Any]:
+    def recall(self, *args: Any, **kwargs: Any) -> list[Any]:
         return self._mem.recall(*args, **kwargs)
 
     def reinforce(self, *args: Any, **kwargs: Any) -> None:
@@ -67,7 +69,7 @@ class AblationMemory:
     def penalize(self, *args: Any, **kwargs: Any) -> None:
         return self._mem.penalize(*args, **kwargs)
 
-    def get_pressure(self, memory_id: str) -> Optional[float]:
+    def get_pressure(self, memory_id: str) -> float | None:
         """Read the raw p_magnitude for a given memory ID."""
         rec = self._mem._storage.get(memory_id, user=self._mem._user)
         return rec.p_magnitude if rec else None
@@ -77,8 +79,8 @@ class AblationMemory:
         self._mem.close()
         logger.debug("[Ablation] V patcher stopped, memory closed")
 
-    def __enter__(self) -> "AblationMemory":
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *args: Any) -> None:
+    def __exit__(self, *args: object) -> None:
         self.close()

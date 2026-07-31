@@ -16,13 +16,10 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
-from typing import List
 
 import pytest
 
 from pdm_memory import Memory
-from pdm_memory.bench.correctability.baselines import VectorRAGBaseline
 from pdm_memory.bench.correctability.harness import run_suite
 from pdm_memory.bench.correctability.metrics import (
     RoundRecord,
@@ -33,13 +30,11 @@ from pdm_memory.bench.correctability.metrics import (
 )
 from pdm_memory.bench.correctability.scenarios import (
     ALL_SCENARIOS,
-    SCENARIOS_BY_DOMAIN,
-    BenchScenario,
     P_CORRECT,
     P_WRONG,
+    SCENARIOS_BY_DOMAIN,
     get_scenarios,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -269,7 +264,7 @@ def test_vector_rag_baseline_has_high_gravity():
 def test_json_output_has_required_fields(tmp_path):
     """Report.to_json() must include all 5 metrics and trace records."""
     output_path = str(tmp_path / "test_report.json")
-    report = run_suite(
+    run_suite(
         mode="pdm_enabled",
         rounds=5,
         seeds=[0],

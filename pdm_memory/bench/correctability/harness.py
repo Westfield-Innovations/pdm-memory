@@ -33,19 +33,19 @@ import logging
 import os
 import random
 import tempfile
-import time
-from typing import Any, Callable, List, Optional
+from collections.abc import Callable
+from typing import Any
 
 from pdm_memory.bench.correctability.metrics import (
+    CorrectabilityReport,
     RoundRecord,
     ScenarioTrace,
-    CorrectabilityReport,
     build_report,
 )
 from pdm_memory.bench.correctability.scenarios import (
-    BenchScenario,
     P_CORRECT,
     P_WRONG,
+    BenchScenario,
     get_scenarios,
 )
 
@@ -231,10 +231,10 @@ def _seed_scenario(backend: Any, scenario: BenchScenario) -> tuple[str, str]:
 def run_suite(
     mode: str = "pdm_enabled",
     rounds: int = 20,
-    seeds: Optional[List[int]] = None,
-    domains: Optional[List[str]] = None,
-    output: Optional[str] = None,
-    on_progress: Optional[Callable[[int, int], None]] = None,
+    seeds: list[int] | None = None,
+    domains: list[str] | None = None,
+    output: str | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> CorrectabilityReport:
     """
     Run the Correctability Benchmark suite.
@@ -281,7 +281,7 @@ def run_suite(
 
         for scenario in scenarios:
             # Each (seed × scenario) gets its own isolated backend
-            tmp_path: Optional[str] = None
+            tmp_path: str | None = None
 
             if needs_file:
                 tmp_fd, tmp_path = tempfile.mkstemp(suffix=".db", prefix="pdm_bench_")

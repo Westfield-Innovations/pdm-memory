@@ -338,13 +338,12 @@ def main() -> None:
         mode = "pdm_ablation" if args.ablation else args.mode
         seed_list = list(range(args.seeds))
 
-        print(f"Running PDM Correctability Benchmark…")
+        print("Running PDM Correctability Benchmark…")
         print(f"  mode={mode}  rounds={args.rounds}  seeds={seed_list}")
         if args.domains:
             print(f"  domains={args.domains}")
         print()
 
-        completed_runs = [0]
 
         def _progress(done: int, total: int) -> None:
             if done % max(1, total // 10) == 0 or done == total:

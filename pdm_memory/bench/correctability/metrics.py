@@ -18,11 +18,8 @@ The five metrics
 from __future__ import annotations
 
 import json
-import math
 import statistics
 from dataclasses import asdict, dataclass, field
-from typing import Dict, List, Optional
-
 
 # ---------------------------------------------------------------------------
 # Per-round record
@@ -55,10 +52,10 @@ class ScenarioTrace:
     domain: str
     seed: int
 
-    rounds: List[RoundRecord] = field(default_factory=list)
+    rounds: list[RoundRecord] = field(default_factory=list)
 
     # Derived — populated by harness after all rounds complete
-    crossover_round: Optional[int] = None   # None = no crossover before max_rounds
+    crossover_round: int | None = None   # None = no crossover before max_rounds
     gravity_persists: bool = True           # True if A still dominates at final round
     false_demotion: bool = False            # True if B lost dominance after gaining it
 
@@ -104,10 +101,10 @@ class AuthorityDecayStats:
 class CrossoverStats:
     """Distribution of crossover rounds across all scenarios and seeds."""
 
-    median: Optional[float]     # None if no crossovers occurred
-    mean: Optional[float]
-    std_dev: Optional[float]
-    distribution: List[Optional[int]]  # One entry per (scenario, seed) pair; None = no crossover
+    median: float | None     # None if no crossovers occurred
+    mean: float | None
+    std_dev: float | None
+    distribution: list[int | None]  # One entry per (scenario, seed) pair; None = no crossover
     never_crossed: int          # Count of runs with no crossover
 
 
@@ -128,8 +125,8 @@ class CorrectabilityReport:
     # --- Run metadata ---
     mode: str                           # "pdm_enabled" | "pdm_ablation" | "vector_rag"
     rounds_per_scenario: int
-    seeds_used: List[int]
-    domains_covered: List[str]
+    seeds_used: list[int]
+    domains_covered: list[str]
     total_scenarios: int
     total_runs: int                     # total_scenarios × len(seeds_used)
 
@@ -141,7 +138,7 @@ class CorrectabilityReport:
     memory_gravity_pct: float           # Same, as a percentage string-friendly value
 
     # --- Metric 3: Error Curve ---
-    accuracy_per_round: List[float]     # length = rounds_per_scenario
+    accuracy_per_round: list[float]     # length = rounds_per_scenario
 
     # --- Metric 4: Authority Decay Slope ---
     authority_decay: AuthorityDecayStats
@@ -151,10 +148,10 @@ class CorrectabilityReport:
     false_demotion_pct: float
 
     # --- Per-domain breakdown ---
-    gravity_by_domain: Dict[str, float] = field(default_factory=dict)
+    gravity_by_domain: dict[str, float] = field(default_factory=dict)
 
     # --- Raw traces (full data) ---
-    traces: List[ScenarioTrace] = field(default_factory=list)
+    traces: list[ScenarioTrace] = field(default_factory=list)
 
     # ---------------------------------------------------------------------------
     # Human-readable rendering
@@ -173,8 +170,8 @@ class CorrectabilityReport:
             f"║  1. Crossover Round (median):      {crossover_med:<34}║",
             f"║     Never crossed over:            {self.crossover.never_crossed:<34}║",
             f"║  2. Memory Gravity Index:          {self.memory_gravity_pct:.1f}%{'':<31}║",
-            f"║  3. Error Curve (round 1→last):    {self.accuracy_per_round[0]*100:.1f}% → "
-            f"{self.accuracy_per_round[-1]*100:.1f}%{'':<22}║",
+            (f"║  3. Error Curve (round 1→last):    {self.accuracy_per_round[0]*100:.1f}% → "
+            f"{self.accuracy_per_round[-1]*100:.1f}%{'':<22}║"),
             f"║  4. Authority Decay Slope (avg):   {self.authority_decay.avg_slope:.3f} p/round{'':<24}║",
             f"║  5. False Demotion Rate:           {self.false_demotion_pct:.1f}%{'':<31}║",
             "╠══════════════════════════════════════════════════════════════════════╣",
@@ -242,7 +239,7 @@ class CorrectabilityReport:
 # ---------------------------------------------------------------------------
 
 
-def compute_crossover_stats(traces: List[ScenarioTrace]) -> CrossoverStats:
+def compute_crossover_stats(traces: list[ScenarioTrace]) -> CrossoverStats:
     """Compute crossover round statistics from a list of scenario traces."""
     distribution = [t.crossover_round for t in traces]
     crossed_values = [v for v in distribution if v is not None]
@@ -266,7 +263,7 @@ def compute_crossover_stats(traces: List[ScenarioTrace]) -> CrossoverStats:
     )
 
 
-def compute_memory_gravity_index(traces: List[ScenarioTrace]) -> float:
+def compute_memory_gravity_index(traces: list[ScenarioTrace]) -> float:
     """
     Fraction of runs where Signature A (wrong) still dominates at the final round.
 
@@ -278,14 +275,14 @@ def compute_memory_gravity_index(traces: List[ScenarioTrace]) -> float:
 
 
 def compute_accuracy_per_round(
-    traces: List[ScenarioTrace], rounds: int
-) -> List[float]:
+    traces: list[ScenarioTrace], rounds: int
+) -> list[float]:
     """
     Compute mean accuracy (top-hit was correct) for each round index.
 
     Returns a list of length `rounds`.
     """
-    accuracies: List[List[float]] = [[] for _ in range(rounds)]
+    accuracies: list[list[float]] = [[] for _ in range(rounds)]
     for trace in traces:
         for r in trace.rounds:
             if r.round_number < rounds:
@@ -297,18 +294,18 @@ def compute_accuracy_per_round(
     ]
 
 
-def compute_authority_decay_slope(traces: List[ScenarioTrace]) -> AuthorityDecayStats:
+def compute_authority_decay_slope(traces: list[ScenarioTrace]) -> AuthorityDecayStats:
     """
     Compute slope of P_A decay after the first penalty (first round where A was wrong).
 
     Slope = (P_A at last round - P_A at first failure) / rounds elapsed
     Negative means P_A fell — which is what we want.
     """
-    slopes: List[float] = []
+    slopes: list[float] = []
 
     for trace in traces:
-        first_failure_idx: Optional[int] = None
-        p_a_at_failure: Optional[float] = None
+        first_failure_idx: int | None = None
+        p_a_at_failure: float | None = None
 
         for r in trace.rounds:
             if not r.is_correct and first_failure_idx is None:
@@ -342,7 +339,7 @@ def compute_authority_decay_slope(traces: List[ScenarioTrace]) -> AuthorityDecay
     )
 
 
-def compute_false_demotion_rate(traces: List[ScenarioTrace]) -> float:
+def compute_false_demotion_rate(traces: list[ScenarioTrace]) -> float:
     """
     Fraction of traces where Signature B (correct) gained dominance then lost it.
 
@@ -353,9 +350,9 @@ def compute_false_demotion_rate(traces: List[ScenarioTrace]) -> float:
     return sum(1 for t in traces if t.false_demotion) / len(traces)
 
 
-def compute_gravity_by_domain(traces: List[ScenarioTrace]) -> Dict[str, float]:
+def compute_gravity_by_domain(traces: list[ScenarioTrace]) -> dict[str, float]:
     """Return Memory Gravity Index broken down by domain."""
-    by_domain: Dict[str, List[ScenarioTrace]] = {}
+    by_domain: dict[str, list[ScenarioTrace]] = {}
     for t in traces:
         by_domain.setdefault(t.domain, []).append(t)
     return {
@@ -365,11 +362,11 @@ def compute_gravity_by_domain(traces: List[ScenarioTrace]) -> Dict[str, float]:
 
 
 def build_report(
-    traces: List[ScenarioTrace],
+    traces: list[ScenarioTrace],
     mode: str,
     rounds_per_scenario: int,
-    seeds_used: List[int],
-    domains_covered: List[str],
+    seeds_used: list[int],
+    domains_covered: list[str],
     total_scenarios: int,
 ) -> CorrectabilityReport:
     """
