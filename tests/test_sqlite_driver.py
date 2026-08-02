@@ -423,3 +423,32 @@ class TestSQLiteDriverPersistence:
 
         assert retrieved is not None
         assert retrieved.compressed_fact == sig.compressed_fact
+
+
+class TestGetMany:
+    """Tests for the bulk-fetch get_many() path."""
+
+    def test_get_many_mixed_existing_missing_and_other_user(self, driver):
+        sig1 = make_sig(text="Alice memory 1", user="alice")
+        sig2 = make_sig(text="Alice memory 2", user="alice")
+        sig_bob = make_sig(text="Bob memory", user="bob")
+
+        driver.save(sig1)
+        driver.save(sig2)
+        driver.save(sig_bob)
+
+        requested_ids = [sig1.id, "missing-id-99", sig_bob.id, sig2.id]
+        res = driver.get_many(requested_ids, user="alice")
+
+        assert isinstance(res, dict)
+        assert len(res) == 2
+        assert sig1.id in res
+        assert sig2.id in res
+        assert "missing-id-99" not in res
+        assert sig_bob.id not in res
+        assert res[sig1.id].compressed_fact == sig1.compressed_fact
+        assert res[sig2.id].compressed_fact == sig2.compressed_fact
+
+    def test_get_many_empty_returns_empty_dict(self, driver):
+        assert driver.get_many([], user="alice") == {}
+

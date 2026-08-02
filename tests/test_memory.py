@@ -337,6 +337,48 @@ class TestAuditAndHeal:
         assert summary["reconciled"] >= 1
         assert mem.count() == before
 
+    def test_audit_and_heal_uses_get_many_bulk_fetch(self, mem, monkeypatch):
+        """Verify audit_and_heal pre-fetches records via single get_many() call instead of 2*N get() calls."""
+        from datetime import datetime, timezone
+        from unittest.mock import MagicMock
+
+        mem.save(
+            "Project Alpha deadline is July 10",
+            tags=["project", "alpha", "deadline"],
+            drawer="projects",
+            p_magnitude=70,
+            deadline=datetime(2026, 7, 10, tzinfo=timezone.utc),
+            dedupe=False,
+        )
+        mem.save(
+            "Project Alpha deadline is July 15",
+            tags=["project", "alpha", "deadline"],
+            drawer="projects",
+            p_magnitude=72,
+            deadline=datetime(2026, 7, 15, tzinfo=timezone.utc),
+            dedupe=False,
+        )
+
+        real_get_many = mem._storage.get_many
+        real_get = mem._storage.get
+
+        get_many_mock = MagicMock(side_effect=real_get_many)
+        get_mock = MagicMock(side_effect=real_get)
+
+        monkeypatch.setattr(mem._storage, "get_many", get_many_mock)
+        monkeypatch.setattr(mem._storage, "get", get_mock)
+
+        mem.audit_and_heal(
+            torsion_threshold=0.5,
+            auto_reconcile_threshold=0.85,
+            run_decay=False,
+            dry_run=True,
+        )
+
+        # 1 bulk call to get_many instead of 2*N calls to get
+        assert get_many_mock.call_count == 1
+        assert get_mock.call_count == 0
+
 
 class TestMemoryFromEnv:
     def test_from_env_sqlite(self, tmp_path, monkeypatch):

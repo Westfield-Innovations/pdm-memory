@@ -115,6 +115,41 @@ class _FakePostgresConnection:
             rows = [{"id": row[0]} for row in self.signature_rows if row[1] == user and row[0] in ids]
             return _FakeCursor(rows=rows, rowcount=len(rows))
 
+        if normalized_sql.startswith('SELECT * FROM pdm_signatures WHERE "user" ='):
+            user = param_list[0]
+            ids = set(param_list[1:])
+            matched_rows = []
+            for row in self.signature_rows:
+                if row[1] == user and row[0] in ids:
+                    matched_rows.append({
+                        "id": row[0],
+                        "user": row[1],
+                        "compressed_fact": row[2],
+                        "compressed_fact_hash": row[3],
+                        "source": row[4],
+                        "p_magnitude": row[5],
+                        "t_persistence": row[6],
+                        "phase_privilege": row[7],
+                        "effective_spike": row[8],
+                        "intent_tags": row[9],
+                        "question_regime": row[10],
+                        "domain": row[11],
+                        "drawer_domain": row[12],
+                        "retrieval_count": row[13],
+                        "last_retrieved": row[14],
+                        "created_at": row[15],
+                        "validation_prediction_total": row[16],
+                        "validation_prediction_correct": row[17],
+                        "decay_rate": row[18],
+                        "t_deadline": row[19],
+                        "t_event_at": row[20],
+                        "urgency_rate": row[21],
+                        "metadata": row[22],
+                        "is_deleted": row[23],
+                        "idempotency_key": row[24],
+                    })
+            return _FakeCursor(rows=matched_rows, rowcount=len(matched_rows))
+
         return _FakeCursor()
 
     def executemany(self, sql, params_seq, **kwargs):
@@ -253,3 +288,31 @@ class TestPostgresDriverUpdateBatch:
         assert ("BEGIN", []) in conn.calls
         assert conn.commits == 1
         assert conn.rollbacks == 0
+
+
+class TestPostgresDriverGetMany:
+    def test_get_many_mixed_ids(self):
+        conn = _FakePostgresConnection()
+        driver = _make_driver(conn)
+
+        sig1 = make_sig(text="Alice memory 1", user="alice")
+        sig2 = make_sig(text="Alice memory 2", user="alice")
+        sig_bob = make_sig(text="Bob memory", user="bob")
+
+        driver.save_batch([sig1, sig2, sig_bob])
+
+        requested_ids = [sig1.id, "missing-id-99", sig_bob.id, sig2.id]
+        res = driver.get_many(requested_ids, user="alice")
+
+        assert isinstance(res, dict)
+        assert len(res) == 2
+        assert sig1.id in res
+        assert sig2.id in res
+        assert "missing-id-99" not in res
+        assert sig_bob.id not in res
+
+    def test_get_many_empty(self):
+        conn = _FakePostgresConnection()
+        driver = _make_driver(conn)
+        assert driver.get_many([], user="alice") == {}
+
