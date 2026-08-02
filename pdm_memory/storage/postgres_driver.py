@@ -17,14 +17,14 @@ from __future__ import annotations
 import builtins
 import logging
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
 
 from pdm_memory.core.math import P_MAX, calculate_effective_spike
 from pdm_memory.core.signature import DrawerInfo, SignatureRecord
-from pdm_memory.storage.base import BaseStorage, SaveManyResult
+from pdm_memory.storage.base import BaseStorage, SaveBatchResult, UpdateBatchResult
 from pdm_memory.storage.schema import (
     SCHEMA_POSTGRES,
     apply_postgres_migrations,
@@ -53,6 +53,8 @@ INSERT INTO pdm_signatures (
     %s, %s, %s, %s, %s,
     %s, %s
 )
+ON CONFLICT (id) DO NOTHING
+RETURNING id
 """
 
 _INSERT_DRAWER_SQL = """
@@ -63,6 +65,7 @@ ON CONFLICT (domain, "user") DO NOTHING
 
 
 class PostgresDriver(BaseStorage):
+    _CHUNK_SIZE = 500
     """
     PostgreSQL-backed PDM storage.
 
@@ -96,7 +99,7 @@ class PostgresDriver(BaseStorage):
         logger.debug("[PDM-Postgres] Connected (store_raw=%s)", store_raw)
 
     @contextmanager
-    def transaction(self) -> Iterator[None]:
+    def transaction(self) -> Generator[None]:
         conn = self._conn()
         depth = getattr(self._local, "txn_depth", 0)
         if depth == 0:
@@ -133,25 +136,26 @@ class PostgresDriver(BaseStorage):
 
     def save(self, sig: SignatureRecord) -> str:
         conn = self._conn()
-        conn.execute(_INSERT_SIGNATURE_SQL, signature_insert_row(sig, store_raw=self.store_raw))
+        cur = conn.execute(_INSERT_SIGNATURE_SQL, signature_insert_row(sig, store_raw=self.store_raw))
+        row = cur.fetchone() if hasattr(cur, "fetchone") else None
+        if not row and hasattr(cur, "rowcount") and cur.rowcount == 0:
+            raise ValueError(f"Signature record with id '{sig.id}' already exists")
         conn.execute(_INSERT_DRAWER_SQL, (sig.drawer_domain, sig.user, ""))
         self._commit_if_idle(conn)
         logger.debug("[PDM-Postgres] Saved signature %s (P=%.1f)", sig.id, sig.p_magnitude)
         return sig.id
 
-    def save_many(self, sigs: builtins.list[SignatureRecord]) -> builtins.list[SaveManyResult]:
+    def save_batch(self, sigs: builtins.list[SignatureRecord]) -> builtins.list[SaveBatchResult]:
         if not sigs:
             return []
 
-        results = [SaveManyResult(index=i, id=None) for i in range(len(sigs))]
+        results = [SaveBatchResult(index=i, id=None) for i in range(len(sigs))]
         seen_ids: set[str] = set()
         pending: list[tuple[int, SignatureRecord]] = []
         for index, sig in enumerate(sigs):
             if sig.id in seen_ids:
-                results[index] = SaveManyResult(
-                    index=index,
-                    id=None,
-                    error="Duplicate id in batch",
+                results[index] = SaveBatchResult(
+                    index=index, id=None, error="Duplicate id in batch",
                 )
                 continue
             seen_ids.add(sig.id)
@@ -162,45 +166,40 @@ class PostgresDriver(BaseStorage):
 
         conn = self._conn()
         with self.transaction():
-            for start in range(0, len(pending), 500):
-                chunk = pending[start : start + 500]
-                grouped: dict[str, list[tuple[int, SignatureRecord]]] = {}
-                for index, sig in chunk:
-                    grouped.setdefault(sig.user, []).append((index, sig))
+            seen_drawers: set[tuple[str, str]] = set()
 
-                write_rows: list[tuple[int, SignatureRecord]] = []
-                drawer_rows: list[tuple[str, str, str]] = []
-                for user, user_chunk in grouped.items():
-                    ids = [sig.id for _, sig in user_chunk]
-                    placeholders = ", ".join("%s" for _ in ids)
-                    existing_rows = conn.execute(
-                        f'SELECT id FROM pdm_signatures WHERE "user" = %s AND id IN ({placeholders})',
-                        [user, *ids],
-                    ).fetchall()
-                    existing_ids = {row["id"] for row in existing_rows}
-
-                    for index, sig in user_chunk:
-                        if sig.id in existing_ids:
-                            results[index] = SaveManyResult(
-                                index=index,
-                                id=None,
-                                error="Duplicate id already exists",
-                            )
-                            continue
-                        write_rows.append((index, sig))
-                        drawer_rows.append((sig.drawer_domain, sig.user, ""))
-
-                if not write_rows:
-                    continue
+            for start in range(0, len(pending), self._CHUNK_SIZE):
+                chunk = pending[start:start + self._CHUNK_SIZE]
+                params = [
+                    signature_insert_row(sig, store_raw=self.store_raw)
+                    for _, sig in chunk
+                ]
 
                 cur = conn.cursor()
-                cur.executemany(
-                    _INSERT_SIGNATURE_SQL,
-                    [signature_insert_row(sig, store_raw=self.store_raw) for _, sig in write_rows],
-                )
-                cur.executemany(_INSERT_DRAWER_SQL, drawer_rows)
-                for index, sig in write_rows:
-                    results[index] = SaveManyResult(index=index, id=sig.id)
+                cur.executemany(_INSERT_SIGNATURE_SQL, params, returning=True)
+
+                rows: list[Any] = []
+                while True:
+                    row = cur.fetchone()
+                    rows.append(row)
+                    if not cur.nextset():
+                        break
+
+                drawer_rows: list[tuple[str, str, str]] = []
+                for (index, sig), row in zip(chunk, rows):
+                    if row is not None:
+                        drawer_key = (sig.drawer_domain, sig.user)
+                        if drawer_key not in seen_drawers:
+                            drawer_rows.append((sig.drawer_domain, sig.user, ""))
+                            seen_drawers.add(drawer_key)
+                        results[index] = SaveBatchResult(index=index, id=sig.id)
+                    else:
+                        results[index] = SaveBatchResult(
+                            index=index, id=None, error="Duplicate id already exists",
+                        )
+
+                if drawer_rows:
+                    conn.cursor().executemany(_INSERT_DRAWER_SQL, drawer_rows)
 
         return results
 
@@ -307,45 +306,69 @@ class PostgresDriver(BaseStorage):
                 """,
                 (new_p, new_spike, last_retrieved, memory_id, user),
             )
-
     def update_batch(
         self,
         updates: builtins.list[tuple[str, dict]],
         user: str = "default",
-    ) -> None:
+    ) -> builtins.list[UpdateBatchResult]:
         if not updates:
-            return
+            return []
 
-        grouped_updates: dict[tuple[str, ...], list[tuple[object, ...]]] = {}
-        for memory_id, fields in updates:
-            prepared = prepare_update_fields(fields)
-            if not prepared:
-                continue
-            columns = tuple(sorted(prepared))
-            grouped_updates.setdefault(columns, []).append(
-                tuple(prepared[column] for column in columns) + (memory_id, user)
-            )
+        results = [UpdateBatchResult(index=i, id=memory_id) for i, (memory_id, _) in enumerate(updates)]
+        index_map = {memory_id: i for i, (memory_id, _) in enumerate(updates)}
 
-        if not grouped_updates:
-            return
+        grouped: dict[tuple[str, ...], list[tuple[str, tuple]]] = {}
+        for index, (memory_id, fields) in enumerate(updates):
+            try:
+                prepared = prepare_update_fields(fields)
+                if not prepared:
+                    continue
+                columns = tuple(sorted(prepared))
+                params = tuple(prepared[c] for c in columns) + (memory_id, user)
+                grouped.setdefault(columns, []).append((memory_id, params))
+            except Exception as exc:
+                results[index] = UpdateBatchResult(index=index, id=memory_id, error=str(exc))
+
+        if not grouped:
+            return results
 
         conn = self._conn()
         with self.transaction():
-            for columns, rows in grouped_updates.items():
+            for columns, entries in grouped.items():
                 set_clause = ", ".join(f"{col} = %s" for col in columns)
-                cur = conn.cursor()
-                cur.executemany(
-                    f'UPDATE pdm_signatures SET {set_clause} WHERE id = %s AND "user" = %s',
-                    rows,
+                sql = (
+                    f'UPDATE pdm_signatures SET {set_clause} '
+                    f'WHERE id = %s AND "user" = %s RETURNING id'
                 )
-                if cur.rowcount not in (-1, len(rows)):
-                    logger.warning(
-                        "[PDM-Postgres] update_batch touched %s/%s rows (user=%s columns=%s)",
-                        cur.rowcount,
-                        len(rows),
-                        user,
-                        list(columns),
-                    )
+
+                for start in range(0, len(entries), self._CHUNK_SIZE):
+                    chunk = entries[start:start + self._CHUNK_SIZE]
+                    params_list = [p for _, p in chunk]
+
+                    cur = conn.cursor()
+                    cur.executemany(sql, params_list, returning=True)
+
+                    touched: set[str] = set()
+                    while True:
+                        row = cur.fetchone()
+                        if row is not None:
+                            mid = row["id"] if isinstance(row, dict) or hasattr(row, "keys") else row[0]
+                            touched.add(mid)
+                        if not hasattr(cur, "nextset") or not cur.nextset():
+                            break
+
+                    if len(touched) != len(chunk):
+                        missing = [mid for mid, _ in chunk if mid not in touched]
+                        for mid in missing:
+                            idx = index_map[mid]
+                            results[idx] = UpdateBatchResult(index=idx, id=mid, error="Memory not found or wrong user")
+                        logger.warning(
+                            "[PDM-Postgres] update_batch: %s/%s rows touched "
+                            "(user=%s columns=%s); missing ids: %s",
+                            len(touched), len(chunk), user, list(columns), missing[:20],
+                        )
+
+        return results
 
     def delete(self, memory_id: str, user: str = "default") -> None:
         conn = self._conn()

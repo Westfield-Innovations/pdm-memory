@@ -18,7 +18,7 @@ import builtins
 import hashlib
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -28,10 +28,18 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class SaveManyResult:
+class SaveBatchResult:
     index: int
     id: str | None
     error: str | None = None
+
+
+@dataclass
+class UpdateBatchResult:
+    index: int
+    id: str | None
+    error: str | None = None
+
 
 
 class BaseStorage(ABC):
@@ -47,6 +55,19 @@ class BaseStorage(ABC):
         """Persist a new signature. Returns sig.id."""
         ...
 
+    def save_batch(self, sigs: list[SignatureRecord]) -> list[SaveBatchResult]:
+        results = []
+        with self.transaction():
+            for i, sig in enumerate(sigs):
+                try:
+                    new_id = self.save(sig)
+                    results.append(SaveBatchResult(index=i, id=new_id))
+                except Exception as e:
+                    results.append(SaveBatchResult(index=i, id=None, error=str(e)))
+        return results
+
+    save_many = save_batch
+
     @abstractmethod
     def get(self, memory_id: str, user: str = "default") -> SignatureRecord | None:
         """Retrieve a single active (non-deleted) signature by ID."""
@@ -61,12 +82,18 @@ class BaseStorage(ABC):
         self,
         updates: builtins.list[tuple[str, dict]],
         user: str = "default",
-    ) -> None:
+    ) -> builtins.list[UpdateBatchResult]:
         if not updates:
-            return
+            return []
+        results: list[UpdateBatchResult] = []
         with self.transaction():
-            for memory_id, fields in updates:
-                self.update(memory_id, user=user, **fields)
+            for i, (memory_id, fields) in enumerate(updates):
+                try:
+                    self.update(memory_id, user=user, **fields)
+                    results.append(UpdateBatchResult(index=i, id=memory_id))
+                except Exception as e:
+                    results.append(UpdateBatchResult(index=i, id=memory_id, error=str(e)))
+        return results
 
     @abstractmethod
     def delete(self, memory_id: str, user: str = "default") -> None:
@@ -139,7 +166,7 @@ class BaseStorage(ABC):
             return False
 
     @contextmanager
-    def transaction(self) -> Iterator[None]:
+    def transaction(self) -> Generator[None]:
         yield
 
     def close(self) -> None:

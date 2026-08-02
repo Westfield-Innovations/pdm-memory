@@ -309,6 +309,7 @@ class Memory:
         errors = 0
         sigs_to_save: list[SignatureRecord] = []
         seen_idempotency_keys: set[str] = set()
+        seen_hashes: set[str] = set()
 
         txn = getattr(self._storage, "transaction", None)
         ctx: AbstractContextManager[None] = txn() if callable(txn) else nullcontext()
@@ -338,14 +339,20 @@ class Memory:
                     from pdm_memory.storage.schema import hash_fact_text
 
                     if dedupe:
+                        fact_hash = hash_fact_text(text[:500])
+                        if fact_hash in seen_hashes:
+                            skipped += 1
+                            continue
                         existing = self._storage.find_by_hash(
-                            hash_fact_text(text[:500]), user=self._user
+                            fact_hash, user=self._user
                         )
                         if existing is not None:
                             if dedupe_reinforce:
                                 self.reinforce(existing.id)
                             skipped += 1
+                            seen_hashes.add(fact_hash)
                             continue
+                        seen_hashes.add(fact_hash)
 
                     sig = self._build_signature_record(
                         text,
@@ -557,8 +564,12 @@ class Memory:
                 errors += 1
 
         if prepared_updates:
-            self._storage.update_batch(prepared_updates, user=self._user)
-            updated = len(prepared_updates)
+            results = self._storage.update_batch(prepared_updates, user=self._user)
+            for res in results:
+                if res.error is None:
+                    updated += 1
+                else:
+                    errors += 1
 
         logger.info("[PDM] update_batch updated=%d skipped=%d errors=%d", updated, skipped, errors)
         return {"updated": updated, "skipped": skipped, "errors": errors}
@@ -1676,7 +1687,10 @@ class Memory:
             )
         if batch_updates:
             try:
-                self._storage.update_batch(batch_updates, user=self._user)
+                results = self._storage.update_batch(batch_updates, user=self._user)
+                for res in results:
+                    if res.error:
+                        logger.warning("[PDM] torsion V penalty failed for %s: %s", res.id, res.error)
             except Exception as e:
                 logger.warning("[PDM] torsion V penalty batch failed: %s", e)
 
@@ -1714,6 +1728,9 @@ class Memory:
 
         if batch_updates:
             try:
-                self._storage.update_batch(batch_updates, user=self._user)
+                results = self._storage.update_batch(batch_updates, user=self._user)
+                for res in results:
+                    if res.error:
+                        logger.warning("[PDM] reinforcement update failed for %s: %s", res.id, res.error)
             except Exception as e:
                 logger.warning("[PDM] reinforcement batch update failed: %s", e)
