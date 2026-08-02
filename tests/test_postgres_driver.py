@@ -23,23 +23,61 @@ class _FakeCursor:
     def __init__(self, rows=None, rowcount=0):
         self._rows = rows or []
         self.rowcount = rowcount
+        self._idx = 0
 
     def fetchall(self):
         return list(self._rows)
 
     def fetchone(self):
-        return self._rows[0] if self._rows else None
+        if self._idx < len(self._rows):
+            res = self._rows[self._idx]
+            self._idx += 1
+            return res
+        return None
+
+    def nextset(self):
+        return False
+
+
+class _FakeMultiStatementCursor:
+    def __init__(self, result_sets: list[object | None]):
+        self._result_sets = result_sets
+        self._idx = 0
+
+    def fetchone(self):
+        if self._idx < len(self._result_sets):
+            return self._result_sets[self._idx]
+        return None
+
+    def nextset(self):
+        self._idx += 1
+        return self._idx < len(self._result_sets)
 
 
 class _FakePostgresCursor(_FakeCursor):
     def __init__(self, conn):
         super().__init__()
         self._conn = conn
+        self._active_cursor = None
 
-    def executemany(self, sql, params_seq):
-        result = self._conn.executemany(sql, params_seq)
-        self.rowcount = result.rowcount
-        return result
+    def executemany(self, sql, params_seq, **kwargs):
+        self._active_cursor = self._conn.executemany(sql, params_seq, **kwargs)
+        if isinstance(self._active_cursor, _FakeMultiStatementCursor):
+            return self._active_cursor
+        self.rowcount = getattr(self._active_cursor, "rowcount", 0)
+        self._rows = getattr(self._active_cursor, "_rows", [])
+        self._idx = 0
+        return self
+
+    def fetchone(self):
+        if self._active_cursor and hasattr(self._active_cursor, "fetchone"):
+            return self._active_cursor.fetchone()
+        return super().fetchone()
+
+    def nextset(self):
+        if self._active_cursor and hasattr(self._active_cursor, "nextset"):
+            return self._active_cursor.nextset()
+        return super().nextset()
 
 
 class _FakePostgresConnection:
@@ -59,6 +97,18 @@ class _FakePostgresConnection:
         if normalized_sql == "BEGIN":
             return _FakeCursor()
 
+        if normalized_sql.startswith("INSERT INTO pdm_signatures"):
+            sig_id = param_list[0]
+            existing_ids = {row[0] for row in self.signature_rows}
+            if sig_id in existing_ids:
+                return _FakeCursor(rows=[], rowcount=0)
+            self.signature_rows.append(tuple(param_list))
+            return _FakeCursor(rows=[{"id": sig_id}], rowcount=1)
+
+        if normalized_sql.startswith("INSERT INTO pdm_drawers"):
+            self.drawer_rows.append(tuple(param_list))
+            return _FakeCursor(rowcount=1)
+
         if normalized_sql.startswith("SELECT id FROM pdm_signatures WHERE"):
             user = param_list[0]
             ids = set(param_list[1:])
@@ -67,15 +117,24 @@ class _FakePostgresConnection:
 
         return _FakeCursor()
 
-    def executemany(self, sql, params_seq):
+    def executemany(self, sql, params_seq, **kwargs):
         normalized_sql = " ".join(sql.split())
         rows = [tuple(params) for params in params_seq]
         self.executemany_calls.append((normalized_sql, rows))
         if normalized_sql.startswith("UPDATE pdm_signatures SET"):
             return _FakeCursor(rowcount=len(rows))
         if normalized_sql.startswith("INSERT INTO pdm_signatures"):
-            self.signature_rows.extend(rows)
-            return _FakeCursor(rowcount=len(rows))
+            result_sets: list[object | None] = []
+            existing_ids = {row[0] for row in self.signature_rows}
+            for row in rows:
+                sig_id = row[0]
+                if sig_id not in existing_ids:
+                    self.signature_rows.append(row)
+                    existing_ids.add(sig_id)
+                    result_sets.append({"id": sig_id})
+                else:
+                    result_sets.append(None)
+            return _FakeMultiStatementCursor(result_sets)
         if normalized_sql.startswith("INSERT INTO pdm_drawers"):
             self.drawer_rows.extend(rows)
             return _FakeCursor(rowcount=len(rows))
@@ -112,7 +171,7 @@ class TestPostgresDriverSaveMany:
         sigs[8].id = sigs[1].id
         sigs[9].id = sigs[3].id
 
-        results = driver.save_many(sigs)
+        results = driver.save_batch(sigs)
 
         assert [result.index for result in results] == list(range(10))
         assert sum(result.error is None for result in results) == 8
@@ -132,7 +191,7 @@ class TestPostgresDriverSaveMany:
         assert len(signature_inserts) == 1
         assert len(drawer_inserts) == 1
         assert len(signature_inserts[0]) == 8
-        assert len(drawer_inserts[0]) == 8
+        assert len(drawer_inserts[0]) == 1
         assert conn.commits == 1
         assert conn.rollbacks == 0
 
@@ -145,7 +204,7 @@ class TestPostgresDriverSaveMany:
             for i in range(501)
         ]
 
-        results = driver.save_many(sigs)
+        results = driver.save_batch(sigs)
 
         assert all(result.error is None for result in results)
 
@@ -182,13 +241,13 @@ class TestPostgresDriverUpdateBatch:
         first_sql, first_rows = conn.executemany_calls[0]
         second_sql, second_rows = conn.executemany_calls[1]
 
-        assert 'UPDATE pdm_signatures SET p_magnitude = %s, retrieval_count = %s WHERE id = %s AND "user" = %s' == first_sql
+        assert 'UPDATE pdm_signatures SET p_magnitude = %s, retrieval_count = %s WHERE id = %s AND "user" = %s RETURNING id' == first_sql
         assert first_rows == [
             (80.0, 4, "sig-1", "alice"),
             (55.0, 9, "sig-2", "alice"),
         ]
         assert second_sql == (
-            'UPDATE pdm_signatures SET drawer_domain = %s WHERE id = %s AND "user" = %s'
+            'UPDATE pdm_signatures SET drawer_domain = %s WHERE id = %s AND "user" = %s RETURNING id'
         )
         assert second_rows == [("licenses", "sig-3", "alice")]
         assert ("BEGIN", []) in conn.calls

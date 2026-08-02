@@ -143,6 +143,19 @@ class TestSaveMany:
         assert counts["skipped"] == 1
         assert mem.count() == 1
 
+    def test_save_many_intra_batch_dedupe(self, mem):
+        items = [
+            {"text": "Batch Duplicate Fact", "tags": ["a"]},
+            {"text": "Batch Duplicate Fact", "tags": ["b"]},
+            {"text": "Unique Fact", "tags": ["c"]},
+            {"text": "Batch Duplicate Fact", "tags": ["d"]},
+        ]
+        counts = mem.save_many(items)
+        assert counts["saved"] == 2
+        assert counts["skipped"] == 2
+        assert counts["errors"] == 0
+        assert mem.count() == 2
+
 
 class TestSurface:
     def test_surface_returns_combined_report(self, mem):

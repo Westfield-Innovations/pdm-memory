@@ -3,7 +3,7 @@
 import pytest
 
 from pdm_memory import Memory
-from pdm_memory.storage.base import SaveManyResult
+from pdm_memory.storage.base import SaveBatchResult
 
 
 @pytest.fixture
@@ -627,8 +627,8 @@ class TestMemoryIngest:
         def fake_save_many(sigs):
             captured["facts"] = [sig.compressed_fact for sig in sigs]
             return [
-                SaveManyResult(index=0, id="sig-1"),
-                SaveManyResult(index=1, id="sig-2"),
+                SaveBatchResult(index=0, id="sig-1"),
+                SaveBatchResult(index=1, id="sig-2"),
             ]
 
         mem._storage.save_many = fake_save_many

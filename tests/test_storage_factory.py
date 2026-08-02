@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from pdm_memory import Memory
-from pdm_memory.storage.base import BaseStorage
+from pdm_memory.storage.base import BaseStorage, SaveBatchResult, UpdateBatchResult
 from pdm_memory.storage.factory import companion_token_refresh_url, create_storage, register_storage
 from pdm_memory.storage.sqlite_driver import SQLiteDriver
 
@@ -122,3 +122,15 @@ class TestStorageFactory:
             mid = mem.save("fact", tags=["a", "b", "c"])
             assert mem.count() == 1
             assert mem._storage.get(mid, user="alice") is not None
+
+    def test_update_batch_result_dataclass(self):
+        res1 = UpdateBatchResult(index=0, id="sig-123")
+        res2 = UpdateBatchResult(index=1, id=None, error="not found")
+
+        assert res1.index == 0
+        assert res1.id == "sig-123"
+        assert res1.error is None
+
+        assert res2.index == 1
+        assert res2.id is None
+        assert res2.error == "not found"
