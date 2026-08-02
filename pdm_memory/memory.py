@@ -939,14 +939,22 @@ class Memory:
         reconciled_kinds: list[str] = []
         consumed: set[str] = set()
 
+        # Prefetch all records needed by the reconcile loop in one bulk query
+        # (2*N get() calls → 1 get_many() call regardless of candidate count).
+        all_ids: set[str] = set()
+        for report in candidates:
+            all_ids.add(report.signature_a_id)
+            all_ids.add(report.signature_b_id)
+        records = self._storage.get_many(list(all_ids), user=self._user)
+
         for report in candidates:
             a_id = report.signature_a_id
             b_id = report.signature_b_id
             if a_id in consumed or b_id in consumed:
                 skipped += 1
                 continue
-            rec_a = self._storage.get(a_id, user=self._user)
-            rec_b = self._storage.get(b_id, user=self._user)
+            rec_a = records.get(a_id)
+            rec_b = records.get(b_id)
             if rec_a is None or rec_b is None:
                 skipped += 1
                 continue

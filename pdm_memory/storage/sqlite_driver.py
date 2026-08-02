@@ -353,6 +353,42 @@ class SQLiteDriver(BaseStorage):
         ).fetchone()
         return mapping_to_record(row) if row else None
 
+    def get_many(
+        self,
+        ids: builtins.list[str],
+        user: str = "default",
+    ) -> dict[str, SignatureRecord]:
+        """Bulk-fetch via WHERE id IN (...), chunked by _CHUNK_SIZE.
+
+        Strategy:
+        1. De-dup *ids* (preserve order via dict.fromkeys).
+        2. For each chunk of :attr:`_CHUNK_SIZE`, run one
+           ``SELECT * … WHERE user = ? AND id IN (…) AND is_deleted = 0``.
+           The ``idx_pdm_user_id`` covering index ensures O(k log N) lookup.
+        3. Return a dict keyed by id; missing / foreign-user ids are simply
+           absent — no error, since "not found" is an expected outcome here.
+        """
+        if not ids:
+            return {}
+
+        unique_ids = list(dict.fromkeys(ids))
+        result: dict[str, SignatureRecord] = {}
+        conn = self._conn()
+
+        for start in range(0, len(unique_ids), self._CHUNK_SIZE):
+            chunk = unique_ids[start : start + self._CHUNK_SIZE]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT * FROM pdm_signatures WHERE user = ? AND id IN ({placeholders}) "
+                "AND is_deleted = 0",
+                [user, *chunk],
+            ).fetchall()
+            for row in rows:
+                rec = mapping_to_record(row)
+                result[rec.id] = rec
+
+        return result
+
     def find_by_hash(self, text_hash: str, user: str = "default") -> SignatureRecord | None:
         row = self._conn().execute(
             "SELECT * FROM pdm_signatures WHERE user = ? AND compressed_fact_hash = ? "

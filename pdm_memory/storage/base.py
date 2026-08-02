@@ -46,8 +46,16 @@ class BaseStorage(ABC):
     """
     Abstract storage interface for PDM signatures.
 
-    Implement all methods to create a new storage backend.
-    The Memory class will call only these methods — no direct DB access.
+    **Required** (abstract — must implement in every driver):
+    ``save``, ``get``, ``update``, ``delete``, ``list``, ``list_drawers``.
+
+    **Optional hooks with defaults** (override for real performance):
+    ``save_batch`` / ``save_many``, ``update_batch``, ``get_many``,
+    ``count``, ``find_by_hash``, ``find_by_idempotency_key``, ``ping``,
+    ``hard_delete``, ``transaction``, ``close``.
+
+    The Memory class depends only on BaseStorage — it never knows which
+    driver is active.
     """
 
     @abstractmethod
@@ -72,6 +80,28 @@ class BaseStorage(ABC):
     def get(self, memory_id: str, user: str = "default") -> SignatureRecord | None:
         """Retrieve a single active (non-deleted) signature by ID."""
         ...
+
+    def get_many(
+        self,
+        ids: builtins.list[str],
+        user: str = "default",
+    ) -> dict[str, SignatureRecord]:
+        """Fetch multiple signatures by id in one call.
+
+        Default: loops over ``get()``.  Drivers should override with a real
+        bulk query (``WHERE id IN (...)``) for real performance.
+
+        Returns a dict keyed by id; ids that don't exist (or belong to
+        another user) are simply absent from the result — no error per id,
+        since a missing record is a valid, expected outcome here (not a
+        batch-operation failure like in save_batch/update_batch).
+        """
+        result: dict[str, SignatureRecord] = {}
+        for memory_id in ids:
+            rec = self.get(memory_id, user=user)
+            if rec is not None:
+                result[memory_id] = rec
+        return result
 
     @abstractmethod
     def update(self, memory_id: str, user: str = "default", **fields) -> None:
