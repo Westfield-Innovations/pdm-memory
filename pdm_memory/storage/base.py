@@ -18,20 +18,44 @@ import builtins
 import hashlib
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 from pdm_memory.core.signature import DrawerInfo, SignatureRecord
 
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class SaveBatchResult:
+    index: int
+    id: str | None
+    error: str | None = None
+
+
+@dataclass
+class UpdateBatchResult:
+    index: int
+    id: str | None
+    error: str | None = None
+
+
+
 class BaseStorage(ABC):
     """
     Abstract storage interface for PDM signatures.
 
-    Implement all methods to create a new storage backend.
-    The Memory class will call only these methods — no direct DB access.
+    **Required** (abstract — must implement in every driver):
+    ``save``, ``get``, ``update``, ``delete``, ``list``, ``list_drawers``.
+
+    **Optional hooks with defaults** (override for real performance):
+    ``save_batch`` / ``save_many``, ``update_batch``, ``get_many``,
+    ``count``, ``find_by_hash``, ``find_by_idempotency_key``, ``ping``,
+    ``hard_delete``, ``transaction``, ``close``.
+
+    The Memory class depends only on BaseStorage — it never knows which
+    driver is active.
     """
 
     @abstractmethod
@@ -39,10 +63,45 @@ class BaseStorage(ABC):
         """Persist a new signature. Returns sig.id."""
         ...
 
+    def save_batch(self, sigs: list[SignatureRecord]) -> list[SaveBatchResult]:
+        results = []
+        with self.transaction():
+            for i, sig in enumerate(sigs):
+                try:
+                    new_id = self.save(sig)
+                    results.append(SaveBatchResult(index=i, id=new_id))
+                except Exception as e:
+                    results.append(SaveBatchResult(index=i, id=None, error=str(e)))
+        return results
+
+    save_many = save_batch
+
     @abstractmethod
     def get(self, memory_id: str, user: str = "default") -> SignatureRecord | None:
         """Retrieve a single active (non-deleted) signature by ID."""
         ...
+
+    def get_many(
+        self,
+        ids: builtins.list[str],
+        user: str = "default",
+    ) -> dict[str, SignatureRecord]:
+        """Fetch multiple signatures by id in one call.
+
+        Default: loops over ``get()``.  Drivers should override with a real
+        bulk query (``WHERE id IN (...)``) for real performance.
+
+        Returns a dict keyed by id; ids that don't exist (or belong to
+        another user) are simply absent from the result — no error per id,
+        since a missing record is a valid, expected outcome here (not a
+        batch-operation failure like in save_batch/update_batch).
+        """
+        result: dict[str, SignatureRecord] = {}
+        for memory_id in ids:
+            rec = self.get(memory_id, user=user)
+            if rec is not None:
+                result[memory_id] = rec
+        return result
 
     @abstractmethod
     def update(self, memory_id: str, user: str = "default", **fields) -> None:
@@ -53,9 +112,18 @@ class BaseStorage(ABC):
         self,
         updates: builtins.list[tuple[str, dict]],
         user: str = "default",
-    ) -> None:
-        for memory_id, fields in updates:
-            self.update(memory_id, user=user, **fields)
+    ) -> builtins.list[UpdateBatchResult]:
+        if not updates:
+            return []
+        results: list[UpdateBatchResult] = []
+        with self.transaction():
+            for i, (memory_id, fields) in enumerate(updates):
+                try:
+                    self.update(memory_id, user=user, **fields)
+                    results.append(UpdateBatchResult(index=i, id=memory_id))
+                except Exception as e:
+                    results.append(UpdateBatchResult(index=i, id=memory_id, error=str(e)))
+        return results
 
     @abstractmethod
     def delete(self, memory_id: str, user: str = "default") -> None:
@@ -128,7 +196,7 @@ class BaseStorage(ABC):
             return False
 
     @contextmanager
-    def transaction(self) -> Iterator[None]:
+    def transaction(self) -> Generator[None]:
         yield
 
     def close(self) -> None:

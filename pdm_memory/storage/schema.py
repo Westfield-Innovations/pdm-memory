@@ -83,6 +83,9 @@ CREATE INDEX IF NOT EXISTS idx_pdm_user_fact_hash
 CREATE INDEX IF NOT EXISTS idx_pdm_user_active_pressure
     ON pdm_signatures (user, is_deleted, p_magnitude DESC, id DESC);
 
+CREATE INDEX IF NOT EXISTS idx_pdm_user_id
+    ON pdm_signatures (user, id);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pdm_user_idempotency
     ON pdm_signatures (user, idempotency_key)
     WHERE idempotency_key IS NOT NULL;
@@ -136,6 +139,9 @@ CREATE INDEX IF NOT EXISTS idx_pdm_user_fact_hash
 CREATE INDEX IF NOT EXISTS idx_pdm_user_active_pressure
     ON pdm_signatures ("user", is_deleted, p_magnitude DESC, id DESC);
 
+CREATE INDEX IF NOT EXISTS idx_pdm_user_id
+    ON pdm_signatures ("user", id);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pdm_user_idempotency
     ON pdm_signatures ("user", idempotency_key)
     WHERE idempotency_key IS NOT NULL;
@@ -165,6 +171,10 @@ def apply_sqlite_migrations(conn: Any) -> None:
         "ON pdm_signatures (user, is_deleted, p_magnitude DESC, id DESC)"
     )
     conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pdm_user_id "
+        "ON pdm_signatures (user, id)"
+    )
+    conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_pdm_user_idempotency "
         "ON pdm_signatures (user, idempotency_key) "
         "WHERE idempotency_key IS NOT NULL"
@@ -189,6 +199,10 @@ def apply_postgres_migrations(conn: Any) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pdm_user_active_pressure "
         'ON pdm_signatures ("user", is_deleted, p_magnitude DESC, id DESC)'
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pdm_user_id "
+        'ON pdm_signatures ("user", id)'
     )
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_pdm_user_idempotency "

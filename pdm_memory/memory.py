@@ -267,33 +267,19 @@ class Memory:
                 logger.debug("[PDM] save() dedupe → %s", existing.id[:8])
                 return existing.id
 
-        resolved_tags = tags or []
-        domain = infer_domain(resolved_tags)
-        eff_spike = calculate_effective_spike(p_magnitude, t_persistence, phase_privilege)
-
-        # Companion parity: a future deadline without event_at still needs an
-        # event timestamp for temporal-window recall.
-        resolved_event = event_at
-        if resolved_event is None and deadline is not None:
-            resolved_event = deadline
-
-        sig = SignatureRecord(
-            user=self._user,
-            compressed_fact=text,
+        sig = self._build_signature_record(
+            text=text,
             source=source,
+            tags=tags,
             p_magnitude=p_magnitude,
             t_persistence=t_persistence,
+            drawer=drawer,
+            regime=regime,
             phase_privilege=phase_privilege,
-            effective_spike=eff_spike,
-            intent_tags=resolved_tags,
-            question_regime=regime,
-            domain=domain,
-            drawer_domain=drawer,
-            decay_rate=0.9,
-            t_deadline=deadline,
-            t_event_at=resolved_event,
-            metadata=metadata or {},
-            idempotency_key=idempotency_key.strip() if idempotency_key else None,
+            deadline=deadline,
+            event_at=event_at,
+            metadata=metadata,
+            idempotency_key=idempotency_key,
         )
         sig = self._run_pre_save_hooks(sig)
         memory_id = self._storage.save(sig)
@@ -321,6 +307,9 @@ class Memory:
         saved = 0
         skipped = 0
         errors = 0
+        sigs_to_save: list[SignatureRecord] = []
+        seen_idempotency_keys: set[str] = set()
+        seen_hashes: set[str] = set()
 
         txn = getattr(self._storage, "transaction", None)
         ctx: AbstractContextManager[None] = txn() if callable(txn) else nullcontext()
@@ -333,19 +322,39 @@ class Memory:
                         errors += 1
                         continue
 
+                    idempotency_key = str(item.get("idempotency_key") or "").strip()
+                    if idempotency_key:
+                        if idempotency_key in seen_idempotency_keys:
+                            skipped += 1
+                            continue
+                        existing = self._storage.find_by_idempotency_key(
+                            idempotency_key,
+                            user=self._user,
+                        )
+                        if existing is not None:
+                            skipped += 1
+                            continue
+                        seen_idempotency_keys.add(idempotency_key)
+
                     from pdm_memory.storage.schema import hash_fact_text
 
                     if dedupe:
+                        fact_hash = hash_fact_text(text[:500])
+                        if fact_hash in seen_hashes:
+                            skipped += 1
+                            continue
                         existing = self._storage.find_by_hash(
-                            hash_fact_text(text[:500]), user=self._user
+                            fact_hash, user=self._user
                         )
                         if existing is not None:
                             if dedupe_reinforce:
                                 self.reinforce(existing.id)
                             skipped += 1
+                            seen_hashes.add(fact_hash)
                             continue
+                        seen_hashes.add(fact_hash)
 
-                    self.save(
+                    sig = self._build_signature_record(
                         text,
                         source=str(item.get("source") or "batch"),
                         tags=item.get("tags") or item.get("intent_tags"),
@@ -356,11 +365,35 @@ class Memory:
                         deadline=item.get("deadline") or item.get("t_deadline"),
                         event_at=item.get("event_at") or item.get("t_event_at"),
                         metadata=item.get("metadata"),
-                        dedupe=False,
+                        phase_privilege=float(item.get("phase_privilege", 1.0)),
+                        idempotency_key=idempotency_key or None,
                     )
-                    saved += 1
+                    sig = self._run_pre_save_hooks(sig)
+                    sigs_to_save.append(sig)
                 except Exception:
                     errors += 1
+
+            if sigs_to_save:
+                try:
+                    save_results = self._storage.save_many(sigs_to_save)
+                except Exception as exc:
+                    logger.warning("[PDM] save_many storage batch failed: %s", exc)
+                    errors += len(sigs_to_save)
+                else:
+                    if len(save_results) != len(sigs_to_save):
+                        logger.warning(
+                            "[PDM] save_many result mismatch saved=%d returned=%d",
+                            len(sigs_to_save),
+                            len(save_results),
+                        )
+                    for sig, result in zip(sigs_to_save, save_results):
+                        if result.error is None:
+                            saved += 1
+                            self._run_post_save_hooks(sig, result.id or sig.id)
+                        else:
+                            errors += 1
+                    if len(save_results) < len(sigs_to_save):
+                        errors += len(sigs_to_save) - len(save_results)
 
         logger.info("[PDM] save_many saved=%d skipped=%d errors=%d", saved, skipped, errors)
         return {"saved": saved, "skipped": skipped, "errors": errors}
@@ -472,49 +505,21 @@ class Memory:
         if rec is None:
             raise ValueError(f"Memory '{memory_id}' not found for user '{self._user}'")
 
-        fields: dict[str, Any] = {}
-        if text is not None:
-            if not text.strip():
-                raise ValueError("Memory text cannot be empty.")
-            from pdm_memory.storage.schema import encode_compressed_fact
-
-            trimmed = text.strip()[:500]
-            store_raw = getattr(self._storage, "store_raw", True)
-            stored, text_hash = encode_compressed_fact(trimmed, store_raw=store_raw)
-            fields["compressed_fact"] = stored
-            fields["compressed_fact_hash"] = text_hash
-        if tags is not None:
-            fields["intent_tags"] = tags
-            fields["domain"] = infer_domain(tags)
-        if p_magnitude is not None:
-            if not 0.0 <= p_magnitude <= 100.0:
-                raise ValueError("p_magnitude must be between 0 and 100")
-            fields["p_magnitude"] = p_magnitude
-        if t_persistence is not None:
-            fields["t_persistence"] = t_persistence
-        if drawer is not None:
-            fields["drawer_domain"] = drawer
-        if regime is not None:
-            fields["question_regime"] = regime
-        if source is not None:
-            fields["source"] = source
-        if metadata is not None:
-            fields["metadata"] = {**(rec.metadata or {}), **metadata}
-        if deadline is not None:
-            fields["t_deadline"] = deadline
-        if event_at is not None:
-            fields["t_event_at"] = event_at
-        elif deadline is not None and rec.t_event_at is None:
-            # Same backfill rule as save(): deadline implies event when unset
-            fields["t_event_at"] = deadline
-
+        fields = self._build_update_fields(
+            rec,
+            text=text,
+            tags=tags,
+            p_magnitude=p_magnitude,
+            t_persistence=t_persistence,
+            drawer=drawer,
+            regime=regime,
+            source=source,
+            metadata=metadata,
+            deadline=deadline,
+            event_at=event_at,
+        )
         if not fields:
             raise ValueError("At least one field must be provided to update()")
-
-        new_p = fields.get("p_magnitude", rec.p_magnitude)
-        new_t = fields.get("t_persistence", rec.t_persistence)
-        if "p_magnitude" in fields or "t_persistence" in fields:
-            fields["effective_spike"] = calculate_effective_spike(new_p, new_t, rec.phase_privilege)
 
         self._storage.update(memory_id, user=self._user, **fields)
         updated = self._storage.get(memory_id, user=self._user)
@@ -522,6 +527,75 @@ class Memory:
             raise ValueError(f"Memory '{memory_id}' not found after update")
         logger.debug("[PDM] update(%s) fields=%s", memory_id[:8], sorted(fields))
         return self._record_to_hit(updated)
+
+    def update_batch(
+        self,
+        updates: builtins.list[tuple[str, dict[str, Any]]],
+    ) -> dict[str, int]:
+        """
+        Batch-update multiple memories in one storage batch when supported.
+
+        Each tuple is ``(memory_id, fields)`` where ``fields`` may use the same
+        public keys as :meth:`update` (``text``, ``tags``, ``drawer``, etc.) or
+        storage-facing aliases such as ``compressed_fact`` / ``intent_tags``.
+
+        Returns:
+            Dict with ``updated``, ``skipped``, ``errors`` counts.
+        """
+        updated = 0
+        skipped = 0
+        errors = 0
+        prepared_updates: list[tuple[str, dict[str, Any]]] = []
+
+        for memory_id, raw_fields in updates:
+            try:
+                rec = self._storage.get(memory_id, user=self._user)
+                if rec is None:
+                    errors += 1
+                    continue
+
+                fields = self._normalize_batch_update_fields(rec, raw_fields)
+                if not fields:
+                    skipped += 1
+                    continue
+
+                prepared_updates.append((memory_id, fields))
+            except Exception:
+                errors += 1
+
+        if prepared_updates:
+            results = self._storage.update_batch(prepared_updates, user=self._user)
+            for res in results:
+                if res.error is None:
+                    updated += 1
+                else:
+                    errors += 1
+
+        logger.info("[PDM] update_batch updated=%d skipped=%d errors=%d", updated, skipped, errors)
+        return {"updated": updated, "skipped": skipped, "errors": errors}
+
+    def update_many(self, items: builtins.list[dict[str, Any]]) -> dict[str, int]:
+        """
+        Convenience wrapper around :meth:`update_batch`.
+
+        Each item must include ``id`` or ``memory_id`` plus any update fields.
+        Returns:
+            Dict with ``updated``, ``skipped``, ``errors`` counts.
+        """
+        updates: list[tuple[str, dict[str, Any]]] = []
+        errors = 0
+
+        for item in items:
+            memory_id = str(item.get("memory_id") or item.get("id") or "").strip()
+            if not memory_id:
+                errors += 1
+                continue
+            fields = {k: v for k, v in item.items() if k not in {"id", "memory_id"}}
+            updates.append((memory_id, fields))
+
+        counts = self.update_batch(updates)
+        counts["errors"] += errors
+        return counts
 
     def recall(
         self,
@@ -865,14 +939,22 @@ class Memory:
         reconciled_kinds: list[str] = []
         consumed: set[str] = set()
 
+        # Prefetch all records needed by the reconcile loop in one bulk query
+        # (2*N get() calls → 1 get_many() call regardless of candidate count).
+        all_ids: set[str] = set()
+        for report in candidates:
+            all_ids.add(report.signature_a_id)
+            all_ids.add(report.signature_b_id)
+        records = self._storage.get_many(list(all_ids), user=self._user)
+
         for report in candidates:
             a_id = report.signature_a_id
             b_id = report.signature_b_id
             if a_id in consumed or b_id in consumed:
                 skipped += 1
                 continue
-            rec_a = self._storage.get(a_id, user=self._user)
-            rec_b = self._storage.get(b_id, user=self._user)
+            rec_a = records.get(a_id)
+            rec_b = records.get(b_id)
             if rec_a is None or rec_b is None:
                 skipped += 1
                 continue
@@ -1361,6 +1443,158 @@ class Memory:
     # Private helpers
     # ------------------------------------------------------------------
 
+    def _build_signature_record(
+        self,
+        text: str,
+        *,
+        source: str = "chat",
+        tags: builtins.list[str] | None = None,
+        p_magnitude: float = 50.0,
+        t_persistence: float = 30.0,
+        drawer: str = "general",
+        regime: str = "neutral",
+        phase_privilege: float = 1.0,
+        deadline: datetime | None = None,
+        event_at: datetime | None = None,
+        metadata: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+    ) -> SignatureRecord:
+        resolved_tags = tags or []
+        domain = infer_domain(resolved_tags)
+        eff_spike = calculate_effective_spike(p_magnitude, t_persistence, phase_privilege)
+
+        # Companion parity: a future deadline without event_at still needs an
+        # event timestamp for temporal-window recall.
+        resolved_event = event_at
+        if resolved_event is None and deadline is not None:
+            resolved_event = deadline
+
+        return SignatureRecord(
+            user=self._user,
+            compressed_fact=text,
+            source=source,
+            p_magnitude=p_magnitude,
+            t_persistence=t_persistence,
+            phase_privilege=phase_privilege,
+            effective_spike=eff_spike,
+            intent_tags=resolved_tags,
+            question_regime=regime,
+            domain=domain,
+            drawer_domain=drawer,
+            decay_rate=0.9,
+            t_deadline=deadline,
+            t_event_at=resolved_event,
+            metadata=metadata or {},
+            idempotency_key=idempotency_key.strip() if idempotency_key else None,
+        )
+
+    def _build_update_fields(
+        self,
+        rec: SignatureRecord,
+        *,
+        text: str | None = None,
+        tags: builtins.list[str] | None = None,
+        p_magnitude: float | None = None,
+        t_persistence: float | None = None,
+        drawer: str | None = None,
+        regime: str | None = None,
+        source: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        deadline: datetime | None = None,
+        event_at: datetime | None = None,
+        extra_fields: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        fields: dict[str, Any] = dict(extra_fields or {})
+        if text is not None:
+            if not text.strip():
+                raise ValueError("Memory text cannot be empty.")
+            from pdm_memory.storage.schema import encode_compressed_fact
+
+            trimmed = text.strip()[:500]
+            store_raw = getattr(self._storage, "store_raw", True)
+            stored, text_hash = encode_compressed_fact(trimmed, store_raw=store_raw)
+            fields["compressed_fact"] = stored
+            fields["compressed_fact_hash"] = text_hash
+        if tags is not None:
+            fields["intent_tags"] = tags
+            fields["domain"] = infer_domain(tags)
+        if p_magnitude is not None:
+            if not 0.0 <= p_magnitude <= 100.0:
+                raise ValueError("p_magnitude must be between 0 and 100")
+            fields["p_magnitude"] = p_magnitude
+        if t_persistence is not None:
+            fields["t_persistence"] = t_persistence
+        if drawer is not None:
+            fields["drawer_domain"] = drawer
+        if regime is not None:
+            fields["question_regime"] = regime
+        if source is not None:
+            fields["source"] = source
+        if metadata is not None:
+            fields["metadata"] = {**(rec.metadata or {}), **metadata}
+        if deadline is not None:
+            fields["t_deadline"] = deadline
+        if event_at is not None:
+            fields["t_event_at"] = event_at
+        elif deadline is not None and rec.t_event_at is None:
+            # Same backfill rule as save(): deadline implies event when unset.
+            fields["t_event_at"] = deadline
+
+        if any(key in fields for key in ("p_magnitude", "t_persistence", "phase_privilege")):
+            new_p = fields.get("p_magnitude", rec.p_magnitude)
+            new_t = fields.get("t_persistence", rec.t_persistence)
+            new_phase = fields.get("phase_privilege", rec.phase_privilege)
+            fields["effective_spike"] = calculate_effective_spike(new_p, new_t, new_phase)
+        return fields
+
+    def _normalize_batch_update_fields(
+        self,
+        rec: SignatureRecord,
+        raw_fields: dict[str, Any],
+    ) -> dict[str, Any]:
+        fields = dict(raw_fields)
+        text = fields.pop("text", None)
+        if text is None and "compressed_fact" in fields:
+            text = fields.pop("compressed_fact")
+
+        tags = fields.pop("tags", None)
+        if tags is None and "intent_tags" in fields:
+            tags = fields.pop("intent_tags")
+
+        drawer = fields.pop("drawer", None)
+        if drawer is None and "drawer_domain" in fields:
+            drawer = fields.pop("drawer_domain")
+
+        regime = fields.pop("regime", None)
+        if regime is None and "question_regime" in fields:
+            regime = fields.pop("question_regime")
+
+        deadline = fields.pop("deadline", None)
+        if deadline is None and "t_deadline" in fields:
+            deadline = fields.pop("t_deadline")
+
+        event_at = fields.pop("event_at", None)
+        if event_at is None and "t_event_at" in fields:
+            event_at = fields.pop("t_event_at")
+
+        source = fields.pop("source", None) if "source" in fields else None
+        metadata = fields.pop("metadata", None) if "metadata" in fields else None
+
+        return self._build_update_fields(
+            rec,
+            text=text,
+            tags=tags,
+            p_magnitude=fields.pop("p_magnitude", None),
+            t_persistence=fields.pop("t_persistence", None),
+            drawer=drawer,
+            regime=regime,
+            source=source,
+            metadata=metadata,
+            deadline=deadline,
+            event_at=event_at,
+            extra_fields=fields,
+        )
+
     def _load_recall_candidates(
         self,
         *,
@@ -1461,7 +1695,10 @@ class Memory:
             )
         if batch_updates:
             try:
-                self._storage.update_batch(batch_updates, user=self._user)
+                results = self._storage.update_batch(batch_updates, user=self._user)
+                for res in results:
+                    if res.error:
+                        logger.warning("[PDM] torsion V penalty failed for %s: %s", res.id, res.error)
             except Exception as e:
                 logger.warning("[PDM] torsion V penalty batch failed: %s", e)
 
@@ -1499,6 +1736,9 @@ class Memory:
 
         if batch_updates:
             try:
-                self._storage.update_batch(batch_updates, user=self._user)
+                results = self._storage.update_batch(batch_updates, user=self._user)
+                for res in results:
+                    if res.error:
+                        logger.warning("[PDM] reinforcement update failed for %s: %s", res.id, res.error)
             except Exception as e:
                 logger.warning("[PDM] reinforcement batch update failed: %s", e)

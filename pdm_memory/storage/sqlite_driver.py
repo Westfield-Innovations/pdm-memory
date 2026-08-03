@@ -28,20 +28,68 @@ import json
 import logging
 import sqlite3
 import threading
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from pdm_memory.core.signature import DrawerInfo, SignatureRecord
-from pdm_memory.storage.base import BaseStorage
+from pdm_memory.storage.base import BaseStorage, SaveBatchResult, UpdateBatchResult
 from pdm_memory.storage.schema import (
     SCHEMA_SQLITE,
-    UPDATABLE_COLUMNS,
     apply_sqlite_migrations,
     mapping_to_record,
+    prepare_update_fields,
+    signature_insert_row,
 )
 
 logger = logging.getLogger(__name__)
+
+
+_INSERT_SIGNATURE_SQL = """
+INSERT OR IGNORE INTO pdm_signatures (
+    id, user, compressed_fact, compressed_fact_hash, source,
+    p_magnitude, t_persistence, phase_privilege, effective_spike,
+    intent_tags, question_regime, domain, drawer_domain,
+    retrieval_count, last_retrieved, created_at,
+    validation_prediction_total, validation_prediction_correct,
+    decay_rate, t_deadline, t_event_at, urgency_rate, metadata,
+    is_deleted, idempotency_key
+) VALUES (
+    ?, ?, ?, ?, ?,
+    ?, ?, ?, ?,
+    ?, ?, ?, ?,
+    ?, ?, ?,
+    ?, ?,
+    ?, ?, ?, ?, ?,
+    ?, ?
+)
+"""
+
+
+_BULK_INSERT_SIGNATURE_SQL = """
+INSERT INTO pdm_signatures (
+    id, user, compressed_fact, compressed_fact_hash, source,
+    p_magnitude, t_persistence, phase_privilege, effective_spike,
+    intent_tags, question_regime, domain, drawer_domain,
+    retrieval_count, last_retrieved, created_at,
+    validation_prediction_total, validation_prediction_correct,
+    decay_rate, t_deadline, t_event_at, urgency_rate, metadata,
+    is_deleted, idempotency_key
+) VALUES (
+    ?, ?, ?, ?, ?,
+    ?, ?, ?, ?,
+    ?, ?, ?, ?,
+    ?, ?, ?,
+    ?, ?,
+    ?, ?, ?, ?, ?,
+    ?, ?
+) ON CONFLICT(id) DO NOTHING
+"""
+
+_INSERT_DRAWER_SQL = """
+INSERT OR IGNORE INTO pdm_drawers (domain, user, description)
+VALUES (?, ?, ?)
+"""
 
 
 def _now_iso() -> str:
@@ -67,11 +115,12 @@ class SQLiteDriver(BaseStorage):
                     stored — the text itself never touches disk.
     """
 
+    _CHUNK_SIZE = 500
+
     def __init__(self, db_path: str = "./pdm_memory.db", store_raw: bool = True) -> None:
         self.db_path = db_path
         self.store_raw = store_raw
         self._local = threading.local()
-        # Initialise schema on startup
         conn = self._conn()
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA_SQLITE)
@@ -80,7 +129,7 @@ class SQLiteDriver(BaseStorage):
         logger.debug("[PDM-SQLite] Opened %s (store_raw=%s)", db_path, store_raw)
 
     @contextmanager
-    def transaction(self) -> Iterator[None]:
+    def transaction(self) -> Generator[None]:
         """Atomic batch — defer commits until context exit."""
         conn = self._conn()
         depth = getattr(self._local, "txn_depth", 0)
@@ -101,6 +150,29 @@ class SQLiteDriver(BaseStorage):
     def _commit_if_idle(self, conn: sqlite3.Connection) -> None:
         if getattr(self._local, "txn_depth", 0) == 0:
             conn.commit()
+
+    def _find_existing_ids(
+        self,
+        conn: sqlite3.Connection,
+        user: str,
+        ids: builtins.list[str],
+    ) -> set[str]:
+        """Return existing signature IDs for *user* among *ids* in chunks."""
+        if not ids:
+            return set()
+
+        existing_ids: set[str] = set()
+        chunk_size = self._CHUNK_SIZE
+        for chunk_start in range(0, len(ids), chunk_size):
+            chunk_ids = ids[chunk_start : chunk_start + chunk_size]
+            placeholders = ",".join("?" * len(chunk_ids))
+            rows = conn.execute(
+                f"SELECT id FROM pdm_signatures WHERE user = ? AND id IN ({placeholders})",
+                [user, *chunk_ids],
+            ).fetchall()
+            existing_ids.update(row[0] for row in rows)
+        return existing_ids
+
 
     # ------------------------------------------------------------------
     # Connection management (one connection per thread)
@@ -192,12 +264,148 @@ class SQLiteDriver(BaseStorage):
         logger.debug("[PDM-SQLite] Saved signature %s (P=%.1f)", sig.id, sig.p_magnitude)
         return sig.id
 
+    def save_batch(self, sigs: builtins.list[SignatureRecord]) -> builtins.list[SaveBatchResult]:
+        """Bulk-insert *sigs* in chunks of :attr:`_CHUNK_SIZE`.
+
+        Strategy (SQLite-specific):
+
+        1. **In-batch dedup** — duplicate *id* values within *sigs* itself are
+           rejected early (``"Duplicate id in batch"``).
+        2. **Pre-check SELECT** — for each chunk, one ``SELECT id … WHERE id IN
+           (…)`` query discovers ids already present in the DB; those receive
+           ``SaveBatchResult(id=None, error="Duplicate id already exists")``.
+        3. **executemany INSERT … ON CONFLICT(id) DO NOTHING** — true bulk
+           insert for the survivors.  The ``ON CONFLICT`` clause is a silent
+           safety net for any rare race between steps 2 and 3; it prevents
+           ``IntegrityError`` from aborting the whole transaction.
+        4. If ``cur.rowcount`` for a chunk is less than expected (race
+           occurred), a ``WARNING`` is emitted.  Per-row attribution is not
+           possible without ``RETURNING`` per-row support in sqlite3.
+        5. Drawers for inserted sigs are upserted via a single ``executemany``.
+        """
+        if not sigs:
+            return []
+
+        results = [SaveBatchResult(index=i, id=None) for i in range(len(sigs))]
+
+        seen_ids: set[str] = set()
+        pending: list[tuple[int, SignatureRecord]] = []
+        for index, sig in enumerate(sigs):
+            if sig.id in seen_ids:
+                results[index] = SaveBatchResult(
+                    index=index,
+                    id=None,
+                    error="Duplicate id in batch",
+                )
+                continue
+            seen_ids.add(sig.id)
+            pending.append((index, sig))
+
+        if not pending:
+            return results
+
+        conn = self._conn()
+        chunk_size = self._CHUNK_SIZE
+
+        with self.transaction():
+            seen_drawers: set[tuple[str, str]] = set()
+
+            for chunk_start in range(0, len(pending), chunk_size):
+                chunk = pending[chunk_start : chunk_start + chunk_size]
+
+                chunk_by_user: dict[str, list[tuple[int, SignatureRecord]]] = {}
+                for idx, sig in chunk:
+                    chunk_by_user.setdefault(sig.user, []).append((idx, sig))
+
+                existing_ids: set[str] = set()
+                for user, user_items in chunk_by_user.items():
+                    ids_for_user = [sig.id for _, sig in user_items]
+                    existing_ids.update(self._find_existing_ids(conn, user, ids_for_user))
+
+                to_insert: list[tuple[int, SignatureRecord]] = []
+                for idx, sig in chunk:
+                    if sig.id in existing_ids:
+                        results[idx] = SaveBatchResult(
+                            index=idx,
+                            id=None,
+                            error="Duplicate id already exists",
+                        )
+                    else:
+                        to_insert.append((idx, sig))
+
+                if not to_insert:
+                    continue
+
+                insert_rows = [
+                    signature_insert_row(sig, store_raw=self.store_raw)
+                    for _, sig in to_insert
+                ]
+                cur = conn.executemany(_BULK_INSERT_SIGNATURE_SQL, insert_rows)
+
+                if cur.rowcount != len(to_insert):
+                    logger.warning(
+                        "[PDM-SQLite] save_batch chunk inserted %d/%d rows "
+                        "(possible race on ids: %s)",
+                        cur.rowcount,
+                        len(to_insert),
+                        [sig.id for _, sig in to_insert],
+                    )
+
+                for idx, sig in to_insert:
+                    results[idx] = SaveBatchResult(index=idx, id=sig.id)
+                    drawer_key = (sig.drawer_domain, sig.user)
+                    seen_drawers.add(drawer_key)
+
+            if seen_drawers:
+                conn.executemany(
+                    _INSERT_DRAWER_SQL,
+                    [(domain, user, "") for domain, user in seen_drawers],
+                )
+
+        return results
+
     def get(self, memory_id: str, user: str = "default") -> SignatureRecord | None:
         row = self._conn().execute(
             "SELECT * FROM pdm_signatures WHERE id = ? AND user = ? AND is_deleted = 0",
             (memory_id, user),
         ).fetchone()
         return mapping_to_record(row) if row else None
+
+    def get_many(
+        self,
+        ids: builtins.list[str],
+        user: str = "default",
+    ) -> dict[str, SignatureRecord]:
+        """Bulk-fetch via WHERE id IN (...), chunked by _CHUNK_SIZE.
+
+        Strategy:
+        1. De-dup *ids* (preserve order via dict.fromkeys).
+        2. For each chunk of :attr:`_CHUNK_SIZE`, run one
+           ``SELECT * … WHERE user = ? AND id IN (…) AND is_deleted = 0``.
+           The ``idx_pdm_user_id`` covering index ensures O(k log N) lookup.
+        3. Return a dict keyed by id; missing / foreign-user ids are simply
+           absent — no error, since "not found" is an expected outcome here.
+        """
+        if not ids:
+            return {}
+
+        unique_ids = list(dict.fromkeys(ids))
+        result: dict[str, SignatureRecord] = {}
+        conn = self._conn()
+
+        for start in range(0, len(unique_ids), self._CHUNK_SIZE):
+            chunk = unique_ids[start : start + self._CHUNK_SIZE]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT * FROM pdm_signatures WHERE user = ? AND id IN ({placeholders}) "
+                "AND is_deleted = 0",
+                [user, *chunk],
+            ).fetchall()
+            for row in rows:
+                rec = mapping_to_record(row)
+                result[rec.id] = rec
+
+        return result
 
     def find_by_hash(self, text_hash: str, user: str = "default") -> SignatureRecord | None:
         row = self._conn().execute(
@@ -229,7 +437,7 @@ class SQLiteDriver(BaseStorage):
 
     def update(self, memory_id: str, user: str = "default", **fields) -> None:
         """Update whitelisted columns for ``memory_id`` owned by ``user``."""
-        prepared = self._prepare_update_fields(fields)
+        prepared = prepare_update_fields(fields)
         if not prepared:
             return
 
@@ -251,61 +459,84 @@ class SQLiteDriver(BaseStorage):
         self,
         updates: builtins.list[tuple[str, dict]],
         user: str = "default",
-    ) -> None:
-        """Batch-update with the same whitelist + user scope as :meth:`update`."""
+    ) -> builtins.list[UpdateBatchResult]:
+        """Batch-update with the same whitelist + user scope as :meth:`update`.
+
+        Strategy (SQLite-specific — no per-row RETURNING from executemany):
+
+        1. **Pre-check SELECT** — one query per chunk discovers which
+           *memory_id* values actually exist in the DB for *user*.  Missing
+           ids are immediately assigned
+           ``UpdateBatchResult(error="Memory not found or wrong user")``.
+        2. **executemany UPDATE** — runs only for confirmed-existing ids.
+           A ``rowcount`` warning fires on the rare race between steps 1 and 2.
+        """
         if not updates:
-            return
+            return []
+
+        results = [
+            UpdateBatchResult(index=i, id=memory_id)
+            for i, (memory_id, _) in enumerate(updates)
+        ]
+        index_map: dict[str, int] = {
+            memory_id: i for i, (memory_id, _) in enumerate(updates)
+        }
+        grouped_updates: dict[tuple[str, ...], list[tuple[str, tuple]]] = {}
+        for index, (memory_id, fields) in enumerate(updates):
+            try:
+                prepared = prepare_update_fields(fields)
+                if not prepared:
+                    continue
+                columns = tuple(sorted(prepared))
+                params = tuple(prepared[col] for col in columns) + (memory_id, user)
+                grouped_updates.setdefault(columns, []).append((memory_id, params))
+            except Exception as exc:
+                results[index] = UpdateBatchResult(index=index, id=memory_id, error=str(exc))
+
+        if not grouped_updates:
+            return results
+
+        all_ids: list[str] = list(
+            {mid for entries in grouped_updates.values() for mid, _ in entries}
+        )
+
         conn = self._conn()
-        for memory_id, fields in updates:
-            prepared = self._prepare_update_fields(fields)
-            if not prepared:
-                continue
-            set_clause = ", ".join(f"{col} = ?" for col in prepared)
-            values = list(prepared.values()) + [memory_id, user]
-            cur = conn.execute(
-                f"UPDATE pdm_signatures SET {set_clause} WHERE id = ? AND user = ?",
-                values,
+
+        existing_ids = self._find_existing_ids(conn, user, all_ids)
+
+        missing_ids = set(all_ids) - existing_ids
+        for mid in missing_ids:
+            idx = index_map[mid]
+            results[idx] = UpdateBatchResult(
+                index=idx,
+                id=mid,
+                error="Memory not found or wrong user",
             )
-            if cur.rowcount == 0:
-                logger.warning(
-                    "[PDM-SQLite] update_batch(%s) affected 0 rows (user=%s)",
-                    memory_id,
-                    user,
+        with self.transaction():
+            for columns, entries in grouped_updates.items():
+                confirmed = [(mid, params) for mid, params in entries if mid in existing_ids]
+                if not confirmed:
+                    continue
+
+                set_clause = ", ".join(f"{col} = ?" for col in columns)
+                param_rows = [params for _, params in confirmed]
+                cur = conn.executemany(
+                    f"UPDATE pdm_signatures SET {set_clause} WHERE id = ? AND user = ?",
+                    param_rows,
                 )
-        self._commit_if_idle(conn)
 
-    @staticmethod
-    def _prepare_update_fields(fields: dict) -> dict:
-        """
-        Validate column names against whitelist and serialise JSON/datetime.
+                if cur.rowcount not in (-1, len(confirmed)):
+                    logger.warning(
+                        "[PDM-SQLite] update_batch touched %s/%s rows "
+                        "(user=%s columns=%s); possible race on ids: %s",
+                        cur.rowcount,
+                        len(confirmed),
+                        user,
+                        list(columns),
+                        [mid for mid, _ in confirmed],
+                    )
 
-        Raises:
-            ValueError: If any key is not an allowed column (blocks SQL injection).
-        """
-        if not fields:
-            return {}
-
-        unknown = set(fields) - UPDATABLE_COLUMNS
-        if unknown:
-            raise ValueError(
-                f"Refusing to update non-whitelisted column(s): {sorted(unknown)}. "
-                f"Allowed: {sorted(UPDATABLE_COLUMNS)}"
-            )
-
-        prepared: dict = {}
-        for col, value in fields.items():
-            if col == "intent_tags" or col == "metadata":
-                prepared[col] = json.dumps(value)
-            elif col in (
-                "last_retrieved",
-                "created_at",
-                "t_deadline",
-                "t_event_at",
-            ) and isinstance(value, datetime):
-                prepared[col] = value.isoformat()
-            else:
-                prepared[col] = value
-        return prepared
+        return results
 
     def delete(self, memory_id: str, user: str = "default") -> None:
         conn = self._conn()
