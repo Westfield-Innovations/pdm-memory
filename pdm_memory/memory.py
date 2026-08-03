@@ -35,23 +35,12 @@ from __future__ import annotations
 import builtins
 import logging
 import os
-from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from typing_extensions import Self
 
-from pdm_memory.core.math import (
-    DECAY_DELETE_THRESHOLD,
-    calculate_decay_factor,
-    calculate_effective_spike,
-    calculate_intent_weight,
-    calculate_p_effective,
-    calculate_v,
-    infer_domain,
-    resolve_half_life,
-)
 from pdm_memory.core.retrieval import DEFAULT_DIVERSITY_BIAS, RetrievalEngine
 from pdm_memory.core.signature import (
     DrawerInfo,
@@ -218,88 +207,26 @@ class Memory:
         dedupe_reinforce: bool = False,
         idempotency_key: str | None = None,
     ) -> str:
-        """
-        Store a new memory.
+        """Store a new memory. See ``memory_ops.write.save_memory``."""
+        from pdm_memory.memory_ops.write import save_memory
 
-        The raw text is compressed into a SignatureRecord with PDM pressure fields.
-        Only the text you supply is stored — no AI call is made in this method.
-
-        Args:
-            text:           The memory content (max 500 chars recommended).
-            source:         Origin label: "chat", "manual", "csv", etc.
-            tags:           Intent tags (3+ recommended for best retrieval).
-            p_magnitude:    Initial pressure / importance (0–100).
-            t_persistence:  Days this memory stays relevant before decaying.
-            drawer:         Category drawer name (e.g. "preferences", "facts").
-            regime:         Context regime: "neutral", "trading", "engineering", etc.
-            phase_privilege: Nesting multiplier (usually 1.0).
-            deadline:       Optional due datetime (PDM-T ``t_deadline`` — pressure cliff).
-            event_at:       Optional event datetime (PDM-T ``t_event_at`` — when it
-                            happened / will happen; powers "what was yesterday").
-            metadata:       Arbitrary extra data attached to the memory.
-            dedupe:         If True, return existing ID when fact hash already stored.
-            dedupe_reinforce: When dedupe hits, call reinforce() on the existing memory.
-            idempotency_key:  If set, repeated saves with the same key return the existing ID.
-
-        Returns:
-            The new memory ID (UUID string), or existing ID if dedupe matched.
-        """
-        if not text or not text.strip():
-            raise ValueError("Memory text cannot be empty.")
-
-        text = text.strip()[:500]
-
-        if idempotency_key:
-            key = idempotency_key.strip()
-            if key:
-                existing = self._storage.find_by_idempotency_key(key, user=self._user)
-                if existing is not None:
-                    logger.debug("[PDM] save() idempotency → %s", existing.id[:8])
-                    return existing.id
-
-        if dedupe:
-            from pdm_memory.storage.schema import hash_fact_text
-
-            existing = self._storage.find_by_hash(hash_fact_text(text), user=self._user)
-            if existing is not None:
-                if dedupe_reinforce:
-                    self.reinforce(existing.id)
-                logger.debug("[PDM] save() dedupe → %s", existing.id[:8])
-                return existing.id
-
-        resolved_tags = tags or []
-        domain = infer_domain(resolved_tags)
-        eff_spike = calculate_effective_spike(p_magnitude, t_persistence, phase_privilege)
-
-        # Companion parity: a future deadline without event_at still needs an
-        # event timestamp for temporal-window recall.
-        resolved_event = event_at
-        if resolved_event is None and deadline is not None:
-            resolved_event = deadline
-
-        sig = SignatureRecord(
-            user=self._user,
-            compressed_fact=text,
+        return save_memory(
+            self,
+            text,
             source=source,
+            tags=tags,
             p_magnitude=p_magnitude,
             t_persistence=t_persistence,
+            drawer=drawer,
+            regime=regime,
             phase_privilege=phase_privilege,
-            effective_spike=eff_spike,
-            intent_tags=resolved_tags,
-            question_regime=regime,
-            domain=domain,
-            drawer_domain=drawer,
-            decay_rate=0.9,
-            t_deadline=deadline,
-            t_event_at=resolved_event,
-            metadata=metadata or {},
-            idempotency_key=idempotency_key.strip() if idempotency_key else None,
+            deadline=deadline,
+            event_at=event_at,
+            metadata=metadata,
+            dedupe=dedupe,
+            dedupe_reinforce=dedupe_reinforce,
+            idempotency_key=idempotency_key,
         )
-        sig = self._run_pre_save_hooks(sig)
-        memory_id = self._storage.save(sig)
-        self._run_post_save_hooks(sig, memory_id)
-        logger.debug("[PDM] save() → %s (P=%.1f)", memory_id, p_magnitude)
-        return memory_id
 
     def save_many(
         self,
@@ -308,62 +235,12 @@ class Memory:
         dedupe: bool = True,
         dedupe_reinforce: bool = False,
     ) -> dict[str, int]:
-        """
-        Batch-save multiple memories in one storage transaction when supported.
+        """Batch-save multiple memories. See ``memory_ops.write.save_many_memories``."""
+        from pdm_memory.memory_ops.write import save_many_memories
 
-        Each item accepts the same keys as :meth:`save` (``text``, ``tags``,
-        ``p_magnitude``, ``drawer``, ``source``, ``regime``, ``t_persistence``,
-        ``metadata``, ``deadline``, ``event_at``).
-
-        Returns:
-            Dict with ``saved``, ``skipped``, ``errors`` counts.
-        """
-        saved = 0
-        skipped = 0
-        errors = 0
-
-        txn = getattr(self._storage, "transaction", None)
-        ctx: AbstractContextManager[None] = txn() if callable(txn) else nullcontext()
-
-        with ctx:
-            for item in items:
-                try:
-                    text = str(item.get("text") or item.get("compressed_fact") or "").strip()
-                    if not text:
-                        errors += 1
-                        continue
-
-                    from pdm_memory.storage.schema import hash_fact_text
-
-                    if dedupe:
-                        existing = self._storage.find_by_hash(
-                            hash_fact_text(text[:500]), user=self._user
-                        )
-                        if existing is not None:
-                            if dedupe_reinforce:
-                                self.reinforce(existing.id)
-                            skipped += 1
-                            continue
-
-                    self.save(
-                        text,
-                        source=str(item.get("source") or "batch"),
-                        tags=item.get("tags") or item.get("intent_tags"),
-                        p_magnitude=float(item.get("p_magnitude", 50.0)),
-                        t_persistence=float(item.get("t_persistence", 30.0)),
-                        drawer=str(item.get("drawer") or item.get("drawer_domain") or "general"),
-                        regime=str(item.get("regime") or item.get("question_regime") or "neutral"),
-                        deadline=item.get("deadline") or item.get("t_deadline"),
-                        event_at=item.get("event_at") or item.get("t_event_at"),
-                        metadata=item.get("metadata"),
-                        dedupe=False,
-                    )
-                    saved += 1
-                except Exception:
-                    errors += 1
-
-        logger.info("[PDM] save_many saved=%d skipped=%d errors=%d", saved, skipped, errors)
-        return {"saved": saved, "skipped": skipped, "errors": errors}
+        return save_many_memories(
+            self, items, dedupe=dedupe, dedupe_reinforce=dedupe_reinforce
+        )
 
     def export_json(
         self,
@@ -446,82 +323,23 @@ class Memory:
         deadline: datetime | None = None,
         event_at: datetime | None = None,
     ) -> MemoryHit:
-        """
-        Update whitelisted fields on an existing memory.
+        """Update whitelisted fields on an existing memory."""
+        from pdm_memory.memory_ops.mutate import update_memory
 
-        Args:
-            memory_id:   Target signature UUID.
-            text:        New fact text (max 500 chars).
-            tags:        Replacement intent tags (recomputes domain).
-            p_magnitude: New stored pressure (0–100).
-            t_persistence: New persistence half-life in days.
-            drawer:      New drawer / category name.
-            regime:      New question regime.
-            source:      New source label.
-            metadata:    Shallow-merged into existing metadata dict.
-            deadline:    New ``t_deadline`` (pass to clear with care — use storage).
-            event_at:    New ``t_event_at`` event timestamp.
-
-        Returns:
-            Updated MemoryHit with live P_effective.
-
-        Raises:
-            ValueError: Memory not found or no fields to update.
-        """
-        rec = self._storage.get(memory_id, user=self._user)
-        if rec is None:
-            raise ValueError(f"Memory '{memory_id}' not found for user '{self._user}'")
-
-        fields: dict[str, Any] = {}
-        if text is not None:
-            if not text.strip():
-                raise ValueError("Memory text cannot be empty.")
-            from pdm_memory.storage.schema import encode_compressed_fact
-
-            trimmed = text.strip()[:500]
-            store_raw = getattr(self._storage, "store_raw", True)
-            stored, text_hash = encode_compressed_fact(trimmed, store_raw=store_raw)
-            fields["compressed_fact"] = stored
-            fields["compressed_fact_hash"] = text_hash
-        if tags is not None:
-            fields["intent_tags"] = tags
-            fields["domain"] = infer_domain(tags)
-        if p_magnitude is not None:
-            if not 0.0 <= p_magnitude <= 100.0:
-                raise ValueError("p_magnitude must be between 0 and 100")
-            fields["p_magnitude"] = p_magnitude
-        if t_persistence is not None:
-            fields["t_persistence"] = t_persistence
-        if drawer is not None:
-            fields["drawer_domain"] = drawer
-        if regime is not None:
-            fields["question_regime"] = regime
-        if source is not None:
-            fields["source"] = source
-        if metadata is not None:
-            fields["metadata"] = {**(rec.metadata or {}), **metadata}
-        if deadline is not None:
-            fields["t_deadline"] = deadline
-        if event_at is not None:
-            fields["t_event_at"] = event_at
-        elif deadline is not None and rec.t_event_at is None:
-            # Same backfill rule as save(): deadline implies event when unset
-            fields["t_event_at"] = deadline
-
-        if not fields:
-            raise ValueError("At least one field must be provided to update()")
-
-        new_p = fields.get("p_magnitude", rec.p_magnitude)
-        new_t = fields.get("t_persistence", rec.t_persistence)
-        if "p_magnitude" in fields or "t_persistence" in fields:
-            fields["effective_spike"] = calculate_effective_spike(new_p, new_t, rec.phase_privilege)
-
-        self._storage.update(memory_id, user=self._user, **fields)
-        updated = self._storage.get(memory_id, user=self._user)
-        if updated is None:
-            raise ValueError(f"Memory '{memory_id}' not found after update")
-        logger.debug("[PDM] update(%s) fields=%s", memory_id[:8], sorted(fields))
-        return self._record_to_hit(updated)
+        return update_memory(
+            self,
+            memory_id,
+            text=text,
+            tags=tags,
+            p_magnitude=p_magnitude,
+            t_persistence=t_persistence,
+            drawer=drawer,
+            regime=regime,
+            source=source,
+            metadata=metadata,
+            deadline=deadline,
+            event_at=event_at,
+        )
 
     def recall(
         self,
@@ -564,54 +382,21 @@ class Memory:
         Returns:
             List[MemoryHit] ranked by relevance, length ≤ k.
         """
-        records = self._load_recall_candidates(
+        from pdm_memory.memory_ops.recall import run_recall
+
+        return run_recall(
+            self,
+            query,
+            k=k,
             min_pressure=min_pressure,
+            search_cost=search_cost,
             drawer=drawer,
+            reinforce=reinforce,
             candidate_limit=candidate_limit,
             page_size=page_size,
-        )
-        if not records:
-            ctx: dict[str, Any] = {
-                "query": query,
-                "k": k,
-                "hits": [],
-                "reinforced": False,
-                "min_pressure": min_pressure,
-                "search_cost": search_cost,
-                "drawer": drawer,
-                "diversity_bias": diversity_bias,
-            }
-            self._run_post_recall_hooks(ctx)
-            return []
-
-        hits = self._engine.recall(
-            records=records,
-            query=query,
-            k=k,
-            search_cost=search_cost,
             diversity_bias=diversity_bias,
+            on_recall=on_recall,
         )
-
-        if on_recall:
-            for hit in hits:
-                on_recall(hit)
-
-        reinforced = bool(reinforce and hits)
-        if reinforced:
-            self._apply_reinforcement(hits)
-
-        ctx = {
-            "query": query,
-            "k": k,
-            "hits": hits,
-            "reinforced": reinforced,
-            "min_pressure": min_pressure,
-            "search_cost": search_cost,
-            "drawer": drawer,
-            "diversity_bias": diversity_bias,
-        }
-        self._run_post_recall_hooks(ctx)
-        return hits
 
     def surface(
         self,
@@ -658,105 +443,16 @@ class Memory:
         )
 
     def reinforce(self, memory_id: str, coupling_score: float = 0.5) -> None:
-        """
-        Manually reinforce a memory (raise its pressure) and record a correct
-        prediction in the Validation Coefficient counters.
+        """Manually reinforce a memory (raise its pressure)."""
+        from pdm_memory.memory_ops.mutate import reinforce_memory
 
-        recall() calls this automatically for all returned hits when
-        ``reinforce=True`` (the default).  Call this explicitly to signal
-        that a memory-driven prediction turned out to be *correct*.
-
-        Each call increments both ``validation_prediction_total`` and
-        ``validation_prediction_correct``, which raises V and therefore
-        P_effective on the next retrieval.
-
-        Args:
-            memory_id:      The memory UUID to reinforce.
-            coupling_score: Coupling strength (0–1), influences Δp magnitude.
-        """
-        now = datetime.now(tz=timezone.utc)
-        atomic_reinforce = getattr(self._storage, "atomic_reinforce", None)
-        if callable(atomic_reinforce):
-            atomic_reinforce(
-                memory_id,
-                self._user,
-                compute_delta=lambda p, rc: self._engine.compute_reinforcement_delta(
-                    p, rc, coupling_score
-                ),
-                last_retrieved=now,
-            )
-            logger.debug("[PDM] reinforce(%s) atomic", memory_id)
-            return
-
-        rec = self._storage.get(memory_id, user=self._user)
-        if rec is None:
-            raise ValueError(f"Memory '{memory_id}' not found for user '{self._user}'")
-        delta = self._engine.compute_reinforcement_delta(
-            rec.p_magnitude, rec.retrieval_count, coupling_score
-        )
-        new_p = min(100.0, rec.p_magnitude + delta)
-        new_spike = calculate_effective_spike(new_p, rec.t_persistence, rec.phase_privilege)
-        new_total = (rec.validation_prediction_total or 0) + 1
-        new_correct = (rec.validation_prediction_correct or 0) + 1
-        self._storage.update(
-            memory_id,
-            user=self._user,
-            p_magnitude=new_p,
-            effective_spike=new_spike,
-            retrieval_count=(rec.retrieval_count or 0) + 1,
-            last_retrieved=now,
-            validation_prediction_total=new_total,
-            validation_prediction_correct=new_correct,
-        )
-        logger.debug(
-            "[PDM] reinforce(%s) Δp=+%.2f → P=%.1f  V_total=%d V_correct=%d",
-            memory_id, delta, new_p, new_total, new_correct,
-        )
+        reinforce_memory(self, memory_id, coupling_score=coupling_score)
 
     def penalize(self, memory_id: str, coupling_score: float = 0.5) -> None:
-        """
-        Penalise a memory after a *wrong* prediction and lower its authority.
+        """Penalize a memory (lower pressure / validation miss)."""
+        from pdm_memory.memory_ops.mutate import penalize_memory
 
-        This is the consequence signal **E*** described in the Correctability
-        Benchmark spec.  Call it when the memory that was used as the basis
-        for a prediction turned out to be **incorrect**.
-
-        Mechanically:
-        - Increments ``validation_prediction_total`` (prediction was made).
-        - Does **not** increment ``validation_prediction_correct`` (it was wrong).
-        - This lowers V = (correct+1)/(total+2), which lowers P_effective on
-          the next retrieval — the wrong signature loses authority over time.
-        - Also decrements ``p_magnitude`` by the same delta formula used in
-          reinforcement, so the raw pressure drops too.
-
-        Args:
-            memory_id:      The memory UUID to penalise.
-            coupling_score: Coupling strength (0–1), influences Δp magnitude.
-        """
-        rec = self._storage.get(memory_id, user=self._user)
-        if rec is None:
-            logger.warning("[PDM] penalize(%s): not found", memory_id)
-            return
-        delta = self._engine.compute_reinforcement_delta(
-            rec.p_magnitude, rec.retrieval_count, coupling_score
-        )
-        new_p = max(0.0, rec.p_magnitude - delta)
-        new_spike = calculate_effective_spike(new_p, rec.t_persistence, rec.phase_privilege)
-        new_total = (rec.validation_prediction_total or 0) + 1
-        # correct count stays the same — this was a wrong prediction
-        self._storage.update(
-            memory_id,
-            user=self._user,
-            p_magnitude=new_p,
-            effective_spike=new_spike,
-            retrieval_count=(rec.retrieval_count or 0) + 1,
-            last_retrieved=datetime.now(tz=timezone.utc),
-            validation_prediction_total=new_total,
-        )
-        logger.debug(
-            "[PDM] penalize(%s) Δp=-%.2f → P=%.1f  V_total=%d V_correct=%d",
-            memory_id, delta, new_p, new_total, rec.validation_prediction_correct or 0,
-        )
+        penalize_memory(self, memory_id, coupling_score=coupling_score)
 
     def delete(self, memory_id: str) -> bool:
 
@@ -780,49 +476,12 @@ class Memory:
         signature_b_id: str,
         reconciled_text: str,
     ) -> str:
-        """
-        Replace a torsion pair with one authoritative signature.
+        """Replace a torsion pair with one authoritative signature."""
+        from pdm_memory.memory_ops.mutate import reconcile_torsion_pair
 
-        Saves merged fact, then deletes both conflicting records.
-
-        Returns:
-            ID of the new reconciled signature.
-
-        Raises:
-            ValueError: Missing signatures or empty reconciled text.
-        """
-        rec_a = self._storage.get(signature_a_id, user=self._user)
-        rec_b = self._storage.get(signature_b_id, user=self._user)
-        if rec_a is None or rec_b is None:
-            raise ValueError("One or both signatures not found")
-        text = reconciled_text.strip()[:500]
-        if not text:
-            raise ValueError("reconciled_text cannot be empty")
-
-        tags = sorted({t for t in rec_a.intent_tags + rec_b.intent_tags if t})
-        drawer = rec_a.drawer_domain or rec_b.drawer_domain or "general"
-        p_mag = min(100.0, max(rec_a.p_magnitude, rec_b.p_magnitude) + 8.0)
-
-        txn = getattr(self._storage, "transaction", None)
-        ctx: AbstractContextManager[None] = txn() if callable(txn) else nullcontext()
-        with ctx:
-            new_id = self.save(
-                text,
-                tags=tags,
-                drawer=drawer,
-                p_magnitude=p_mag,
-                source="reconcile",
-                dedupe=False,
-            )
-            self._storage.delete(signature_a_id, user=self._user)
-            self._storage.delete(signature_b_id, user=self._user)
-        logger.info(
-            "[PDM] reconcile_torsion %s+%s → %s",
-            signature_a_id[:8],
-            signature_b_id[:8],
-            new_id[:8],
+        return reconcile_torsion_pair(
+            self, signature_a_id, signature_b_id, reconciled_text
         )
-        return new_id
 
     def audit_and_heal(
         self,
@@ -846,96 +505,17 @@ class Memory:
             Dict with ``scanned_pairs``, ``reconciled``, ``skipped``,
             ``reconciled_ids``, ``decay``, ``narrative``, ``dry_run``.
         """
-        reports = self.detect_torsion(
+        from pdm_memory.memory_ops.heal import audit_and_heal as run_heal
+
+        return run_heal(
+            self,
+            torsion_threshold=torsion_threshold,
+            auto_reconcile_threshold=auto_reconcile_threshold,
+            run_decay=run_decay,
+            dry_run=dry_run,
             drawer=drawer,
-            threshold=torsion_threshold,
             limit=limit,
         )
-        # Strictly greater than threshold (architectural claim: score > 0.85)
-        candidates = sorted(
-            (r for r in reports if float(r.torsion_score) > float(auto_reconcile_threshold)),
-            key=lambda r: float(r.torsion_score),
-            reverse=True,
-        )
-
-        reconciled = 0
-        skipped = 0
-        reconciled_ids: list[str] = []
-        reconciled_drawers: list[str] = []
-        reconciled_kinds: list[str] = []
-        consumed: set[str] = set()
-
-        for report in candidates:
-            a_id = report.signature_a_id
-            b_id = report.signature_b_id
-            if a_id in consumed or b_id in consumed:
-                skipped += 1
-                continue
-            rec_a = self._storage.get(a_id, user=self._user)
-            rec_b = self._storage.get(b_id, user=self._user)
-            if rec_a is None or rec_b is None:
-                skipped += 1
-                continue
-
-            # Prefer the higher-pressure fact as the surviving narrative
-            if float(rec_a.p_magnitude) >= float(rec_b.p_magnitude):
-                text = (rec_a.compressed_fact or "").strip()
-            else:
-                text = (rec_b.compressed_fact or "").strip()
-            if not text:
-                skipped += 1
-                continue
-
-            if dry_run:
-                reconciled += 1
-                reconciled_ids.append(f"dry:{a_id[:8]}+{b_id[:8]}")
-                reconciled_drawers.append(report.drawer or "general")
-                reconciled_kinds.append(report.conflict_kind or "semantic")
-                consumed.add(a_id)
-                consumed.add(b_id)
-                continue
-
-            try:
-                new_id = self.reconcile_torsion(a_id, b_id, text)
-            except ValueError as exc:
-                logger.warning(
-                    "[PDM] audit_and_heal skip pair %s+%s: %s",
-                    a_id[:8],
-                    b_id[:8],
-                    exc,
-                )
-                skipped += 1
-                continue
-
-            reconciled += 1
-            reconciled_ids.append(new_id)
-            reconciled_drawers.append(report.drawer or "general")
-            reconciled_kinds.append(report.conflict_kind or "semantic")
-            consumed.add(a_id)
-            consumed.add(b_id)
-
-        decay_counts: dict[str, int] | None = None
-        if run_decay:
-            decay_counts = self.decay(dry_run=dry_run)
-
-        narrative = self._heal_narrative(
-            reconciled=reconciled,
-            drawers=reconciled_drawers,
-            kinds=reconciled_kinds,
-            decay=decay_counts,
-        )
-        summary = {
-            "scanned_pairs": len(reports),
-            "auto_reconcile_threshold": float(auto_reconcile_threshold),
-            "reconciled": reconciled,
-            "skipped": skipped,
-            "reconciled_ids": reconciled_ids,
-            "decay": decay_counts,
-            "narrative": narrative,
-            "dry_run": dry_run,
-        }
-        logger.info("[PDM] audit_and_heal %s", summary)
-        return summary
 
     @staticmethod
     def _heal_narrative(
@@ -946,30 +526,14 @@ class Memory:
         decay: dict[str, int] | None,
     ) -> str:
         """Human-readable heal summary for agents / CLI / ops dashboards."""
-        parts: list[str] = []
-        if reconciled > 0:
-            drawer = drawers[0] if drawers else "general"
-            # Prefer a single drawer label when all matches agree
-            if drawers and len(set(drawers)) == 1:
-                drawer = drawers[0]
-            elif drawers and len(set(drawers)) > 1:
-                drawer = ", ".join(sorted(set(drawers))[:3])
-            kind = kinds[0] if kinds else "factual"
-            if kinds and len(set(kinds)) > 1:
-                kind = "mixed"
-            noun = "contradiction" if reconciled == 1 else "contradictions"
-            parts.append(f"Detected and resolved {reconciled} {kind} {noun} in '{drawer}'.")
-        else:
-            parts.append("No high-confidence torsion pairs required reconciliation.")
+        from pdm_memory.memory_ops.heal import heal_narrative
 
-        purged = int((decay or {}).get("deleted", 0) or 0)
-        if purged > 0:
-            residue = "residue" if purged == 1 else "residues"
-            parts.append(f"Purged {purged} low-pressure {residue}.")
-        elif decay is not None:
-            parts.append("No low-pressure residues required purge.")
-
-        return " ".join(parts)
+        return heal_narrative(
+            reconciled=reconciled,
+            drawers=drawers,
+            kinds=kinds,
+            decay=decay,
+        )
 
     def verify_alignment(
         self,
@@ -1027,42 +591,14 @@ class Memory:
         Returns:
             Dict with keys: decayed, deleted, skipped.
         """
-        records = self._storage.list(user=self._user, limit=10_000)
-        now = datetime.now(tz=timezone.utc)
-        counts = {"decayed": 0, "deleted": 0, "skipped": 0}
+        from pdm_memory.memory_ops.decay import run_decay
 
-        for rec in records:
-            days_since_touch = self._days_since(rec.last_retrieved or rec.created_at, now)
-            days_since_created = self._days_since(rec.created_at, now)
-            domain = rec.domain or infer_domain(rec.intent_tags)
-            half_life = resolve_half_life(domain)
-            decay = calculate_decay_factor(
-                days_since_touch,
-                half_life,
-                days_since_created=days_since_created,
-                t_persistence=rec.t_persistence,
-            )
-            v = calculate_v(
-                rec.validation_prediction_correct,
-                rec.validation_prediction_total,
-            )
-            p_eff = calculate_p_effective(
-                rec.p_magnitude, v, decay, intent_weight=1.0, quality=0.80
-            )
-
-            if p_eff < DECAY_DELETE_THRESHOLD:
-                if not dry_run:
-                    hard_delete = getattr(self._storage, "hard_delete", None)
-                    if callable(hard_delete):
-                        hard_delete(rec.id, user=self._user)
-                    else:
-                        self._storage.delete(rec.id, user=self._user)
-                counts["deleted"] += 1
-            else:
-                counts["skipped"] += 1
-
-        logger.info("[PDM] decay() %s | %s", "(dry_run)" if dry_run else "", counts)
-        return counts
+        return run_decay(
+            self._storage,
+            user=self._user,
+            days_since=self._days_since,
+            dry_run=dry_run,
+        )
 
     @staticmethod
     def _days_since(dt: datetime | None, now: datetime) -> float:
@@ -1074,29 +610,9 @@ class Memory:
 
     def _record_to_hit(self, rec: SignatureRecord) -> MemoryHit:
         """Build a MemoryHit with live decay / P_effective (no query coupling)."""
-        now = datetime.now(tz=timezone.utc)
-        days_since = self._days_since(rec.last_retrieved or rec.created_at, now)
-        days_since_created = self._days_since(rec.created_at, now)
-        domain = rec.domain or infer_domain(rec.intent_tags)
-        half_life = resolve_half_life(domain)
-        decay = calculate_decay_factor(
-            days_since,
-            half_life,
-            days_since_created=days_since_created,
-            t_persistence=rec.t_persistence,
-        )
-        v = calculate_v(rec.validation_prediction_correct, rec.validation_prediction_total)
-        p_eff = calculate_p_effective(rec.p_magnitude, v, decay, 1.0, 0.80)
-        e_temporal, is_urgent = self._engine._temporal_energy(rec, now)
-        return MemoryHit.from_record(
-            rec,
-            p_eff,
-            decay,
-            1.0,
-            v,
-            e_temporal=e_temporal,
-            is_urgent=is_urgent,
-        )
+        from pdm_memory.memory_ops.explain import record_to_hit
+
+        return record_to_hit(self, rec)
 
     def detect_torsion(
         self,
@@ -1139,88 +655,10 @@ class Memory:
         return reports
 
     def explain(self, memory_id: str, query: str | None = None) -> ExplainReport:
-        """
-        Return a detailed explanation of why a memory has its current pressure.
+        """Return a detailed explanation of why a memory has its current pressure."""
+        from pdm_memory.memory_ops.explain import explain_memory
 
-        Task 5.1: The explain method.
-
-        Shows every component of P_effective and (if query given) the TAS
-        coupling scores that led to resonance.
-
-        Args:
-            memory_id: The UUID of the memory to explain.
-            query:     Optional: show resonance components for this query.
-
-        Returns:
-            ExplainReport (call .render() for a human-readable string).
-
-        Raises:
-            KeyError: If the memory is not found.
-        """
-        rec = self._storage.get(memory_id, user=self._user)
-        if rec is None:
-            raise KeyError(f"Memory '{memory_id}' not found for user '{self._user}'.")
-
-        now = datetime.now(tz=timezone.utc)
-        days_since = self._days_since(rec.last_retrieved or rec.created_at, now)
-        days_since_created = self._days_since(rec.created_at, now)
-
-        domain = rec.domain or infer_domain(rec.intent_tags)
-        half_life = resolve_half_life(domain)
-        decay = calculate_decay_factor(
-            days_since,
-            half_life,
-            days_since_created=days_since_created,
-            t_persistence=rec.t_persistence,
-        )
-        v = calculate_v(rec.validation_prediction_correct, rec.validation_prediction_total)
-        i_weight = calculate_intent_weight(rec.intent_tags, query) if query else None
-        p_eff = calculate_p_effective(
-            rec.p_magnitude,
-            v,
-            decay,
-            i_weight if i_weight is not None else 1.0,
-            0.80,
-        )
-
-        # TAS coupling for the query
-        coupling_score = tag_overlap = domain_match = regime_match = press_prox = None
-        if query:
-            hits = self._engine.recall(records=[rec], query=query, k=1, search_cost=1.0)
-            if hits:
-                h = hits[0]
-                coupling_score = h.coupling_score
-                tag_overlap = h.tag_overlap
-                domain_match = h.domain_match
-                regime_match = h.regime_match
-                press_prox = h.pressure_proximity
-
-        return ExplainReport(
-            memory_id=memory_id,
-            compressed_fact=rec.compressed_fact,
-            drawer=rec.drawer_domain,
-            source=rec.source,
-            p_magnitude=rec.p_magnitude,
-            t_persistence=rec.t_persistence,
-            effective_spike=rec.effective_spike or 0.0,
-            created_at=rec.created_at,
-            last_retrieved=rec.last_retrieved,
-            retrieval_count=rec.retrieval_count,
-            days_since_retrieved=round(days_since, 2),
-            half_life_days=half_life,
-            decay_factor=round(decay, 4),
-            v_coefficient=round(v, 4),
-            intent_weight=round(i_weight, 4) if i_weight is not None else None,
-            quality=0.80,
-            p_effective=round(p_eff, 2),
-            coupling_score=coupling_score,
-            tag_overlap=tag_overlap,
-            domain_match=domain_match,
-            regime_match=regime_match,
-            pressure_proximity=press_prox,
-            intent_tags=rec.intent_tags,
-            domain=domain,
-        )
+        return explain_memory(self, memory_id, query=query)
 
     def sync(
         self,
@@ -1370,30 +808,16 @@ class Memory:
         page_size: int,
     ) -> builtins.list[SignatureRecord]:
         """Load recall candidates via keyset pagination instead of one bulk query."""
-        if candidate_limit <= 0:
-            return []
+        from pdm_memory.memory_ops.candidates import load_recall_candidates
 
-        page_size = max(1, min(page_size, candidate_limit))
-        records: list[SignatureRecord] = []
-        cursor_id: str | None = None
-
-        while len(records) < candidate_limit:
-            batch_limit = min(page_size, candidate_limit - len(records))
-            batch = self._storage.list(
-                user=self._user,
-                limit=batch_limit,
-                min_pressure=min_pressure,
-                drawer=drawer,
-                cursor_id=cursor_id,
-            )
-            if not batch:
-                break
-            records.extend(batch)
-            if len(batch) < batch_limit:
-                break
-            cursor_id = batch[-1].id
-
-        return records
+        return load_recall_candidates(
+            self._storage,
+            user=self._user,
+            min_pressure=min_pressure,
+            drawer=drawer,
+            candidate_limit=candidate_limit,
+            page_size=page_size,
+        )
 
     def _init_storage(
         self,
@@ -1441,29 +865,9 @@ class Memory:
 
     def _apply_torsion_v_penalty(self, reports: builtins.list[TorsionReport]) -> None:
         """Record a validation miss on each signature involved in high torsion."""
-        affected: set[str] = set()
-        for report in reports:
-            affected.add(report.signature_a_id)
-            affected.add(report.signature_b_id)
+        from pdm_memory.memory_ops.reinforcement import apply_torsion_v_penalty
 
-        batch_updates: list[tuple[str, dict]] = []
-        for sig_id in affected:
-            rec = self._storage.get(sig_id, user=self._user)
-            if rec is None:
-                continue
-            new_total = int(rec.validation_prediction_total or 0) + 1
-            # correct unchanged → Laplace V decreases
-            batch_updates.append(
-                (
-                    sig_id,
-                    {"validation_prediction_total": new_total},
-                )
-            )
-        if batch_updates:
-            try:
-                self._storage.update_batch(batch_updates, user=self._user)
-            except Exception as e:
-                logger.warning("[PDM] torsion V penalty batch failed: %s", e)
+        apply_torsion_v_penalty(self._storage, reports, user=self._user)
 
     def _apply_reinforcement(self, hits: builtins.list[MemoryHit]) -> None:
         """Write retrieval reinforcement back to storage for all hits.
@@ -1471,34 +875,6 @@ class Memory:
         Also increments Validation Coefficient counters so repeated successful
         retrievals raise V and therefore P_effective over time.
         """
-        now = datetime.now(tz=timezone.utc)
-        batch_updates: list[tuple[str, dict]] = []
-        for hit in hits:
-            try:
-                rec = self._storage.get(hit.id, user=self._user)
-                if rec is None:
-                    continue
-                delta = self._engine.compute_reinforcement_delta(
-                    rec.p_magnitude, rec.retrieval_count, hit.coupling_score
-                )
-                new_p = min(100.0, rec.p_magnitude + delta)
-                new_spike = calculate_effective_spike(new_p, rec.t_persistence, rec.phase_privilege)
-                batch_updates.append(
-                    (
-                        hit.id,
-                        {
-                            "p_magnitude": new_p,
-                            "effective_spike": new_spike,
-                            "retrieval_count": (rec.retrieval_count or 0) + 1,
-                            "last_retrieved": now,
-                        },
-                    )
-                )
-            except Exception as e:
-                logger.warning("[PDM] reinforcement check failed for %s: %s", hit.id, e)
+        from pdm_memory.memory_ops.reinforcement import apply_reinforcement
 
-        if batch_updates:
-            try:
-                self._storage.update_batch(batch_updates, user=self._user)
-            except Exception as e:
-                logger.warning("[PDM] reinforcement batch update failed: %s", e)
+        apply_reinforcement(self._storage, self._engine, hits, user=self._user)
