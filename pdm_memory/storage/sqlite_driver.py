@@ -151,6 +151,29 @@ class SQLiteDriver(BaseStorage):
         if getattr(self._local, "txn_depth", 0) == 0:
             conn.commit()
 
+    def _find_existing_ids(
+        self,
+        conn: sqlite3.Connection,
+        user: str,
+        ids: builtins.list[str],
+    ) -> set[str]:
+        """Return existing signature IDs for *user* among *ids* in chunks."""
+        if not ids:
+            return set()
+
+        existing_ids: set[str] = set()
+        chunk_size = self._CHUNK_SIZE
+        for chunk_start in range(0, len(ids), chunk_size):
+            chunk_ids = ids[chunk_start : chunk_start + chunk_size]
+            placeholders = ",".join("?" * len(chunk_ids))
+            rows = conn.execute(
+                f"SELECT id FROM pdm_signatures WHERE user = ? AND id IN ({placeholders})",
+                [user, *chunk_ids],
+            ).fetchall()
+            existing_ids.update(row[0] for row in rows)
+        return existing_ids
+
+
     # ------------------------------------------------------------------
     # Connection management (one connection per thread)
     # ------------------------------------------------------------------
@@ -297,12 +320,7 @@ class SQLiteDriver(BaseStorage):
                 existing_ids: set[str] = set()
                 for user, user_items in chunk_by_user.items():
                     ids_for_user = [sig.id for _, sig in user_items]
-                    placeholders = ",".join("?" * len(ids_for_user))
-                    rows = conn.execute(
-                        f"SELECT id FROM pdm_signatures WHERE user = ? AND id IN ({placeholders})",
-                        [user, *ids_for_user],
-                    ).fetchall()
-                    existing_ids.update(row[0] for row in rows)
+                    existing_ids.update(self._find_existing_ids(conn, user, ids_for_user))
 
                 to_insert: list[tuple[int, SignatureRecord]] = []
                 for idx, sig in chunk:
@@ -456,8 +474,6 @@ class SQLiteDriver(BaseStorage):
         if not updates:
             return []
 
-        chunk_size = self._CHUNK_SIZE
-
         results = [
             UpdateBatchResult(index=i, id=memory_id)
             for i, (memory_id, _) in enumerate(updates)
@@ -486,15 +502,7 @@ class SQLiteDriver(BaseStorage):
 
         conn = self._conn()
 
-        existing_ids: set[str] = set()
-        for chunk_start in range(0, len(all_ids), chunk_size):
-            chunk_ids = all_ids[chunk_start : chunk_start + chunk_size]
-            placeholders = ",".join("?" * len(chunk_ids))
-            rows = conn.execute(
-                f"SELECT id FROM pdm_signatures WHERE user = ? AND id IN ({placeholders})",
-                [user, *chunk_ids],
-            ).fetchall()
-            existing_ids.update(row[0] for row in rows)
+        existing_ids = self._find_existing_ids(conn, user, all_ids)
 
         missing_ids = set(all_ids) - existing_ids
         for mid in missing_ids:
