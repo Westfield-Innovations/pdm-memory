@@ -88,7 +88,7 @@ class CloudDriver(BaseStorage):
 
     def get(self, memory_id: str, user: str = "default") -> SignatureRecord | None:
         """
-        GET /api/v1/pdm/signatures/<id>/
+        GET /api/v1/pdm/signatures/<id>
 
         Returns:
             SignatureRecord, or None if the cloud returns 404.
@@ -97,7 +97,7 @@ class CloudDriver(BaseStorage):
             CloudStorageError: On network / auth / non-404 HTTP failures.
         """
         try:
-            resp = self._get(f"/api/v1/pdm/signatures/{memory_id}/")
+            resp = self._get(f"/api/v1/pdm/signatures/{memory_id}")
             rec = self._payload_to_record(resp.json())
             if self._record_deleted(rec):
                 return None
@@ -135,16 +135,16 @@ class CloudDriver(BaseStorage):
         for key in ("last_retrieved", "created_at", "t_deadline", "t_event_at"):
             if key in fields and isinstance(fields[key], datetime):
                 fields[key] = fields[key].isoformat()
-        self._patch(f"/api/v1/pdm/signatures/{memory_id}/", fields)
+        self._patch(f"/api/v1/pdm/signatures/{memory_id}", fields)
 
     def delete(self, memory_id: str, user: str = "default") -> None:
         """Soft-delete via metadata flag (Companion API has no is_deleted column yet)."""
         rec = self.get(memory_id, user=user)
         if rec is None:
             raise CloudNotFoundError(
-                f"Cloud resource not found: /api/v1/pdm/signatures/{memory_id}/",
+                f"Cloud resource not found: /api/v1/pdm/signatures/{memory_id}",
                 status_code=404,
-                path=f"/api/v1/pdm/signatures/{memory_id}/",
+                path=f"/api/v1/pdm/signatures/{memory_id}",
             )
         meta = dict(rec.metadata or {})
         meta["_pdm_is_deleted"] = True
