@@ -17,7 +17,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from pdm_memory.core.constraints import detect_constraint_violation
+from pdm_memory.core.constraints import ConstraintViolation, build_presence_index, detect_constraint_violation
 from pdm_memory.core.math import calculate_intent_weight, infer_domain
 from pdm_memory.core.signature import SignatureRecord
 from pdm_memory.models import AlignmentReport
@@ -180,10 +180,11 @@ def intent_goal_torsion(
     goal: SignatureRecord,
     *,
     occupancy_records: Sequence[SignatureRecord] = (),
-) -> tuple[float, str]:
+    presence_index: dict | None = None,
+) -> tuple[float, str, ConstraintViolation | None]:
     """
     Deviation of a proposed intent from one Goal Signature.
-    Returns (torsion in [0,1], short detail).
+    Returns (torsion in [0,1], short detail, hard constraint or None).
     """
     intent_l = (intent_text or "").lower()
     goal_text = goal.compressed_fact or ""
@@ -200,6 +201,7 @@ def intent_goal_torsion(
         goal,
         intent_text,
         occupancy_records=occupancy_records,
+        presence_index=presence_index,
     )
     if constraint is not None:
         best = constraint.strength
@@ -259,7 +261,7 @@ def intent_goal_torsion(
                 f"({', '.join(sorted(normalized_shared)[:3])})"
             )
 
-    return round(best, 4), detail
+    return round(best, 4), detail, constraint
 
 
 def _forbidden_after_negation(goal_text: str) -> set[str]:
@@ -433,16 +435,17 @@ def verify_alignment(
             anchor_count=0,
         )
 
+    presence_index = build_presence_index(records)
     scored: list[_AnchorScore] = []
     for goal in anchors:
         iaw = compute_iaw(goal)
         resonance = intent_goal_resonance(engine, text, goal)
-        constraint = detect_constraint_violation(
-            goal,
+        torsion, detail, constraint = intent_goal_torsion(
             text,
+            goal,
             occupancy_records=records,
+            presence_index=presence_index,
         )
-        torsion, detail = intent_goal_torsion(text, goal, occupancy_records=records)
         # Weight deviation by IAW — contradicting a strong identity anchor hurts more
         # Hard numerical/role/occupancy constraints are not advisory and cannot be diluted.
         torsion_w = (

@@ -711,14 +711,37 @@ class Memory:
         Returns:
             SurfaceReport with hits, torsion_count, and alignment status.
         """
-        hits = self.recall(
-            query,
+        # One store load — recall / torsion / alignment share the same snapshot.
+        records = self._storage.list(user=self._user, limit=10_000)
+        hits = self._engine.recall(
+            records=records,
+            query=query,
             k=k,
             search_cost=search_cost,
-            reinforce=reinforce,
+            diversity_bias=DEFAULT_DIVERSITY_BIAS,
         )
-        torsion_reports = self.detect_torsion(threshold=torsion_threshold)
-        alignment = self.verify_alignment(
+        reinforced = bool(reinforce and hits)
+        if reinforced:
+            self._apply_reinforcement(hits)
+        self._run_post_recall_hooks(
+            {
+                "query": query,
+                "k": k,
+                "hits": hits,
+                "reinforced": reinforced,
+                "min_pressure": 0.0,
+                "search_cost": search_cost,
+                "drawer": None,
+                "diversity_bias": None,
+            }
+        )
+        torsion_reports = self._engine.detect_torsion(
+            records,
+            threshold=torsion_threshold,
+            judge=self._torsion_judge,
+        )
+        alignment = self._engine.verify_alignment(
+            records,
             query,
             min_pressure=min_goal_pressure,
             torsion_threshold=torsion_threshold,
@@ -1112,6 +1135,7 @@ class Memory:
         records = self._storage.list(user=self._user, limit=10_000)
         now = datetime.now(tz=timezone.utc)
         counts = {"decayed": 0, "deleted": 0, "skipped": 0}
+        to_delete: list[str] = []
 
         for rec in records:
             days_since_touch = self._days_since(rec.last_retrieved or rec.created_at, now)
@@ -1133,15 +1157,21 @@ class Memory:
             )
 
             if p_eff < DECAY_DELETE_THRESHOLD:
-                if not dry_run:
-                    hard_delete = getattr(self._storage, "hard_delete", None)
-                    if callable(hard_delete):
-                        hard_delete(rec.id, user=self._user)
-                    else:
-                        self._storage.delete(rec.id, user=self._user)
+                to_delete.append(rec.id)
                 counts["deleted"] += 1
             else:
                 counts["skipped"] += 1
+
+        if to_delete and not dry_run:
+            hard_delete = getattr(self._storage, "hard_delete", None)
+            txn = getattr(self._storage, "transaction", None)
+            ctx: AbstractContextManager[None] = txn() if callable(txn) else nullcontext()
+            with ctx:
+                for memory_id in to_delete:
+                    if callable(hard_delete):
+                        hard_delete(memory_id, user=self._user)
+                    else:
+                        self._storage.delete(memory_id, user=self._user)
 
         logger.info("[PDM] decay() %s | %s", "(dry_run)" if dry_run else "", counts)
         return counts
@@ -1679,12 +1709,12 @@ class Memory:
         for report in reports:
             affected.add(report.signature_a_id)
             affected.add(report.signature_b_id)
+        if not affected:
+            return
 
+        records = self._storage.get_many(list(affected), user=self._user)
         batch_updates: list[tuple[str, dict]] = []
-        for sig_id in affected:
-            rec = self._storage.get(sig_id, user=self._user)
-            if rec is None:
-                continue
+        for sig_id, rec in records.items():
             new_total = int(rec.validation_prediction_total or 0) + 1
             # correct unchanged → Laplace V decreases
             batch_updates.append(
@@ -1708,13 +1738,16 @@ class Memory:
         Also increments Validation Coefficient counters so repeated successful
         retrievals raise V and therefore P_effective over time.
         """
+        if not hits:
+            return
         now = datetime.now(tz=timezone.utc)
+        records = self._storage.get_many([hit.id for hit in hits], user=self._user)
         batch_updates: list[tuple[str, dict]] = []
         for hit in hits:
+            rec = records.get(hit.id)
+            if rec is None:
+                continue
             try:
-                rec = self._storage.get(hit.id, user=self._user)
-                if rec is None:
-                    continue
                 delta = self._engine.compute_reinforcement_delta(
                     rec.p_magnitude, rec.retrieval_count, hit.coupling_score
                 )
@@ -1731,7 +1764,7 @@ class Memory:
                         },
                     )
                 )
-            except Exception as e:
+            except (TypeError, ValueError) as e:
                 logger.warning("[PDM] reinforcement check failed for %s: %s", hit.id, e)
 
         if batch_updates:
