@@ -153,7 +153,7 @@ class TestSQLiteDriverCRUD:
             make_sig(text="Bulk fact 3", drawer="bulk"),
         ]
 
-        results = driver.save_many(sigs)
+        results = driver.save_batch(sigs)
 
         assert [result.error for result in results] == [None, None, None]
         assert [result.id for result in results] == [sig.id for sig in sigs]

@@ -14,13 +14,27 @@ class _StubStorage(BaseStorage):
     def save(self, sig):
         return sig.id
 
+    def save_batch(self, sigs):
+        return [SaveBatchResult(index=i, id=s.id) for i, s in enumerate(sigs)]
+
     def get(self, memory_id, user="default"):
         return None
+
+    def get_many(self, ids, user="default"):
+        return {}
 
     def update(self, memory_id, user="default", **fields):
         return None
 
+    def update_batch(self, updates, user="default"):
+        return [
+            UpdateBatchResult(index=i, id=mid) for i, (mid, _) in enumerate(updates)
+        ]
+
     def delete(self, memory_id, user="default"):
+        return None
+
+    def hard_delete(self, memory_id, user="default"):
         return None
 
     def list(
@@ -36,6 +50,12 @@ class _StubStorage(BaseStorage):
 
     def list_drawers(self, user="default"):
         return []
+
+    def find_by_idempotency_key(self, idempotency_key, user="default"):
+        return None
+
+    def ping(self):
+        return True
 
 
 class TestStorageFactory:

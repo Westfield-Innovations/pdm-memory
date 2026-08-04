@@ -375,7 +375,7 @@ class Memory:
 
             if sigs_to_save:
                 try:
-                    save_results = self._storage.save_many(sigs_to_save)
+                    save_results = self._storage.save_batch(sigs_to_save)
                 except Exception as exc:
                     logger.warning("[PDM] save_many storage batch failed: %s", exc)
                     errors += len(sigs_to_save)

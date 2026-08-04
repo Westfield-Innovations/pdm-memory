@@ -222,17 +222,32 @@ class TestCloudFailFast:
         with pytest.raises(CloudStorageError, match="body type"):
             _driver().list()
 
+    @patch("httpx.patch")
+    def test_delete_soft_via_is_deleted_patch(self, mock_patch):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = "{}"
+        mock_patch.return_value = mock_resp
+
+        mid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        _driver().delete(mid)
+        mock_patch.assert_called_once()
+        url = mock_patch.call_args.args[0]
+        assert url.endswith(f"/api/v1/pdm/signatures/{mid}")
+        assert mock_patch.call_args.kwargs["json"] == {"is_deleted": True}
+
     @patch("httpx.delete")
-    def test_delete_uses_hard_delete(self, mock_delete):
+    def test_hard_delete_uses_delete_method(self, mock_delete):
         mock_resp = MagicMock()
         mock_resp.status_code = 204
         mock_resp.text = ""
         mock_delete.return_value = mock_resp
 
-        _driver().delete("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        mid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        _driver().hard_delete(mid)
         mock_delete.assert_called_once()
         url = mock_delete.call_args.args[0]
-        assert url.endswith("/api/v1/pdm/signatures/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        assert url.endswith(f"/api/v1/pdm/signatures/{mid}")
         assert not url.endswith("/")
 
     @patch("httpx.get")
@@ -276,3 +291,204 @@ class TestSyncNoDuplicateOnCloudError:
         assert report.pushed == 0
         cloud.save.assert_not_called()
         local.close()
+
+
+class TestCloudBatchMethods:
+    """save_batch / get_many / update_batch — bulk routes with 404 fallback."""
+
+    @patch("httpx.post")
+    def test_save_batch_uses_ingest_batch(self, mock_post):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = b"{}"
+        mock_resp.json.return_value = {
+            "results": [
+                {"index": 0, "id": "id-a", "error": None},
+                {"index": 1, "id": None, "error": "Validation failed"},
+            ]
+        }
+        mock_post.return_value = mock_resp
+
+        s1 = SignatureRecord(
+            user="alice",
+            compressed_fact="Batch fact A",
+            source="azus_chat",
+            p_magnitude=60.0,
+            intent_tags=["a", "b", "c"],
+            drawer_domain="research",
+        )
+        s2 = SignatureRecord(
+            user="alice",
+            compressed_fact="Batch fact B",
+            source="azus_chat",
+            p_magnitude=61.0,
+            intent_tags=["a", "b", "c"],
+            drawer_domain="research",
+        )
+        results = _driver().save_batch([s1, s2])
+        mock_post.assert_called_once()
+        url = mock_post.call_args.args[0]
+        assert url.endswith("/api/v1/pdm/ingest/batch")
+        body = mock_post.call_args.kwargs["json"]
+        assert len(body["items"]) == 2
+        assert results[0].id == "id-a" and results[0].error is None
+        assert results[1].id is None and "Validation" in (results[1].error or "")
+
+    def test_save_batch_client_validates_before_http(self):
+        bad = SignatureRecord(
+            user="alice",
+            compressed_fact="too few tags",
+            source="azus_chat",
+            p_magnitude=60.0,
+            intent_tags=["only", "two"],
+            drawer_domain="research",
+        )
+        with patch("httpx.post") as mock_post:
+            results = _driver().save_batch([bad])
+            mock_post.assert_not_called()
+        assert results[0].id is None
+        assert "intent_tags" in (results[0].error or "")
+
+    @patch("httpx.post")
+    def test_save_batch_falls_back_on_404(self, mock_post):
+        batch_404 = MagicMock()
+        batch_404.status_code = 404
+        batch_404.text = "not found"
+        batch_404.content = b"not found"
+
+        success = MagicMock()
+        success.status_code = 201
+        success.content = b"{}"
+        success.json.return_value = {"id": "from-single"}
+        mock_post.side_effect = [batch_404, success]
+
+        sig = SignatureRecord(
+            user="alice",
+            compressed_fact="Fallback single",
+            source="azus_chat",
+            p_magnitude=60.0,
+            intent_tags=["a", "b", "c"],
+            drawer_domain="research",
+        )
+        results = _driver().save_batch([sig])
+        assert results[0].id == "from-single"
+        assert mock_post.call_count == 2
+        assert mock_post.call_args_list[0].args[0].endswith("/ingest/batch")
+        assert mock_post.call_args_list[1].args[0].endswith("/pdm/ingest")
+
+    @patch("httpx.post")
+    def test_get_many_uses_batch_get(self, mock_post):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = b"{}"
+        mock_resp.json.return_value = {
+            "signatures": [
+                {
+                    "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                    "compressed_fact": "Found",
+                    "p_magnitude": 70,
+                    "t_persistence": 30,
+                    "intent_tags": ["a", "b", "c"],
+                    "source": "manual",
+                    "user": "alice",
+                    "drawer": "research",
+                    "is_deleted": False,
+                }
+            ]
+        }
+        mock_post.return_value = mock_resp
+
+        mid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        out = _driver().get_many([mid, "missing-id"])
+        assert mid in out
+        assert out[mid].compressed_fact == "Found"
+        mock_post.assert_called_once()
+        assert mock_post.call_args.args[0].endswith("/signatures/batch-get")
+        assert mock_post.call_args.kwargs["json"]["ids"] == [mid, "missing-id"]
+
+    @patch("httpx.post")
+    def test_update_batch_uses_batch_update(self, mock_post):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = b"{}"
+        mock_resp.json.return_value = {
+            "results": [
+                {"index": 0, "id": "mid-1", "error": None},
+                {
+                    "index": 1,
+                    "id": "mid-2",
+                    "error": "Memory not found or wrong user",
+                },
+            ]
+        }
+        mock_post.return_value = mock_resp
+
+        results = _driver().update_batch(
+            [
+                ("mid-1", {"p_magnitude": 80.0}),
+                ("mid-2", {"p_magnitude": 81.0}),
+            ]
+        )
+        assert results[0].error is None and results[0].id == "mid-1"
+        assert results[1].error and "not found" in results[1].error
+        assert mock_post.call_args.args[0].endswith("/signatures/batch-update")
+        body = mock_post.call_args.kwargs["json"]
+        assert body["updates"][0] == {"id": "mid-1", "p_magnitude": 80.0}
+
+    def test_get_many_empty(self):
+        assert _driver().get_many([]) == {}
+
+    def test_update_batch_empty(self):
+        assert _driver().update_batch([]) == []
+
+    def test_payload_includes_idempotency_key(self):
+        sig = SignatureRecord(
+            user="alice",
+            compressed_fact="Idempotent fact",
+            source="manual",
+            p_magnitude=70.0,
+            intent_tags=["a", "b", "c"],
+            drawer_domain="calendar",
+            idempotency_key="pay-123",
+        )
+        payload = CloudDriver._record_to_payload(sig)
+        assert payload["idempotency_key"] == "pay-123"
+        assert payload["metadata"]["_idempotency_key"] == "pay-123"
+
+    @patch("httpx.get")
+    def test_find_by_idempotency_key_hits_lookup_route(self, mock_get):
+        mid = "11111111-2222-3333-4444-555555555555"
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = b"{}"
+        mock_resp.json.return_value = {
+            "id": mid,
+            "user": "alice",
+            "compressed_fact": "Pay invoice",
+            "source": "manual",
+            "p_magnitude": 70.0,
+            "intent_tags": ["a", "b", "c"],
+            "drawer": "billing",
+            "idempotency_key": "pay-123",
+            "is_deleted": False,
+        }
+        mock_get.return_value = mock_resp
+
+        rec = _driver().find_by_idempotency_key("pay-123", user="alice")
+        assert rec is not None
+        assert rec.id == mid
+        assert rec.idempotency_key == "pay-123"
+        assert mock_get.call_args.args[0].endswith(
+            "/signatures/by-idempotency-key"
+        )
+        assert mock_get.call_args.kwargs["params"]["key"] == "pay-123"
+
+    @patch("httpx.get")
+    def test_find_by_idempotency_key_404(self, mock_get):
+        from pdm_memory.storage.errors import CloudNotFoundError
+
+        d = _driver()
+        with patch.object(
+            d, "_get", side_effect=CloudNotFoundError("x", status_code=404)
+        ):
+            assert d.find_by_idempotency_key("missing") is None

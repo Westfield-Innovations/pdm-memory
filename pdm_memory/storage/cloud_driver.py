@@ -25,15 +25,16 @@ from typing import Any
 
 from pdm_memory.auth.jwt_handler import JWTAuth
 from pdm_memory.core.signature import DrawerInfo, SignatureRecord
-from pdm_memory.storage.base import BaseStorage
+from pdm_memory.storage.base import BaseStorage, SaveBatchResult, UpdateBatchResult
 from pdm_memory.storage.errors import CloudNotFoundError, CloudStorageError
 
 logger = logging.getLogger(__name__)
 
 # Default AZUS Companion API base URL
-DEFAULT_CLOUD_URL = "https://api.azus.ai"
+DEFAULT_CLOUD_URL = "http://localhost:8000"
 
-# Ingest API clamps (companion SignatureIngestSerializer)
+# Match companion_api.pdm.signature_mutations.MAX_BATCH_SIZE
+_API_BATCH_MAX = 100
 _API_DECAY_RATE_MIN = 0.01
 _API_DECAY_RATE_MAX = 0.5
 _API_URGENCY_MIN = 1.0
@@ -51,6 +52,7 @@ _API_SOURCES = frozenset(
         "docvault",
         "operator_accumulation",
         "autonomous_web",
+        "companion_app",
     }
 )
 _API_DEFAULT_SOURCE = "azus_chat"
@@ -102,6 +104,101 @@ class CloudDriver(BaseStorage):
         logger.debug("[PDM-Cloud] Saved signature %s", cloud_id)
         return str(cloud_id)
 
+    def save_batch(
+        self, sigs: builtins.list[SignatureRecord]
+    ) -> builtins.list[SaveBatchResult]:
+        """
+        Bulk create via POST /api/v1/pdm/ingest/batch when available.
+
+        Semantics mirror SQLite/Postgres:
+        - empty input → []
+        - per-index SaveBatchResult with id or error (partial success)
+        - client pre-validation errors without HTTP
+        - HTTP 404 on bulk path → fall back to N× save() (older deployments)
+        """
+        if not sigs:
+            return []
+
+        results: list[SaveBatchResult] = [
+            SaveBatchResult(index=i, id=None) for i in range(len(sigs))
+        ]
+        # Build payloads first so invalid rows never hit the network, and
+        # keep valid ones in request order for index alignment.
+        pending: list[tuple[int, dict]] = []
+        for index, sig in enumerate(sigs):
+            try:
+                pending.append((index, self._record_to_payload(sig)))
+            except Exception as exc:
+                results[index] = SaveBatchResult(
+                    index=index, id=None, error=str(exc)
+                )
+
+        if not pending:
+            return results
+
+        try:
+            for start in range(0, len(pending), _API_BATCH_MAX):
+                chunk = pending[start : start + _API_BATCH_MAX]
+                items = [payload for _, payload in chunk]
+                resp = self._post(
+                    "/api/v1/pdm/ingest/batch",
+                    {"items": items},
+                )
+                data = resp.json() if resp.content else {}
+                api_results = data.get("results") if isinstance(data, dict) else None
+                if not isinstance(api_results, list):
+                    raise CloudStorageError(
+                        "Batch ingest response missing 'results' list",
+                        path="/api/v1/pdm/ingest/batch",
+                        status_code=getattr(resp, "status_code", None),
+                    )
+                for entry in api_results:
+                    if not isinstance(entry, dict):
+                        continue
+                    local_i = entry.get("index")
+                    if not isinstance(local_i, int) or not (
+                        0 <= local_i < len(chunk)
+                    ):
+                        continue
+                    orig_index = chunk[local_i][0]
+                    err = entry.get("error")
+                    cid = entry.get("id")
+                    if err:
+                        results[orig_index] = SaveBatchResult(
+                            index=orig_index, id=None, error=str(err)
+                        )
+                    elif cid:
+                        results[orig_index] = SaveBatchResult(
+                            index=orig_index, id=str(cid)
+                        )
+                    else:
+                        results[orig_index] = SaveBatchResult(
+                            index=orig_index,
+                            id=None,
+                            error="Batch ingest returned no id",
+                        )
+        except CloudStorageError as exc:
+            if exc.status_code == 404:
+                logger.warning(
+                    "[PDM-Cloud] ingest/batch unavailable; falling back to N× save()"
+                )
+                return self._save_batch_sequential(sigs)
+            raise
+
+        return results
+
+    def _save_batch_sequential(
+        self, sigs: builtins.list[SignatureRecord]
+    ) -> builtins.list[SaveBatchResult]:
+        results: list[SaveBatchResult] = []
+        for i, sig in enumerate(sigs):
+            try:
+                new_id = self.save(sig)
+                results.append(SaveBatchResult(index=i, id=new_id))
+            except Exception as e:
+                results.append(SaveBatchResult(index=i, id=None, error=str(e)))
+        return results
+
     def get(self, memory_id: str, user: str = "default") -> SignatureRecord | None:
         """
         GET /api/v1/pdm/signatures/<id>
@@ -121,18 +218,102 @@ class CloudDriver(BaseStorage):
         except CloudNotFoundError:
             return None
 
+    def get_many(
+        self,
+        ids: builtins.list[str],
+        user: str = "default",
+    ) -> dict[str, SignatureRecord]:
+        """
+        Bulk-fetch via POST /api/v1/pdm/signatures/batch-get.
+
+        Same contract as SQLite/Postgres: dict keyed by id; missing ids
+        omitted. HTTP 404 bulk path → N× get() fallback.
+        """
+        if not ids:
+            return {}
+
+        unique_ids = list(dict.fromkeys(str(i) for i in ids if i))
+        result: dict[str, SignatureRecord] = {}
+
+        try:
+            for start in range(0, len(unique_ids), _API_BATCH_MAX):
+                chunk = unique_ids[start : start + _API_BATCH_MAX]
+                resp = self._post(
+                    "/api/v1/pdm/signatures/batch-get",
+                    {"ids": chunk},
+                )
+                data = resp.json() if resp.content else {}
+                if not isinstance(data, dict):
+                    raise CloudStorageError(
+                        f"Unexpected batch-get body type: {type(data).__name__}",
+                        path="/api/v1/pdm/signatures/batch-get",
+                    )
+                items = data.get("signatures")
+                if not isinstance(items, list):
+                    raise CloudStorageError(
+                        "Batch-get response missing 'signatures' list",
+                        path="/api/v1/pdm/signatures/batch-get",
+                    )
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    rec = self._payload_to_record(item)
+                    if self._record_deleted(rec):
+                        continue
+                    result[rec.id] = rec
+        except CloudStorageError as exc:
+            if exc.status_code == 404:
+                logger.warning(
+                    "[PDM-Cloud] batch-get unavailable; falling back to N× get()"
+                )
+                return self._get_many_sequential(ids, user=user)
+            raise
+
+        return result
+
+    def _get_many_sequential(
+        self,
+        ids: builtins.list[str],
+        user: str = "default",
+    ) -> dict[str, SignatureRecord]:
+        result: dict[str, SignatureRecord] = {}
+        for memory_id in ids:
+            rec = self.get(memory_id, user=user)
+            if rec is not None:
+                result[memory_id] = rec
+        return result
+
     def find_by_idempotency_key(
         self,
         idempotency_key: str,
         user: str = "default",
     ) -> SignatureRecord | None:
-        key = idempotency_key.strip()
+        """
+        GET /api/v1/pdm/signatures/by-idempotency-key?key=...
+
+        Server-side lookup. Missing key → None.
+        """
+        key = (idempotency_key or "").strip()
         if not key:
             return None
-        for rec in self.list(user=user, limit=500):
-            if rec.idempotency_key == key:
-                return rec
-        return None
+        try:
+            resp = self._get(
+                "/api/v1/pdm/signatures/by-idempotency-key",
+                params={"key": key},
+            )
+            data = resp.json() if resp.content else {}
+            if not isinstance(data, dict) or not data.get("id"):
+                return None
+            rec = self._payload_to_record(data)
+            if self._record_deleted(rec):
+                return None
+            return rec
+        except CloudNotFoundError:
+            return None
+        except CloudStorageError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
 
     def ping(self) -> bool:
         try:
@@ -153,19 +334,123 @@ class CloudDriver(BaseStorage):
                 fields[key] = fields[key].isoformat()
         self._patch(f"/api/v1/pdm/signatures/{memory_id}", fields)
 
+    def update_batch(
+        self,
+        updates: builtins.list[tuple[str, dict]],
+        user: str = "default",
+    ) -> builtins.list[UpdateBatchResult]:
+        """
+        Bulk PATCH via POST /api/v1/pdm/signatures/batch-update.
+
+        Per-index UpdateBatchResult with id + optional error, like local drivers.
+        HTTP 404 bulk → N× update() fallback.
+        """
+        if not updates:
+            return []
+
+        results: list[UpdateBatchResult] = [
+            UpdateBatchResult(index=i, id=memory_id)
+            for i, (memory_id, _) in enumerate(updates)
+        ]
+
+        prepared: list[tuple[int, str, dict]] = []
+        for index, (memory_id, fields) in enumerate(updates):
+            try:
+                body = dict(fields)
+                body.pop("user", None)
+                body.pop("id", None)
+                for key in (
+                    "last_retrieved",
+                    "created_at",
+                    "t_deadline",
+                    "t_event_at",
+                ):
+                    if key in body and isinstance(body[key], datetime):
+                        body[key] = body[key].isoformat()
+                prepared.append((index, memory_id, body))
+            except Exception as exc:
+                results[index] = UpdateBatchResult(
+                    index=index, id=memory_id, error=str(exc)
+                )
+
+        if not prepared:
+            return results
+
+        try:
+            for start in range(0, len(prepared), _API_BATCH_MAX):
+                chunk = prepared[start : start + _API_BATCH_MAX]
+                payload = {
+                    "updates": [
+                        {"id": memory_id, **fields}
+                        for _, memory_id, fields in chunk
+                    ]
+                }
+                resp = self._post(
+                    "/api/v1/pdm/signatures/batch-update",
+                    payload,
+                )
+                data = resp.json() if resp.content else {}
+                api_results = data.get("results") if isinstance(data, dict) else None
+                if not isinstance(api_results, list):
+                    raise CloudStorageError(
+                        "Batch-update response missing 'results' list",
+                        path="/api/v1/pdm/signatures/batch-update",
+                    )
+                for entry in api_results:
+                    if not isinstance(entry, dict):
+                        continue
+                    local_i = entry.get("index")
+                    if not isinstance(local_i, int) or not (
+                        0 <= local_i < len(chunk)
+                    ):
+                        continue
+                    orig_index = chunk[local_i][0]
+                    mid = chunk[local_i][1]
+                    err = entry.get("error")
+                    if err:
+                        results[orig_index] = UpdateBatchResult(
+                            index=orig_index, id=mid, error=str(err)
+                        )
+                    else:
+                        results[orig_index] = UpdateBatchResult(
+                            index=orig_index, id=str(entry.get("id") or mid)
+                        )
+        except CloudStorageError as exc:
+            if exc.status_code == 404:
+                logger.warning(
+                    "[PDM-Cloud] batch-update unavailable; falling back to N× update()"
+                )
+                return self._update_batch_sequential(updates, user=user)
+            raise
+
+        return results
+
+    def _update_batch_sequential(
+        self,
+        updates: builtins.list[tuple[str, dict]],
+        user: str = "default",
+    ) -> builtins.list[UpdateBatchResult]:
+        if not updates:
+            return []
+        results: list[UpdateBatchResult] = []
+        for i, (memory_id, fields) in enumerate(updates):
+            try:
+                self.update(memory_id, user=user, **fields)
+                results.append(UpdateBatchResult(index=i, id=memory_id))
+            except Exception as e:
+                results.append(
+                    UpdateBatchResult(index=i, id=memory_id, error=str(e))
+                )
+        return results
+
     def delete(self, memory_id: str, user: str = "default") -> None:
         """
-        Delete a signature in the cloud.
+        Soft-delete a signature: PATCH /api/v1/pdm/signatures/<id>
+        with ``{"is_deleted": true}``.
 
-        Interim: Companion has no soft-delete (is_deleted) yet, so this maps to
-        permanent DELETE /api/v1/pdm/signatures/<id> (same as the companion UI).
-        When the API gains is_deleted, soft-delete should use PATCH; hard
-        removal stays on DELETE via hard_delete().
+        Permanent removal is ``hard_delete()`` → DELETE the same path.
         """
-        logger.debug(
-            "[PDM-Cloud] delete() uses hard DELETE until is_deleted is supported"
-        )
-        self.hard_delete(memory_id, user=user)
+        self.update(memory_id, user=user, is_deleted=True)
 
     def hard_delete(self, memory_id: str, user: str = "default") -> None:
         """DELETE /api/v1/pdm/signatures/<id> — permanent removal."""
@@ -200,6 +485,8 @@ class CloudDriver(BaseStorage):
         params: dict = {"limit": fetch_limit, "min_p": min_pressure}
         if drawer:
             params["drawer"] = drawer
+        if include_deleted:
+            params["include_deleted"] = "true"
         resp = self._get("/api/v1/pdm/retrieve", params=params)
         data = resp.json()
         if not isinstance(data, dict):
@@ -276,6 +563,7 @@ class CloudDriver(BaseStorage):
         except httpx.HTTPError as exc:
             raise CloudStorageError(f"Cloud POST failed: {exc}", path=path) from exc
         self._handle_auth_retry(resp, "POST", path, payload)
+        # After auth retry the response object is mutated in place
         self._raise_for_status(resp, path)
         return resp
 
@@ -309,6 +597,7 @@ class CloudDriver(BaseStorage):
             )
         except httpx.HTTPError as exc:
             raise CloudStorageError(f"Cloud PATCH failed: {exc}", path=path) from exc
+        self._handle_auth_retry(resp, "PATCH", path, payload)
         self._raise_for_status(resp, path)
         return resp
 
@@ -339,6 +628,13 @@ class CloudDriver(BaseStorage):
             resp2 = httpx.get(
                 f"{self._base_url}{path}",
                 params=params,
+                headers=self._auth.headers(),
+                timeout=self._timeout,
+            )
+        elif method == "PATCH":
+            resp2 = httpx.patch(
+                f"{self._base_url}{path}",
+                json=payload,
                 headers=self._auth.headers(),
                 timeout=self._timeout,
             )
@@ -445,7 +741,7 @@ class CloudDriver(BaseStorage):
             "source_sdk": sig.source,
         }
 
-        return {
+        payload = {
             "id": sig.id,
             "user": sig.user,
             "compressed_fact": sig.compressed_fact,
@@ -471,6 +767,9 @@ class CloudDriver(BaseStorage):
             # Companion ingest alias some clients use
             "related_tickers": list(meta.get("related_tickers") or []),
         }
+        if sig.idempotency_key:
+            payload["idempotency_key"] = sig.idempotency_key
+        return payload
 
     @staticmethod
     def _record_deleted(rec: SignatureRecord) -> bool:
