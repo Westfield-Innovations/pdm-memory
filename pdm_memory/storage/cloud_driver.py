@@ -38,6 +38,22 @@ _API_DECAY_RATE_MIN = 0.01
 _API_DECAY_RATE_MAX = 0.5
 _API_URGENCY_MIN = 1.0
 _API_URGENCY_MAX = 10.0
+_API_P_MAGNITUDE_MIN = 50.0
+_API_P_MAGNITUDE_MAX = 100.0
+_API_INTENT_TAGS_MIN = 3
+# companion Signature.SOURCE_CHOICES
+_API_SOURCES = frozenset(
+    {
+        "azus_chat",
+        "junior_clipboard",
+        "slack",
+        "manual",
+        "docvault",
+        "operator_accumulation",
+        "autonomous_web",
+    }
+)
+_API_DEFAULT_SOURCE = "azus_chat"
 
 
 class CloudDriver(BaseStorage):
@@ -120,14 +136,14 @@ class CloudDriver(BaseStorage):
 
     def ping(self) -> bool:
         try:
-            self._get("/api/v1/pdm/retrieve", params={"limit": 1, "min_pressure": 0})
+            self._get("/api/v1/pdm/retrieve", params={"limit": 1, "min_p": 0})
             return True
         except Exception as exc:
             logger.warning("[PDM-Cloud] ping failed: %s", exc)
             return False
 
     def update(self, memory_id: str, user: str = "default", **fields) -> None:
-        """PATCH /api/v1/pdm/signatures/<id>/ — raises on failure."""
+        """PATCH /api/v1/pdm/signatures/<id> — raises on failure."""
         fields = dict(fields)
         fields.pop("user", None)
         fields.pop("id", None)
@@ -138,24 +154,25 @@ class CloudDriver(BaseStorage):
         self._patch(f"/api/v1/pdm/signatures/{memory_id}", fields)
 
     def delete(self, memory_id: str, user: str = "default") -> None:
-        """Soft-delete via metadata flag (Companion API has no is_deleted column yet)."""
-        rec = self.get(memory_id, user=user)
-        if rec is None:
-            raise CloudNotFoundError(
-                f"Cloud resource not found: /api/v1/pdm/signatures/{memory_id}",
-                status_code=404,
-                path=f"/api/v1/pdm/signatures/{memory_id}",
-            )
-        meta = dict(rec.metadata or {})
-        meta["_pdm_is_deleted"] = True
-        self.update(memory_id, user=user, metadata=meta)
+        """
+        Delete a signature in the cloud.
+
+        Interim: Companion has no soft-delete (is_deleted) yet, so this maps to
+        permanent DELETE /api/v1/pdm/signatures/<id> (same as the companion UI).
+        When the API gains is_deleted, soft-delete should use PATCH; hard
+        removal stays on DELETE via hard_delete().
+        """
+        logger.debug(
+            "[PDM-Cloud] delete() uses hard DELETE until is_deleted is supported"
+        )
+        self.hard_delete(memory_id, user=user)
 
     def hard_delete(self, memory_id: str, user: str = "default") -> None:
-        """DELETE /api/v1/pdm/signatures/<id>/ — permanent removal."""
+        """DELETE /api/v1/pdm/signatures/<id> — permanent removal."""
         import httpx
 
         self._auth.ensure_fresh()
-        path = f"/api/v1/pdm/signatures/{memory_id}/"
+        path = f"/api/v1/pdm/signatures/{memory_id}"
         try:
             resp = httpx.delete(
                 f"{self._base_url}{path}",
@@ -179,12 +196,23 @@ class CloudDriver(BaseStorage):
     ) -> builtins.list[SignatureRecord]:
         """GET /api/v1/pdm/retrieve — client-side keyset when API has no cursor param."""
         fetch_limit = limit if cursor_id is None else max(limit * 4, 200)
-        params: dict = {"limit": fetch_limit, "min_pressure": min_pressure}
+        # Companion query param is min_p (not min_pressure)
+        params: dict = {"limit": fetch_limit, "min_p": min_pressure}
         if drawer:
             params["drawer"] = drawer
         resp = self._get("/api/v1/pdm/retrieve", params=params)
         data = resp.json()
-        items = data if isinstance(data, list) else data.get("results", [])
+        if not isinstance(data, dict):
+            raise CloudStorageError(
+                f"Unexpected retrieve body type: {type(data).__name__}",
+                path="/api/v1/pdm/retrieve",
+            )
+        items = data.get("signatures")
+        if not isinstance(items, list):
+            raise CloudStorageError(
+                "Retrieve response missing 'signatures' list",
+                path="/api/v1/pdm/retrieve",
+            )
         records = [self._payload_to_record(item) for item in items]
         if not include_deleted:
             records = [rec for rec in records if not self._record_deleted(rec)]
@@ -208,9 +236,18 @@ class CloudDriver(BaseStorage):
     def list_drawers(self, user: str = "default") -> builtins.list[DrawerInfo]:
         """GET /api/v1/pdm/drawers — raises on failure."""
         resp = self._get("/api/v1/pdm/drawers")
-        items = resp.json()
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise CloudStorageError(
+                f"Unexpected drawers body type: {type(data).__name__}",
+                path="/api/v1/pdm/drawers",
+            )
+        items = data.get("drawers")
         if not isinstance(items, list):
-            items = items.get("results", [])
+            raise CloudStorageError(
+                "Drawers response missing 'drawers' list",
+                path="/api/v1/pdm/drawers",
+            )
         return [
             DrawerInfo(
                 domain=item.get("domain", ""),
@@ -352,6 +389,30 @@ class CloudDriver(BaseStorage):
         return max(_API_URGENCY_MIN, min(_API_URGENCY_MAX, float(urgency_rate)))
 
     @classmethod
+    def _map_api_source(cls, source: str | None) -> str:
+        """Map SDK source to a Companion SOURCE_CHOICES value."""
+        if source and source in _API_SOURCES:
+            return source
+        # SDK legacy default "chat" and any unknown label → azus_chat
+        return _API_DEFAULT_SOURCE
+
+    @classmethod
+    def _validate_ingest_record(cls, sig: SignatureRecord) -> None:
+        """Fail before HTTP when payload cannot pass Companion ingest rules."""
+        tags = list(sig.intent_tags or [])
+        if len(tags) < _API_INTENT_TAGS_MIN:
+            raise ValueError(
+                f"Companion ingest requires at least {_API_INTENT_TAGS_MIN} "
+                f"intent_tags (got {len(tags)})."
+            )
+        p = float(sig.p_magnitude)
+        if p < _API_P_MAGNITUDE_MIN or p > _API_P_MAGNITUDE_MAX:
+            raise ValueError(
+                f"Companion ingest requires p_magnitude in "
+                f"[{_API_P_MAGNITUDE_MIN}, {_API_P_MAGNITUDE_MAX}] (got {p})."
+            )
+
+    @classmethod
     def _record_to_payload(cls, sig: SignatureRecord) -> dict:
         """
         Full signature dump for ingest / sync.
@@ -360,7 +421,12 @@ class CloudDriver(BaseStorage):
         (t_deadline, urgency_rate, decay_rate, …) plus SDK extras. Unknown
         keys are ignored by DRF; accepted keys must not be silently dropped
         on our side.
+
+        Validates Companion invariants (tags count, p_magnitude range) and
+        maps SDK source labels (e.g. chat) to azus_chat when needed.
         """
+        cls._validate_ingest_record(sig)
+
         meta: dict[str, Any] = dict(sig.metadata or {})
         if sig.idempotency_key:
             meta["_idempotency_key"] = sig.idempotency_key
@@ -376,13 +442,14 @@ class CloudDriver(BaseStorage):
             "effective_spike": sig.effective_spike,
             "decay_rate_sdk": sig.decay_rate,
             "t_event_at": cls._iso(sig.t_event_at),
+            "source_sdk": sig.source,
         }
 
         return {
             "id": sig.id,
             "user": sig.user,
             "compressed_fact": sig.compressed_fact,
-            "source": sig.source,
+            "source": cls._map_api_source(sig.source),
             "p_magnitude": sig.p_magnitude,
             "t_persistence": sig.t_persistence,
             "phase_privilege": sig.phase_privilege,

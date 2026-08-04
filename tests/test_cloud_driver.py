@@ -56,8 +56,46 @@ class TestCloudPayloadRoundTrip:
         assert payload["domain"] == "reminder"
         assert payload["id"] == sig.id
         assert payload["decay_rate"] == 0.05  # clamped from 0.9
+        assert payload["source"] == "azus_chat"  # SDK "chat" mapped for Companion
         assert payload["metadata"]["_pdm_sdk"]["client_id"] == sig.id
         assert payload["metadata"]["_pdm_sdk"]["decay_rate_sdk"] == 0.9
+        assert payload["metadata"]["_pdm_sdk"]["source_sdk"] == "chat"
+
+    def test_payload_rejects_too_few_intent_tags(self):
+        sig = SignatureRecord(
+            user="alice",
+            compressed_fact="Too few tags",
+            source="azus_chat",
+            p_magnitude=70.0,
+            intent_tags=["only", "two"],
+            drawer_domain="calendar",
+        )
+        with pytest.raises(ValueError, match="intent_tags"):
+            CloudDriver._record_to_payload(sig)
+
+    def test_payload_rejects_low_p_magnitude(self):
+        sig = SignatureRecord(
+            user="alice",
+            compressed_fact="Too low pressure",
+            source="azus_chat",
+            p_magnitude=40.0,
+            intent_tags=["a", "b", "c"],
+            drawer_domain="calendar",
+        )
+        with pytest.raises(ValueError, match="p_magnitude"):
+            CloudDriver._record_to_payload(sig)
+
+    def test_payload_preserves_valid_companion_source(self):
+        sig = SignatureRecord(
+            user="alice",
+            compressed_fact="Manual note",
+            source="manual",
+            p_magnitude=55.0,
+            intent_tags=["a", "b", "c"],
+            drawer_domain="calendar",
+        )
+        payload = CloudDriver._record_to_payload(sig)
+        assert payload["source"] == "manual"
 
     def test_payload_to_record_restores_fields(self):
         deadline = datetime(2026, 8, 1, tzinfo=timezone.utc)
@@ -136,6 +174,82 @@ class TestCloudFailFast:
 
         with pytest.raises(CloudStorageError):
             _driver().update("id-1", user="u", p_magnitude=90.0)
+
+    @patch("httpx.get")
+    def test_list_parses_companion_signatures_key(self, mock_get):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "count": 1,
+            "signatures": [
+                {
+                    "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                    "user": "alice",
+                    "compressed_fact": "From companion shape",
+                    "source": "azus_chat",
+                    "p_magnitude": 70.0,
+                    "intent_tags": ["a", "b", "c"],
+                    "drawer": "research",
+                }
+            ],
+        }
+        mock_get.return_value = mock_resp
+
+        rows = _driver().list(limit=10)
+        assert len(rows) == 1
+        assert rows[0].compressed_fact == "From companion shape"
+        mock_get.assert_called_once()
+        assert mock_get.call_args.kwargs["params"]["min_p"] == 0.0
+        assert "min_pressure" not in mock_get.call_args.kwargs["params"]
+
+    @patch("httpx.get")
+    def test_list_raises_on_missing_signatures_key(self, mock_get):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"count": 0}
+        mock_get.return_value = mock_resp
+
+        with pytest.raises(CloudStorageError, match="signatures"):
+            _driver().list()
+
+    @patch("httpx.get")
+    def test_list_raises_on_non_dict_body(self, mock_get):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = []
+        mock_get.return_value = mock_resp
+
+        with pytest.raises(CloudStorageError, match="body type"):
+            _driver().list()
+
+    @patch("httpx.delete")
+    def test_delete_uses_hard_delete(self, mock_delete):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 204
+        mock_resp.text = ""
+        mock_delete.return_value = mock_resp
+
+        _driver().delete("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        mock_delete.assert_called_once()
+        url = mock_delete.call_args.args[0]
+        assert url.endswith("/api/v1/pdm/signatures/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        assert not url.endswith("/")
+
+    @patch("httpx.get")
+    def test_list_drawers_parses_companion_drawers_key(self, mock_get):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "drawers": [
+                {"domain": "research", "signature_count": 3, "avg_pressure": 80.0},
+            ]
+        }
+        mock_get.return_value = mock_resp
+
+        drawers = _driver().list_drawers()
+        assert len(drawers) == 1
+        assert drawers[0].domain == "research"
+        assert drawers[0].signature_count == 3
 
 
 class TestSyncNoDuplicateOnCloudError:
