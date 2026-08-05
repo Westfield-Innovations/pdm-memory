@@ -15,7 +15,6 @@ knows which driver is active.
 from __future__ import annotations
 
 import builtins
-import hashlib
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Generator
@@ -47,7 +46,7 @@ class BaseStorage(ABC):
 
     Every concrete driver (SQLite, Postgres, Cloud) implements the full
     required surface. Defaults remain only for helpers that are not yet
-    uniform across drivers (``count``, ``find_by_hash``) and for no-ops
+    uniform across drivers (``count``) and for no-ops
     (``transaction``, ``close``).
 
     The Memory class depends only on BaseStorage — it never knows which
@@ -138,6 +137,13 @@ class BaseStorage(ABC):
         ...
 
     @abstractmethod
+    def find_by_hash(
+        self, text_hash: str, user: str = "default"
+    ) -> SignatureRecord | None:
+        """Return the live signature matching content hash, if any."""
+        ...
+
+    @abstractmethod
     def ping(self) -> bool:
         """Lightweight storage connectivity check."""
         ...
@@ -145,18 +151,6 @@ class BaseStorage(ABC):
     def count(self, user: str = "default") -> int:
         """Default: list + len (local drivers override with COUNT(*))."""
         return len(self.list(user=user, limit=10_000))
-
-    def find_by_hash(self, text_hash: str, user: str = "default") -> SignatureRecord | None:
-        """Default scan via ``list``; local drivers override with SQL."""
-        for rec in self.list(user=user, limit=10_000):
-            fact = rec.compressed_fact or ""
-            if fact.startswith("[HASH:") and fact.endswith("]"):
-                existing_hash = fact[6:-1]
-            else:
-                existing_hash = hashlib.sha256(fact.encode()).hexdigest()
-            if existing_hash == text_hash:
-                return rec
-        return None
 
     @contextmanager
     def transaction(self) -> Generator[None]:

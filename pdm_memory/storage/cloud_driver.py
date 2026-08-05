@@ -277,6 +277,37 @@ class CloudDriver(BaseStorage):
                 return None
             raise
 
+    def find_by_hash(
+        self, text_hash: str, user: str = "default"
+    ) -> SignatureRecord | None:
+        """
+        GET /api/v1/pdm/signatures/by-hash?hash=...
+
+        Server-side content-hash lookup for Memory.save(dedupe=True).
+        Missing / invalid hash → None. Avoids list-scan BaseStorage default.
+        """
+        digest = (text_hash or "").strip().lower()
+        if not digest:
+            return None
+        try:
+            resp = self._get(
+                "/api/v1/pdm/signatures/by-hash",
+                params={"hash": digest},
+            )
+            data = resp.json() if resp.content else {}
+            if not isinstance(data, dict) or not data.get("id"):
+                return None
+            rec = self._payload_to_record(data)
+            if self._record_deleted(rec):
+                return None
+            return rec
+        except CloudNotFoundError:
+            return None
+        except CloudStorageError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+
     def ping(self) -> bool:
         try:
             self._get("/api/v1/pdm/retrieve", params={"limit": 1, "min_p": 0})

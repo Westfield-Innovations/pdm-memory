@@ -644,3 +644,41 @@ class TestCloudBatchMethods:
             d, "_get", side_effect=CloudNotFoundError("x", status_code=404)
         ):
             assert d.find_by_idempotency_key("missing") is None
+
+    @patch("httpx.get")
+    def test_find_by_hash_hits_lookup_route(self, mock_get):
+        import hashlib
+
+        fact = "Pay invoice"
+        digest = hashlib.sha256(fact.encode()).hexdigest()
+        mid = "11111111-2222-3333-4444-555555555555"
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = b"{}"
+        mock_resp.json.return_value = {
+            "id": mid,
+            "user": "alice",
+            "compressed_fact": fact,
+            "source": "manual",
+            "p_magnitude": 70.0,
+            "intent_tags": ["a", "b", "c"],
+            "drawer": "billing",
+            "is_deleted": False,
+        }
+        mock_get.return_value = mock_resp
+
+        rec = _driver().find_by_hash(digest, user="alice")
+        assert rec is not None
+        assert rec.id == mid
+        assert mock_get.call_args.args[0].endswith("/signatures/by-hash")
+        assert mock_get.call_args.kwargs["params"]["hash"] == digest
+
+    @patch("httpx.get")
+    def test_find_by_hash_404(self, mock_get):
+        from pdm_memory.storage.errors import CloudNotFoundError
+
+        d = _driver()
+        with patch.object(
+            d, "_get", side_effect=CloudNotFoundError("x", status_code=404)
+        ):
+            assert d.find_by_hash("a" * 64) is None

@@ -54,6 +54,9 @@ class _StubStorage(BaseStorage):
     def find_by_idempotency_key(self, idempotency_key, user="default"):
         return None
 
+    def find_by_hash(self, text_hash, user="default"):
+        return None
+
     def ping(self):
         return True
 
