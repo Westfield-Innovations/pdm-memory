@@ -253,6 +253,27 @@ class PostgresDriver(BaseStorage):
         ).fetchone()
         return mapping_to_record(row) if row else None
 
+    def find_by_hashes(
+        self,
+        hashes: builtins.list[str],
+        user: str = "default",
+    ) -> dict[str, SignatureRecord]:
+        cleaned = [h.strip() for h in hashes if h and h.strip()]
+        if not cleaned:
+            return {}
+        unique: list[str] = list(dict.fromkeys(cleaned))
+        placeholders = ",".join("%s" for _ in unique)
+        rows = self._conn().execute(
+            f'SELECT * FROM pdm_signatures WHERE "user" = %s AND is_deleted = 0 '
+            f"AND compressed_fact_hash IN ({placeholders})",
+            [user, *unique],
+        ).fetchall()
+        result: dict[str, SignatureRecord] = {}
+        for row in rows:
+            rec = mapping_to_record(row)
+            result[str(row["compressed_fact_hash"])] = rec
+        return result
+
     def find_by_idempotency_key(
         self,
         idempotency_key: str,
@@ -264,6 +285,28 @@ class PostgresDriver(BaseStorage):
             (user, idempotency_key.strip()),
         ).fetchone()
         return mapping_to_record(row) if row else None
+
+    def find_by_idempotency_keys(
+        self,
+        keys: builtins.list[str],
+        user: str = "default",
+    ) -> dict[str, SignatureRecord]:
+        cleaned = [k.strip() for k in keys if k and str(k).strip()]
+        if not cleaned:
+            return {}
+        unique: list[str] = list(dict.fromkeys(cleaned))
+        placeholders = ",".join("%s" for _ in unique)
+        rows = self._conn().execute(
+            f'SELECT * FROM pdm_signatures WHERE "user" = %s AND is_deleted = 0 '
+            f"AND idempotency_key IN ({placeholders})",
+            [user, *unique],
+        ).fetchall()
+        result: dict[str, SignatureRecord] = {}
+        for row in rows:
+            key = row["idempotency_key"]
+            if key:
+                result[str(key)] = mapping_to_record(row)
+        return result
 
     def ping(self) -> bool:
         try:
@@ -430,6 +473,7 @@ class PostgresDriver(BaseStorage):
         drawer: str | None = None,
         cursor_id: str | None = None,
         include_deleted: bool = False,
+        tag_any: builtins.list[str] | tuple[str, ...] | None = None,
     ) -> builtins.list[SignatureRecord]:
         where = ['"user" = %s', "p_magnitude >= %s"]
         params: list[Any] = [user, min_pressure]
@@ -438,6 +482,13 @@ class PostgresDriver(BaseStorage):
         if drawer:
             where.append("drawer_domain = %s")
             params.append(drawer)
+        tags = [t.strip().lower() for t in (tag_any or ()) if t and str(t).strip()]
+        if tags:
+            tag_clauses: list[str] = []
+            for tag in tags[:32]:
+                tag_clauses.append("LOWER(intent_tags) LIKE %s")
+                params.append(f'%"{tag}"%')
+            where.append("(" + " OR ".join(tag_clauses) + ")")
         if cursor_id:
             cursor = self._conn().execute(
                 'SELECT p_magnitude FROM pdm_signatures WHERE id = %s AND "user" = %s',

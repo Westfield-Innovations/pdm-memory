@@ -304,12 +304,39 @@ class Memory:
         Returns:
             Dict with ``saved``, ``skipped``, ``errors`` counts.
         """
+        from pdm_memory.storage.schema import hash_fact_text
+
         saved = 0
         skipped = 0
         errors = 0
         sigs_to_save: list[SignatureRecord] = []
         seen_idempotency_keys: set[str] = set()
         seen_hashes: set[str] = set()
+        reinforce_ids: list[str] = []
+
+        # Preload batch lookups once — avoids N× find_by_hash / idempotency RTTs.
+        pending_keys: list[str] = []
+        pending_hashes: list[str] = []
+        for item in items:
+            text = str(item.get("text") or item.get("compressed_fact") or "").strip()
+            if not text:
+                continue
+            key = str(item.get("idempotency_key") or "").strip()
+            if key:
+                pending_keys.append(key)
+            if dedupe:
+                pending_hashes.append(hash_fact_text(text[:500]))
+
+        existing_by_key = (
+            self._storage.find_by_idempotency_keys(pending_keys, user=self._user)
+            if pending_keys
+            else {}
+        )
+        existing_by_hash = (
+            self._storage.find_by_hashes(pending_hashes, user=self._user)
+            if pending_hashes
+            else {}
+        )
 
         txn = getattr(self._storage, "transaction", None)
         ctx: AbstractContextManager[None] = txn() if callable(txn) else nullcontext()
@@ -327,28 +354,20 @@ class Memory:
                         if idempotency_key in seen_idempotency_keys:
                             skipped += 1
                             continue
-                        existing = self._storage.find_by_idempotency_key(
-                            idempotency_key,
-                            user=self._user,
-                        )
-                        if existing is not None:
+                        if idempotency_key in existing_by_key:
                             skipped += 1
                             continue
                         seen_idempotency_keys.add(idempotency_key)
-
-                    from pdm_memory.storage.schema import hash_fact_text
 
                     if dedupe:
                         fact_hash = hash_fact_text(text[:500])
                         if fact_hash in seen_hashes:
                             skipped += 1
                             continue
-                        existing = self._storage.find_by_hash(
-                            fact_hash, user=self._user
-                        )
+                        existing = existing_by_hash.get(fact_hash)
                         if existing is not None:
                             if dedupe_reinforce:
-                                self.reinforce(existing.id)
+                                reinforce_ids.append(existing.id)
                             skipped += 1
                             seen_hashes.add(fact_hash)
                             continue
@@ -394,6 +413,12 @@ class Memory:
                             errors += 1
                     if len(save_results) < len(sigs_to_save):
                         errors += len(sigs_to_save) - len(save_results)
+
+        for memory_id in reinforce_ids:
+            try:
+                self.reinforce(memory_id)
+            except Exception as exc:
+                logger.warning("[PDM] save_many dedupe reinforce failed for %s: %s", memory_id, exc)
 
         logger.info("[PDM] save_many saved=%d skipped=%d errors=%d", saved, skipped, errors)
         return {"saved": saved, "skipped": skipped, "errors": errors}
@@ -547,9 +572,12 @@ class Memory:
         errors = 0
         prepared_updates: list[tuple[str, dict[str, Any]]] = []
 
+        ids = [memory_id for memory_id, _ in updates]
+        records = self._storage.get_many(ids, user=self._user) if ids else {}
+
         for memory_id, raw_fields in updates:
             try:
-                rec = self._storage.get(memory_id, user=self._user)
+                rec = records.get(memory_id)
                 if rec is None:
                     errors += 1
                     continue
@@ -606,7 +634,7 @@ class Memory:
         drawer: str | None = None,
         reinforce: bool = True,
         *,
-        candidate_limit: int = 10_000,
+        candidate_limit: int = 2_000,
         page_size: int = 500,
         diversity_bias: float | None = DEFAULT_DIVERSITY_BIAS,
         on_recall: RecallHook | None = None,
@@ -629,7 +657,7 @@ class Memory:
             search_cost: 0.0 = strict (high threshold), 1.0 = loose (low threshold).
             drawer:      Optional: filter by drawer name.
             reinforce:   If True, increment retrieval_count and update last_retrieved.
-            candidate_limit: Max signatures loaded from storage for ranking (default 10_000).
+            candidate_limit: Max signatures loaded from storage for ranking (default 2_000).
             page_size:       Keyset page size when loading candidates (default 500).
             diversity_bias:  Max fraction of top-k from one drawer (default ``0.4``).
                              Pass ``None`` for pure score order.
@@ -639,6 +667,7 @@ class Memory:
             List[MemoryHit] ranked by relevance, length ≤ k.
         """
         records = self._load_recall_candidates(
+            query=query,
             min_pressure=min_pressure,
             drawer=drawer,
             candidate_limit=candidate_limit,
@@ -1628,36 +1657,63 @@ class Memory:
     def _load_recall_candidates(
         self,
         *,
+        query: str | None = None,
         min_pressure: float,
         drawer: str | None,
         candidate_limit: int,
         page_size: int,
     ) -> builtins.list[SignatureRecord]:
-        """Load recall candidates via keyset pagination instead of one bulk query."""
+        """Load recall candidates via keyset pagination instead of one bulk query.
+
+        When ``query`` has tokens, first page with ``tag_any`` prefilter. If that
+        yields too few rows, fill remainder from pressure-ordered unfiltered pages.
+        """
         if candidate_limit <= 0:
             return []
 
         page_size = max(1, min(page_size, candidate_limit))
-        records: list[SignatureRecord] = []
-        cursor_id: str | None = None
+        query_tokens = RetrievalEngine._tokenize_query(query) if query else []
 
-        while len(records) < candidate_limit:
-            batch_limit = min(page_size, candidate_limit - len(records))
-            batch = self._storage.list(
-                user=self._user,
-                limit=batch_limit,
-                min_pressure=min_pressure,
-                drawer=drawer,
-                cursor_id=cursor_id,
-            )
-            if not batch:
-                break
-            records.extend(batch)
-            if len(batch) < batch_limit:
-                break
-            cursor_id = batch[-1].id
+        def _paginate(tag_any: builtins.list[str] | None) -> builtins.list[SignatureRecord]:
+            records: list[SignatureRecord] = []
+            cursor_id: str | None = None
+            while len(records) < candidate_limit:
+                batch_limit = min(page_size, candidate_limit - len(records))
+                batch = self._storage.list(
+                    user=self._user,
+                    limit=batch_limit,
+                    min_pressure=min_pressure,
+                    drawer=drawer,
+                    cursor_id=cursor_id,
+                    tag_any=tag_any,
+                )
+                if not batch:
+                    break
+                records.extend(batch)
+                if len(batch) < batch_limit:
+                    break
+                cursor_id = batch[-1].id
+            return records
 
-        return records
+        if not query_tokens:
+            return _paginate(None)
+
+        tagged = _paginate(query_tokens)
+        # Enough tag hits — prefer them (cheaper + more relevant).
+        min_fill = min(candidate_limit, max(50, page_size))
+        if len(tagged) >= min_fill:
+            return tagged
+
+        # Fallthrough: merge pressure-ordered fill for sparse tag indexes.
+        by_id = {rec.id: rec for rec in tagged}
+        for rec in _paginate(None):
+            if rec.id not in by_id:
+                by_id[rec.id] = rec
+            if len(by_id) >= candidate_limit:
+                break
+        merged = list(by_id.values())
+        merged.sort(key=lambda r: (r.p_magnitude, r.id), reverse=True)
+        return merged[:candidate_limit]
 
     def _init_storage(
         self,

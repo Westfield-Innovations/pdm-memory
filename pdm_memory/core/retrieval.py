@@ -126,6 +126,8 @@ _INTEGRITY_DRAWERS: frozenset[str] = frozenset(
 _INTEGRITY_TAGS: frozenset[str] = frozenset(
     {"anchor", "foundational", "goal", "policy", "principle", "rule", "stewardship"}
 )
+# Cap pairs per shared tag — hot tags otherwise go O(n²).
+_TAG_FANOUT_CAP: int = 64
 # PDM-T: how hard urgency energy lifts ranking / Phase-1 gate
 _TEMPORAL_RANK_BOOST: float = 0.35
 _TEMPORAL_GATE_BOOST: float = 0.25
@@ -874,11 +876,34 @@ class RetrievalEngine:
         self,
         records: Sequence[SignatureRecord],
     ) -> Iterator[tuple[SignatureRecord, SignatureRecord]]:
+        """Yield (anchor, signal) only when cue tokens/tags overlap.
+
+        Avoids anchors × signals Cartesian product. Cue-less anchors (rare)
+        still scan all signals to fail closed on opaque stewardship rules.
+        """
         anchors = [record for record in records if self._is_integrity_anchor(record)]
         signals = [record for record in records if not self._is_integrity_anchor(record)]
+        if not anchors or not signals:
+            return
+
+        signal_cues: list[tuple[SignatureRecord, frozenset[str]]] = [
+            (signal, self._integrity_cues(signal)) for signal in signals
+        ]
         for anchor in anchors:
-            for signal in signals:
-                yield anchor, signal
+            cues = self._integrity_cues(anchor)
+            if not cues:
+                for signal, _ in signal_cues:
+                    yield anchor, signal
+                continue
+            for signal, signal_cue in signal_cues:
+                if cues & signal_cue:
+                    yield anchor, signal
+
+    @classmethod
+    def _integrity_cues(cls, record: SignatureRecord) -> frozenset[str]:
+        tags = {tag.lower() for tag in (record.intent_tags or []) if tag}
+        tokens = set(cls._tokenize_query(record.compressed_fact or ""))
+        return frozenset(tags | tokens)
 
     @staticmethod
     def _is_integrity_anchor(record: SignatureRecord) -> bool:
@@ -1135,6 +1160,13 @@ class RetrievalEngine:
         for ids in tag_index.values():
             if len(ids) < 2:
                 continue
+            # Hot-tag fan-out cap: keep highest-pressure ids so we don't explode.
+            if len(ids) > _TAG_FANOUT_CAP:
+                ids = sorted(
+                    ids,
+                    key=lambda rid: (by_id[rid].p_magnitude, rid),
+                    reverse=True,
+                )[:_TAG_FANOUT_CAP]
             for i in range(len(ids)):
                 for j in range(i + 1, len(ids)):
                     yield from emit(ids[i], ids[j])

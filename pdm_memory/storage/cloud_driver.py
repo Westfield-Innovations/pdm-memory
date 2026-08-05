@@ -176,6 +176,7 @@ class CloudDriver(BaseStorage):
         drawer: str | None = None,
         cursor_id: str | None = None,
         include_deleted: bool = False,
+        tag_any: builtins.list[str] | tuple[str, ...] | None = None,
     ) -> builtins.list[SignatureRecord]:
         """GET /api/v1/pdm/retrieve — client-side keyset when API has no cursor param."""
         fetch_limit = limit if cursor_id is None else max(limit * 4, 200)
@@ -188,6 +189,14 @@ class CloudDriver(BaseStorage):
         records = [self._payload_to_record(item) for item in items]
         if not include_deleted:
             records = [rec for rec in records if not self._record_deleted(rec)]
+        tags = {t.strip().lower() for t in (tag_any or ()) if t and str(t).strip()}
+        if tags:
+            filtered: list[SignatureRecord] = []
+            for rec in records:
+                rec_tags = {tag.lower() for tag in (rec.intent_tags or []) if tag}
+                if rec_tags & tags:
+                    filtered.append(rec)
+            records = filtered
         records.sort(key=lambda rec: (rec.p_magnitude, rec.id))
         records.reverse()
 

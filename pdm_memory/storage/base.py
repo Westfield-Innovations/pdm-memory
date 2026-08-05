@@ -18,7 +18,7 @@ import builtins
 import hashlib
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -143,11 +143,14 @@ class BaseStorage(ABC):
         drawer: str | None = None,
         cursor_id: str | None = None,
         include_deleted: bool = False,
+        tag_any: Sequence[str] | None = None,
     ) -> builtins.list[SignatureRecord]:
         """
         List signatures ordered by ``p_magnitude DESC, id DESC``.
 
         Keyset pagination: pass ``cursor_id`` from the last item of the previous page.
+        Optional ``tag_any``: prefer records whose ``intent_tags`` contain any token
+        (drivers without native support may ignore or filter client-side).
         """
         ...
 
@@ -170,6 +173,22 @@ class BaseStorage(ABC):
                 return rec
         return None
 
+    def find_by_hashes(
+        self,
+        hashes: builtins.list[str],
+        user: str = "default",
+    ) -> dict[str, SignatureRecord]:
+        """Map fact-hash → record for hashes that exist. Default: loop find_by_hash."""
+        result: dict[str, SignatureRecord] = {}
+        for text_hash in hashes:
+            key = (text_hash or "").strip()
+            if not key or key in result:
+                continue
+            rec = self.find_by_hash(key, user=user)
+            if rec is not None:
+                result[key] = rec
+        return result
+
     def find_by_idempotency_key(
         self,
         idempotency_key: str,
@@ -185,6 +204,22 @@ class BaseStorage(ABC):
             if meta_key == key:
                 return rec
         return None
+
+    def find_by_idempotency_keys(
+        self,
+        keys: builtins.list[str],
+        user: str = "default",
+    ) -> dict[str, SignatureRecord]:
+        """Map idempotency_key → record. Default: loop find_by_idempotency_key."""
+        result: dict[str, SignatureRecord] = {}
+        for raw in keys:
+            key = (raw or "").strip()
+            if not key or key in result:
+                continue
+            rec = self.find_by_idempotency_key(key, user=user)
+            if rec is not None:
+                result[key] = rec
+        return result
 
     def ping(self) -> bool:
         """Lightweight storage connectivity check."""
