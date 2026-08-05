@@ -199,8 +199,102 @@ class TestCloudFailFast:
         assert len(rows) == 1
         assert rows[0].compressed_fact == "From companion shape"
         mock_get.assert_called_once()
+        assert mock_get.call_args.args[0].endswith("/api/v1/pdm/signatures")
         assert mock_get.call_args.kwargs["params"]["min_p"] == 0.0
         assert "min_pressure" not in mock_get.call_args.kwargs["params"]
+        assert "origin_index" not in mock_get.call_args.kwargs["params"]
+
+    @patch("httpx.get")
+    def test_list_walks_pages_via_next_cursor(self, mock_get):
+        from pdm_memory.storage.cloud_driver import _API_PAGE_MAX
+
+        def _item(i: int):
+            return {
+                "id": f"id-{i:04d}",
+                "user": "alice",
+                "compressed_fact": f"Fact {i}",
+                "source": "manual",
+                "p_magnitude": float(100 - i),
+                "intent_tags": ["a", "b", "c"],
+                "drawer": "research",
+            }
+
+        page1 = {
+            "signatures": [_item(i) for i in range(_API_PAGE_MAX)],
+            "next_cursor_id": f"id-{_API_PAGE_MAX - 1:04d}",
+        }
+        page2 = {
+            "signatures": [_item(_API_PAGE_MAX + i) for i in range(50)],
+            "next_cursor_id": None,
+        }
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.side_effect = [page1, page2]
+        mock_get.return_value = mock_resp
+
+        rows = _driver().list(limit=_API_PAGE_MAX + 50)
+        assert len(rows) == _API_PAGE_MAX + 50
+        assert mock_get.call_count == 2
+        assert mock_get.call_args_list[0].args[0].endswith("/api/v1/pdm/signatures")
+        first_params = mock_get.call_args_list[0].kwargs["params"]
+        second_params = mock_get.call_args_list[1].kwargs["params"]
+        assert first_params["limit"] == _API_PAGE_MAX
+        assert "cursor_id" not in first_params
+        assert second_params["cursor_id"] == f"id-{_API_PAGE_MAX - 1:04d}"
+        assert second_params["limit"] == 50
+
+    @patch("httpx.get")
+    def test_list_passes_initial_cursor_id(self, mock_get):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "signatures": [
+                {
+                    "id": "id-2",
+                    "user": "alice",
+                    "compressed_fact": "After cursor",
+                    "source": "manual",
+                    "p_magnitude": 60.0,
+                    "intent_tags": ["a", "b", "c"],
+                    "drawer": "research",
+                }
+            ],
+            "next_cursor_id": None,
+        }
+        mock_get.return_value = mock_resp
+
+        rows = _driver().list(limit=10, cursor_id="id-1")
+        assert len(rows) == 1
+        assert mock_get.call_args.kwargs["params"]["cursor_id"] == "id-1"
+
+    @patch("httpx.get")
+    def test_count_uses_pagination_total(self, mock_get):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "signatures": [
+                {
+                    "id": "x",
+                    "user": "alice",
+                    "compressed_fact": "one",
+                    "source": "manual",
+                    "p_magnitude": 70,
+                    "intent_tags": ["a", "b", "c"],
+                    "drawer": "research",
+                }
+            ],
+            "pagination": {
+                "page_size": 1,
+                "total_count": 278,
+            },
+        }
+        mock_get.return_value = mock_resp
+
+        assert _driver().count() == 278
+        assert mock_get.call_args.args[0].endswith("/api/v1/pdm/signatures")
+        params = mock_get.call_args.kwargs["params"]
+        assert params["limit"] == 1
+        assert params["min_p"] == 0.0
 
     @patch("httpx.get")
     def test_list_raises_on_missing_signatures_key(self, mock_get):
@@ -294,7 +388,7 @@ class TestSyncNoDuplicateOnCloudError:
 
 
 class TestCloudBatchMethods:
-    """save_batch / get_many / update_batch — bulk routes with 404 fallback."""
+    """save_batch / get_many / update_batch — bulk routes, fail-fast (no sequential fallback)."""
 
     @patch("httpx.post")
     def test_save_batch_uses_ingest_batch(self, mock_post):
@@ -350,31 +444,89 @@ class TestCloudBatchMethods:
         assert "intent_tags" in (results[0].error or "")
 
     @patch("httpx.post")
-    def test_save_batch_falls_back_on_404(self, mock_post):
+    def test_save_batch_raises_on_404(self, mock_post):
         batch_404 = MagicMock()
         batch_404.status_code = 404
         batch_404.text = "not found"
         batch_404.content = b"not found"
-
-        success = MagicMock()
-        success.status_code = 201
-        success.content = b"{}"
-        success.json.return_value = {"id": "from-single"}
-        mock_post.side_effect = [batch_404, success]
+        mock_post.return_value = batch_404
 
         sig = SignatureRecord(
             user="alice",
-            compressed_fact="Fallback single",
+            compressed_fact="No fallback single",
             source="azus_chat",
             p_magnitude=60.0,
             intent_tags=["a", "b", "c"],
             drawer_domain="research",
         )
-        results = _driver().save_batch([sig])
-        assert results[0].id == "from-single"
+        with pytest.raises(CloudStorageError) as exc:
+            _driver().save_batch([sig])
+        assert exc.value.status_code == 404
+        mock_post.assert_called_once()
+        assert mock_post.call_args.args[0].endswith("/ingest/batch")
+
+    @patch("httpx.post")
+    def test_save_batch_mid_stream_404_raises_after_partial(self, mock_post):
+        """404 on a later chunk raises; no sequential re-ingest of prior or remaining rows."""
+        from pdm_memory.storage.cloud_driver import _API_BATCH_MAX
+
+        def _sig(i: int) -> SignatureRecord:
+            return SignatureRecord(
+                user="alice",
+                compressed_fact=f"Chunk fact {i}",
+                source="azus_chat",
+                p_magnitude=60.0,
+                intent_tags=["a", "b", "c"],
+                drawer_domain="research",
+            )
+
+        n = _API_BATCH_MAX + 2
+        sigs = [_sig(i) for i in range(n)]
+
+        ok_chunk = MagicMock()
+        ok_chunk.status_code = 200
+        ok_chunk.content = b"{}"
+        ok_chunk.json.return_value = {
+            "results": [
+                {"index": i, "id": f"bulk-{i}", "error": None}
+                for i in range(_API_BATCH_MAX)
+            ]
+        }
+        gone = MagicMock()
+        gone.status_code = 404
+        gone.text = "not found"
+        gone.content = b"not found"
+        mock_post.side_effect = [ok_chunk, gone]
+
+        with pytest.raises(CloudStorageError) as exc:
+            _driver().save_batch(sigs)
+        assert exc.value.status_code == 404
         assert mock_post.call_count == 2
-        assert mock_post.call_args_list[0].args[0].endswith("/ingest/batch")
-        assert mock_post.call_args_list[1].args[0].endswith("/pdm/ingest")
+        assert all("/ingest/batch" in c.args[0] for c in mock_post.call_args_list)
+
+    @patch("httpx.post")
+    def test_get_many_404_raises(self, mock_post):
+        gone = MagicMock()
+        gone.status_code = 404
+        gone.text = "not found"
+        gone.content = b"not found"
+        mock_post.return_value = gone
+
+        with pytest.raises(CloudStorageError) as exc:
+            _driver().get_many(["id-1"])
+        assert exc.value.status_code == 404
+
+    @patch("httpx.post")
+    def test_update_batch_404_raises(self, mock_post):
+        gone = MagicMock()
+        gone.status_code = 404
+        gone.text = "not found"
+        gone.content = b"not found"
+        mock_post.return_value = gone
+
+        with pytest.raises(CloudStorageError) as exc:
+            _driver().update_batch([("mid-1", {"p_magnitude": 80.0})])
+        assert exc.value.status_code == 404
 
     @patch("httpx.post")
     def test_get_many_uses_batch_get(self, mock_post):

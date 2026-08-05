@@ -35,6 +35,8 @@ DEFAULT_CLOUD_URL = "http://localhost:8000"
 
 # Match companion_api.pdm.signature_mutations.MAX_BATCH_SIZE
 _API_BATCH_MAX = 100
+# Must match companion_api.pdm.apis.pdm_views._RETRIEVE_MAX_PAGE_SIZE
+_API_PAGE_MAX = 200
 _API_DECAY_RATE_MIN = 0.01
 _API_DECAY_RATE_MAX = 0.5
 _API_URGENCY_MIN = 1.0
@@ -108,13 +110,13 @@ class CloudDriver(BaseStorage):
         self, sigs: builtins.list[SignatureRecord]
     ) -> builtins.list[SaveBatchResult]:
         """
-        Bulk create via POST /api/v1/pdm/ingest/batch when available.
+        Bulk create via POST /api/v1/pdm/ingest/batch.
 
         Semantics mirror SQLite/Postgres:
         - empty input → []
         - per-index SaveBatchResult with id or error (partial success)
         - client pre-validation errors without HTTP
-        - HTTP 404 on bulk path → fall back to N× save() (older deployments)
+        - bulk route errors (including 404) propagate as CloudStorageError 
         """
         if not sigs:
             return []
@@ -136,67 +138,47 @@ class CloudDriver(BaseStorage):
         if not pending:
             return results
 
-        try:
-            for start in range(0, len(pending), _API_BATCH_MAX):
-                chunk = pending[start : start + _API_BATCH_MAX]
-                items = [payload for _, payload in chunk]
-                resp = self._post(
-                    "/api/v1/pdm/ingest/batch",
-                    {"items": items},
+        for start in range(0, len(pending), _API_BATCH_MAX):
+            chunk = pending[start : start + _API_BATCH_MAX]
+            items = [payload for _, payload in chunk]
+            resp = self._post(
+                "/api/v1/pdm/ingest/batch",
+                {"items": items},
+            )
+            data = resp.json() if resp.content else {}
+            api_results = data.get("results") if isinstance(data, dict) else None
+            if not isinstance(api_results, list):
+                raise CloudStorageError(
+                    "Batch ingest response missing 'results' list",
+                    path="/api/v1/pdm/ingest/batch",
+                    status_code=getattr(resp, "status_code", None),
                 )
-                data = resp.json() if resp.content else {}
-                api_results = data.get("results") if isinstance(data, dict) else None
-                if not isinstance(api_results, list):
-                    raise CloudStorageError(
-                        "Batch ingest response missing 'results' list",
-                        path="/api/v1/pdm/ingest/batch",
-                        status_code=getattr(resp, "status_code", None),
+            for entry in api_results:
+                if not isinstance(entry, dict):
+                    continue
+                local_i = entry.get("index")
+                if not isinstance(local_i, int) or not (
+                    0 <= local_i < len(chunk)
+                ):
+                    continue
+                orig_index = chunk[local_i][0]
+                err = entry.get("error")
+                cid = entry.get("id")
+                if err:
+                    results[orig_index] = SaveBatchResult(
+                        index=orig_index, id=None, error=str(err)
                     )
-                for entry in api_results:
-                    if not isinstance(entry, dict):
-                        continue
-                    local_i = entry.get("index")
-                    if not isinstance(local_i, int) or not (
-                        0 <= local_i < len(chunk)
-                    ):
-                        continue
-                    orig_index = chunk[local_i][0]
-                    err = entry.get("error")
-                    cid = entry.get("id")
-                    if err:
-                        results[orig_index] = SaveBatchResult(
-                            index=orig_index, id=None, error=str(err)
-                        )
-                    elif cid:
-                        results[orig_index] = SaveBatchResult(
-                            index=orig_index, id=str(cid)
-                        )
-                    else:
-                        results[orig_index] = SaveBatchResult(
-                            index=orig_index,
-                            id=None,
-                            error="Batch ingest returned no id",
-                        )
-        except CloudStorageError as exc:
-            if exc.status_code == 404:
-                logger.warning(
-                    "[PDM-Cloud] ingest/batch unavailable; falling back to N× save()"
-                )
-                return self._save_batch_sequential(sigs)
-            raise
+                elif cid:
+                    results[orig_index] = SaveBatchResult(
+                        index=orig_index, id=str(cid)
+                    )
+                else:
+                    results[orig_index] = SaveBatchResult(
+                        index=orig_index,
+                        id=None,
+                        error="Batch ingest returned no id",
+                    )
 
-        return results
-
-    def _save_batch_sequential(
-        self, sigs: builtins.list[SignatureRecord]
-    ) -> builtins.list[SaveBatchResult]:
-        results: list[SaveBatchResult] = []
-        for i, sig in enumerate(sigs):
-            try:
-                new_id = self.save(sig)
-                results.append(SaveBatchResult(index=i, id=new_id))
-            except Exception as e:
-                results.append(SaveBatchResult(index=i, id=None, error=str(e)))
         return results
 
     def get(self, memory_id: str, user: str = "default") -> SignatureRecord | None:
@@ -227,7 +209,7 @@ class CloudDriver(BaseStorage):
         Bulk-fetch via POST /api/v1/pdm/signatures/batch-get.
 
         Same contract as SQLite/Postgres: dict keyed by id; missing ids
-        omitted. HTTP 404 bulk path → N× get() fallback.
+        omitted. Bulk route errors (including 404) raise.
         """
         if not ids:
             return {}
@@ -235,52 +217,32 @@ class CloudDriver(BaseStorage):
         unique_ids = list(dict.fromkeys(str(i) for i in ids if i))
         result: dict[str, SignatureRecord] = {}
 
-        try:
-            for start in range(0, len(unique_ids), _API_BATCH_MAX):
-                chunk = unique_ids[start : start + _API_BATCH_MAX]
-                resp = self._post(
-                    "/api/v1/pdm/signatures/batch-get",
-                    {"ids": chunk},
+        for start in range(0, len(unique_ids), _API_BATCH_MAX):
+            chunk = unique_ids[start : start + _API_BATCH_MAX]
+            resp = self._post(
+                "/api/v1/pdm/signatures/batch-get",
+                {"ids": chunk},
+            )
+            data = resp.json() if resp.content else {}
+            if not isinstance(data, dict):
+                raise CloudStorageError(
+                    f"Unexpected batch-get body type: {type(data).__name__}",
+                    path="/api/v1/pdm/signatures/batch-get",
                 )
-                data = resp.json() if resp.content else {}
-                if not isinstance(data, dict):
-                    raise CloudStorageError(
-                        f"Unexpected batch-get body type: {type(data).__name__}",
-                        path="/api/v1/pdm/signatures/batch-get",
-                    )
-                items = data.get("signatures")
-                if not isinstance(items, list):
-                    raise CloudStorageError(
-                        "Batch-get response missing 'signatures' list",
-                        path="/api/v1/pdm/signatures/batch-get",
-                    )
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    rec = self._payload_to_record(item)
-                    if self._record_deleted(rec):
-                        continue
-                    result[rec.id] = rec
-        except CloudStorageError as exc:
-            if exc.status_code == 404:
-                logger.warning(
-                    "[PDM-Cloud] batch-get unavailable; falling back to N× get()"
+            items = data.get("signatures")
+            if not isinstance(items, list):
+                raise CloudStorageError(
+                    "Batch-get response missing 'signatures' list",
+                    path="/api/v1/pdm/signatures/batch-get",
                 )
-                return self._get_many_sequential(ids, user=user)
-            raise
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                rec = self._payload_to_record(item)
+                if self._record_deleted(rec):
+                    continue
+                result[rec.id] = rec
 
-        return result
-
-    def _get_many_sequential(
-        self,
-        ids: builtins.list[str],
-        user: str = "default",
-    ) -> dict[str, SignatureRecord]:
-        result: dict[str, SignatureRecord] = {}
-        for memory_id in ids:
-            rec = self.get(memory_id, user=user)
-            if rec is not None:
-                result[memory_id] = rec
         return result
 
     def find_by_idempotency_key(
@@ -343,7 +305,7 @@ class CloudDriver(BaseStorage):
         Bulk PATCH via POST /api/v1/pdm/signatures/batch-update.
 
         Per-index UpdateBatchResult with id + optional error, like local drivers.
-        HTTP 404 bulk → N× update() fallback.
+        Bulk route errors (including 404) raise.
         """
         if not updates:
             return []
@@ -376,71 +338,45 @@ class CloudDriver(BaseStorage):
         if not prepared:
             return results
 
-        try:
-            for start in range(0, len(prepared), _API_BATCH_MAX):
-                chunk = prepared[start : start + _API_BATCH_MAX]
-                payload = {
-                    "updates": [
-                        {"id": memory_id, **fields}
-                        for _, memory_id, fields in chunk
-                    ]
-                }
-                resp = self._post(
-                    "/api/v1/pdm/signatures/batch-update",
-                    payload,
+        for start in range(0, len(prepared), _API_BATCH_MAX):
+            chunk = prepared[start : start + _API_BATCH_MAX]
+            payload = {
+                "updates": [
+                    {"id": memory_id, **fields}
+                    for _, memory_id, fields in chunk
+                ]
+            }
+            resp = self._post(
+                "/api/v1/pdm/signatures/batch-update",
+                payload,
+            )
+            data = resp.json() if resp.content else {}
+            api_results = data.get("results") if isinstance(data, dict) else None
+            if not isinstance(api_results, list):
+                raise CloudStorageError(
+                    "Batch-update response missing 'results' list",
+                    path="/api/v1/pdm/signatures/batch-update",
                 )
-                data = resp.json() if resp.content else {}
-                api_results = data.get("results") if isinstance(data, dict) else None
-                if not isinstance(api_results, list):
-                    raise CloudStorageError(
-                        "Batch-update response missing 'results' list",
-                        path="/api/v1/pdm/signatures/batch-update",
+            for entry in api_results:
+                if not isinstance(entry, dict):
+                    continue
+                local_i = entry.get("index")
+                if not isinstance(local_i, int) or not (
+                    0 <= local_i < len(chunk)
+                ):
+                    continue
+                orig_index = chunk[local_i][0]
+                mid = chunk[local_i][1]
+                err = entry.get("error")
+                if err:
+                    results[orig_index] = UpdateBatchResult(
+                        index=orig_index, id=mid, error=str(err)
                     )
-                for entry in api_results:
-                    if not isinstance(entry, dict):
-                        continue
-                    local_i = entry.get("index")
-                    if not isinstance(local_i, int) or not (
-                        0 <= local_i < len(chunk)
-                    ):
-                        continue
-                    orig_index = chunk[local_i][0]
-                    mid = chunk[local_i][1]
-                    err = entry.get("error")
-                    if err:
-                        results[orig_index] = UpdateBatchResult(
-                            index=orig_index, id=mid, error=str(err)
-                        )
-                    else:
-                        results[orig_index] = UpdateBatchResult(
-                            index=orig_index, id=str(entry.get("id") or mid)
-                        )
-        except CloudStorageError as exc:
-            if exc.status_code == 404:
-                logger.warning(
-                    "[PDM-Cloud] batch-update unavailable; falling back to N× update()"
-                )
-                return self._update_batch_sequential(updates, user=user)
-            raise
+                else:
+                    results[orig_index] = UpdateBatchResult(
+                        index=orig_index, id=str(entry.get("id") or mid)
+                    )
 
-        return results
-
-    def _update_batch_sequential(
-        self,
-        updates: builtins.list[tuple[str, dict]],
-        user: str = "default",
-    ) -> builtins.list[UpdateBatchResult]:
-        if not updates:
-            return []
-        results: list[UpdateBatchResult] = []
-        for i, (memory_id, fields) in enumerate(updates):
-            try:
-                self.update(memory_id, user=user, **fields)
-                results.append(UpdateBatchResult(index=i, id=memory_id))
-            except Exception as e:
-                results.append(
-                    UpdateBatchResult(index=i, id=memory_id, error=str(e))
-                )
         return results
 
     def delete(self, memory_id: str, user: str = "default") -> None:
@@ -454,21 +390,7 @@ class CloudDriver(BaseStorage):
 
     def hard_delete(self, memory_id: str, user: str = "default") -> None:
         """DELETE /api/v1/pdm/signatures/<id> — permanent removal."""
-        import httpx
-
-        self._auth.ensure_fresh()
-        path = f"/api/v1/pdm/signatures/{memory_id}"
-        try:
-            resp = httpx.delete(
-                f"{self._base_url}{path}",
-                headers=self._auth.headers(),
-                timeout=self._timeout,
-            )
-        except httpx.HTTPError as exc:
-            raise CloudStorageError(
-                f"Cloud DELETE failed: {exc}", path=path
-            ) from exc
-        self._raise_for_status(resp, path)
+        self._delete(f"/api/v1/pdm/signatures/{memory_id}")
 
     def list(
         self,
@@ -479,46 +401,90 @@ class CloudDriver(BaseStorage):
         cursor_id: str | None = None,
         include_deleted: bool = False,
     ) -> builtins.list[SignatureRecord]:
-        """GET /api/v1/pdm/retrieve — client-side keyset when API has no cursor param."""
-        fetch_limit = limit if cursor_id is None else max(limit * 4, 200)
-        # Companion query param is min_p (not min_pressure)
-        params: dict = {"limit": fetch_limit, "min_p": min_pressure}
-        if drawer:
-            params["drawer"] = drawer
-        if include_deleted:
-            params["include_deleted"] = "true"
-        resp = self._get("/api/v1/pdm/retrieve", params=params)
+        """
+        GET /api/v1/pdm/signatures — keyset list, mirrors Postgres/SQLite.
+
+        Storage scan endpoint (no retrieve side effects). Pages transparently
+        when ``limit`` exceeds ``_API_PAGE_MAX`` (server max page size).
+        """
+        if limit <= 0:
+            return []
+
+        records: builtins.list[SignatureRecord] = []
+        next_cursor = cursor_id
+        path = "/api/v1/pdm/signatures"
+
+        while len(records) < limit:
+            page_limit = min(limit - len(records), _API_PAGE_MAX)
+            params: dict = {"limit": page_limit, "min_p": min_pressure}
+            if drawer:
+                params["drawer"] = drawer
+            if next_cursor:
+                params["cursor_id"] = next_cursor
+            if include_deleted:
+                params["include_deleted"] = "true"
+
+            resp = self._get(path, params=params)
+            data = resp.json()
+            if not isinstance(data, dict):
+                raise CloudStorageError(
+                    f"Unexpected list body type: {type(data).__name__}",
+                    path=path,
+                )
+            items = data.get("signatures")
+            if not isinstance(items, list):
+                raise CloudStorageError(
+                    "List response missing 'signatures' list",
+                    path=path,
+                )
+
+            page_records = [
+                self._payload_to_record(item)
+                for item in items
+                if isinstance(item, dict)
+            ]
+            if not include_deleted:
+                page_records = [
+                    rec for rec in page_records if not self._record_deleted(rec)
+                ]
+            if not page_records:
+                break
+
+            records.extend(page_records)
+            next_cursor = data.get("next_cursor_id") or page_records[-1].id
+            if len(page_records) < page_limit:
+                break
+
+        return records[:limit]
+
+    def count(self, user: str = "default") -> int:
+        """
+        Live signature count from list ``pagination.total_count``.
+
+        One cheap page request (size 1) — not ``len(list(...))``.
+        """
+        path = "/api/v1/pdm/signatures"
+        params = {
+            "limit": 1,
+            "min_p": 0.0,
+        }
+        resp = self._get(path, params=params)
         data = resp.json()
         if not isinstance(data, dict):
             raise CloudStorageError(
-                f"Unexpected retrieve body type: {type(data).__name__}",
-                path="/api/v1/pdm/retrieve",
+                f"Unexpected list body type: {type(data).__name__}",
+                path=path,
             )
-        items = data.get("signatures")
-        if not isinstance(items, list):
+        pagination = (
+            data.get("pagination") if isinstance(data.get("pagination"), dict) else {}
+        )
+        try:
+            return int(pagination.get("total_count") or 0)
+        except (TypeError, ValueError) as exc:
             raise CloudStorageError(
-                "Retrieve response missing 'signatures' list",
-                path="/api/v1/pdm/retrieve",
-            )
-        records = [self._payload_to_record(item) for item in items]
-        if not include_deleted:
-            records = [rec for rec in records if not self._record_deleted(rec)]
-        records.sort(key=lambda rec: (rec.p_magnitude, rec.id))
-        records.reverse()
-
-        if cursor_id:
-            cursor = next((rec for rec in records if rec.id == cursor_id), None)
-            if cursor is None:
-                cursor = self.get(cursor_id, user=user)
-            if cursor is not None:
-                records = [
-                    rec
-                    for rec in records
-                    if rec.p_magnitude < cursor.p_magnitude
-                    or (rec.p_magnitude == cursor.p_magnitude and rec.id < cursor_id)
-                ]
-
-        return records[:limit]
+                "List response missing valid pagination.total_count",
+                path=path,
+            ) from exc
 
     def list_drawers(self, user: str = "default") -> builtins.list[DrawerInfo]:
         """GET /api/v1/pdm/drawers — raises on failure."""
@@ -601,6 +567,22 @@ class CloudDriver(BaseStorage):
         self._raise_for_status(resp, path)
         return resp
 
+    def _delete(self, path: str):
+        import httpx
+
+        self._auth.ensure_fresh()
+        try:
+            resp = httpx.delete(
+                f"{self._base_url}{path}",
+                headers=self._auth.headers(),
+                timeout=self._timeout,
+            )
+        except httpx.HTTPError as exc:
+            raise CloudStorageError(f"Cloud DELETE failed: {exc}", path=path) from exc
+        self._handle_auth_retry(resp, "DELETE", path)
+        self._raise_for_status(resp, path)
+        return resp
+
     def _handle_auth_retry(
         self,
         resp,
@@ -635,6 +617,12 @@ class CloudDriver(BaseStorage):
             resp2 = httpx.patch(
                 f"{self._base_url}{path}",
                 json=payload,
+                headers=self._auth.headers(),
+                timeout=self._timeout,
+            )
+        elif method == "DELETE":
+            resp2 = httpx.delete(
+                f"{self._base_url}{path}",
                 headers=self._auth.headers(),
                 timeout=self._timeout,
             )
