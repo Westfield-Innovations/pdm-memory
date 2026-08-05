@@ -91,7 +91,11 @@ mem = Memory(store="./private.db", store_raw=False)
 
 ## ☁️ Ecosystem Mode (AZUS Cloud)
 
-Connect to the AZUS Companion API to sync memories across devices and share them with the AI companion.
+Connect to the **AZUS Companion API** so memories sync across devices and the companion app.
+
+**Cloud endpoint:** default base URL is `https://api.azus.ai` (not the marketing site `https://azus.ai`). Staging: `https://staging.azus.ai`.
+
+CloudDriver expects a Companion build that exposes the PDM SDK routes (list, batch, by-hash / by-idempotency-key, soft-delete). Older deploys still support single-row `ingest` / get / patch / hard delete only.
 
 ### Connect to the Cloud
 
@@ -100,14 +104,37 @@ from pdm_memory import Memory
 
 mem = Memory(
     store="cloud",
-    token="eyJ...",               # Your AZUS JWT access token
-    cloud_url="https://api.azus.ai",
+    token="eyJ...",               # AZUS JWT access token
+    refresh_token="eyJ...",       # optional — auto-refresh on 401
+    cloud_url="https://api.azus.ai",  # optional; this is the default
+    user="your_username",         # ownership scope for storage ops
 )
 
-# All save/recall operations go to the cloud.
-mem.save("User's team is in Kyiv (UTC+3)", tags=["location", "team", "timezone"])
+# Writes use POST /api/v1/pdm/ingest; dedupe hits the by-hash API when available.
+mem.save(
+    "User's team is in Kyiv (UTC+3)",
+    source="manual",
+    tags=["location", "team", "timezone"],
+    p_magnitude=70,
+    dedupe=True,
+)
+# Exact-once create on retries: pass idempotency_key=...
 hits = mem.recall("what timezone are they in?")
+
+# Batch write (POST /pdm/ingest/batch when supported)
+mem.save_many(
+    [
+        {"text": "Fact A", "tags": ["a", "b", "c"], "p_magnitude": 70, "source": "manual"},
+        {"text": "Fact B", "tags": ["a", "b", "c"], "p_magnitude": 70, "source": "manual"},
+    ],
+    dedupe=False,
+)
 ```
+
+### Soft delete vs hard delete
+
+- `mem.delete(id)` → soft-delete (`is_deleted`) when the API supports it; cloud list/get hide those rows.
+- Permanent removal is storage-level `hard_delete` (CloudDriver), not the default Memory facade API.
 
 ### Sync Local ↔ Cloud
 
@@ -346,15 +373,18 @@ API endpoints used by the UI: `GET /api/v1/memory-map`, `GET /api/v1/torsion`.
 
 ## 📖 API Reference
 
-### `Memory(store, user, token, cloud_url, store_raw)`
+### `Memory(store, user, token, refresh_token, cloud_url, store_raw)`
 
 | Method | Description |
 |--------|-------------|
-| `save(text, source, tags, p_magnitude, t_persistence, drawer, regime, deadline)` | Store a new memory |
+| `save(text, source, tags, p_magnitude, t_persistence, drawer, regime, deadline, dedupe=True, idempotency_key=None)` | Store a memory (content dedupe and/or idempotency when storage supports it) |
+| `save_many(items, dedupe=True)` → `dict` | Batch save; returns `{saved, skipped, errors}` |
 | `recall(query, k, min_pressure, search_cost, drawer, reinforce)` → `List[MemoryHit]` | Retrieve top-k relevant memories |
-| `reinforce(memory_id, coupling_score)` | Manually raise a memory's pressure |
+| `reinforce(memory_id, coupling_score)` | Manually raise a memory's pressure (and V-counters where supported) |
+| `delete(memory_id)` → `bool` | Soft-delete when storage supports it |
 | `decay(dry_run)` → `dict` | Trigger decay pass (runs automatically on recall) |
 | `explain(memory_id, query)` → `ExplainReport` | Show why a memory has its current pressure |
+| `list(limit, min_pressure, drawer, cursor_id)` → `MemoryListPage` | Keyset page of memories (storage list API on cloud) |
 | `sync(direction, token, cloud_url)` → `SyncReport` | Sync local ↔ cloud |
 | `ingest(data_source, mapping, llm_client, batch_size)` → `dict` | Import legacy data |
 | `list_drawers()` → `List[DrawerInfo]` | List memory categories |
@@ -396,11 +426,18 @@ from pdm_memory.storage.base import BaseStorage
 
 class MyPostgresStorage(BaseStorage):
     def save(self, sig): ...
+    def save_batch(self, sigs): ...
     def get(self, memory_id, user): ...
+    def get_many(self, ids, user): ...
     def update(self, memory_id, **fields): ...
-    def delete(self, memory_id, user): ...
-    def list(self, user, limit, min_pressure, drawer): ...
+    def update_batch(self, updates, user): ...
+    def delete(self, memory_id, user): ...       # soft-delete when supported
+    def hard_delete(self, memory_id, user): ...
+    def list(self, user, limit, min_pressure, drawer, cursor_id=None, include_deleted=False): ...
     def list_drawers(self, user): ...
+    def find_by_idempotency_key(self, key, user): ...
+    def find_by_hash(self, text_hash, user): ...
+    def ping(self): ...
 
 mem = Memory.__new__(Memory)
 mem._storage = MyPostgresStorage(...)
