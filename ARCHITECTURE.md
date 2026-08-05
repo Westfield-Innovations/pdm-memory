@@ -59,7 +59,7 @@
 1. **`pdm_memory.Memory` (Точка входу):** Фасадний клас, з яким безпосередньо взаємодіє розробник. Він інкапсулює роботу зі сховищем, двигуном пошуку, синхронізацією та імпортом даних.
 2. **`pdm_memory.storage.base.BaseStorage`:** Абстрактний інтерфейс, який описує контракт для будь-якого сховища PDM-сигнатур. Завдяки цьому Memory не знає деталей реалізації драйверів.
 3. **`pdm_memory.storage.sqlite_driver.SQLiteDriver`:** Локальний thread-safe драйвер, що працює з SQLite. Забезпечує збереження даних у файл `.db` та підтримує режим максимальної приватності (зберігання лише хешів SHA-256 замість сирого тексту).
-4. **`pdm_memory.storage.cloud_driver.CloudDriver`:** Драйвер для взаємодії з хмарою **AZUS Companion API** за допомогою HTTP-запитів. Автоматично оновлює авторизаційні JWT-токени при закінченні їх дії.
+4. **`pdm_memory.storage.cloud_driver.CloudDriver`:** HTTP-драйвер до **AZUS Companion API** (`https://api.azus.ai` за замовчуванням). Покриває той самий `BaseStorage`-контракт, що SQLite/Postgres: single-row `ingest` / get / patch, soft-delete (`is_deleted`) і hard `DELETE`, keyset-list (`GET /pdm/signatures`), batch create/get/update (chunk 100), lookup за `idempotency_key` і content-hash (`by-hash`), `ping`. JWT з автоматичним refresh на 401. Batch-маршрути fail-fast (немає silent sequential fallback), непідтримувані PATCH-поля (напр. client-side `effective_spike`) відсікаються перед запитом.
 5. **`pdm_memory.core.retrieval.RetrievalEngine`:** Реалізація алгоритму **TAS (Threshold-Adjustment Search)**. Працює виключно в оперативній пам'яті з масивами об'єктів `SignatureRecord`, що робить його незалежним від конкретної бази даних.
 6. **`pdm_memory.core.math`:** Набір чистих математичних функцій (без залежностей від Django, SQLAlchemy чи Celery), які обчислюють згасання, коефіцієнт валідації, тиск та часову геометрію.
 7. **`pdm_memory.sync.MemorySync`:** Утиліта для двосторонньої синхронізації між локальною базою даних SQLite та хмарою AZUS Cloud з автоматичним вирішенням конфліктів на основі величини тиску.
@@ -217,8 +217,12 @@ $$\text{temporal\_weight}_{\text{new}} = \text{temporal\_weight} \times (1 - \te
          ▼                       ▼
    [SQLiteDriver]          [CloudDriver]
    - Запис у локальний     - POST /api/v1/pdm/ingest
-     файл бази даних       - Збереження у хмарі AZUS
+     файл бази даних       - або ingest/batch (save_many)
+                           - dedupe: GET …/by-hash
+                           - idempotency: key lookup / ingest
 ```
+
+На recall storage спочатку тягне кандидатів через `list` (на cloud — `GET /pdm/signatures` без side-effect `retrieve`), далі TAS працює locally in-process як на SQLite.
 
 ---
 

@@ -666,14 +666,14 @@ class TestMemoryIngest:
     def test_save_many_uses_storage_batch_api(self, mem):
         captured = {}
 
-        def fake_save_many(sigs):
+        def fake_save_batch(sigs):
             captured["facts"] = [sig.compressed_fact for sig in sigs]
             return [
                 SaveBatchResult(index=0, id="sig-1"),
                 SaveBatchResult(index=1, id="sig-2"),
             ]
 
-        mem._storage.save_many = fake_save_many
+        mem._storage.save_batch = fake_save_batch
 
         counts = mem.save_many(
             [
