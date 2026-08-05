@@ -31,7 +31,7 @@ from pdm_memory.storage.errors import CloudNotFoundError, CloudStorageError
 logger = logging.getLogger(__name__)
 
 # Default AZUS Companion API base URL
-DEFAULT_CLOUD_URL = "http://localhost:8000"
+DEFAULT_CLOUD_URL = "https://azus.ai"
 
 # Match companion_api.pdm.signature_mutations.MAX_BATCH_SIZE
 _API_BATCH_MAX = 100
@@ -58,6 +58,57 @@ _API_SOURCES = frozenset(
     }
 )
 _API_DEFAULT_SOURCE = "azus_chat"
+# companion_api.pdm.signature_mutations.PATCHABLE_FIELDS — only these may appear
+# in PATCH / batch-update. Client-derived fields not on the allowlist (e.g.
+# effective_spike) are stripped; the API recomputes them server-side.
+_API_PATCHABLE_FIELDS = frozenset(
+    {
+        "compressed_fact",
+        "p_magnitude",
+        "t_persistence",
+        "intent_tags",
+        "question_regime",
+        "source",
+        "phase_privilege",
+        "retrieval_count",
+        "last_retrieved",
+        "t_deadline",
+        "t_event_at",
+        "urgency_rate",
+        "decay_rate",
+        "is_deleted",
+        "is_complete",
+        "validation_prediction_total",
+        "validation_prediction_correct",
+    }
+)
+_API_PATCH_DATETIME_FIELDS = frozenset(
+    {"last_retrieved", "created_at", "t_deadline", "t_event_at"}
+)
+
+
+def _sanitise_patch_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    """Keep only Companion PATCH-allowlisted keys; ISO-serialise datetimes.
+
+    Dropping client-derived fields (e.g. ``effective_spike``) is intentional:
+    the API recomputes spike when ``p_magnitude`` / ``t_persistence`` /
+    ``phase_privilege`` change. V-counters are patchable and are kept.
+    """
+    body = dict(fields)
+    body.pop("user", None)
+    body.pop("id", None)
+    dropped = [k for k in body if k not in _API_PATCHABLE_FIELDS]
+    if dropped:
+        logger.debug(
+            "[PDM-Cloud] stripping non-PATCH fields from update: %s",
+            sorted(dropped),
+        )
+        for k in dropped:
+            body.pop(k, None)
+    for key in _API_PATCH_DATETIME_FIELDS:
+        if key in body and isinstance(body[key], datetime):
+            body[key] = body[key].isoformat()
+    return body
 
 
 class CloudDriver(BaseStorage):
@@ -317,15 +368,15 @@ class CloudDriver(BaseStorage):
             return False
 
     def update(self, memory_id: str, user: str = "default", **fields) -> None:
-        """PATCH /api/v1/pdm/signatures/<id> — raises on failure."""
-        fields = dict(fields)
-        fields.pop("user", None)
-        fields.pop("id", None)
-        # Serialise datetimes for JSON
-        for key in ("last_retrieved", "created_at", "t_deadline", "t_event_at"):
-            if key in fields and isinstance(fields[key], datetime):
-                fields[key] = fields[key].isoformat()
-        self._patch(f"/api/v1/pdm/signatures/{memory_id}", fields)
+        """PATCH /api/v1/pdm/signatures/<id> — raises on failure.
+
+        Non-PATCH fields (e.g. ``effective_spike``) are dropped; the API
+        recomputes derived values from accepted inputs.
+        """
+        body = _sanitise_patch_fields(fields)
+        if not body:
+            return
+        self._patch(f"/api/v1/pdm/signatures/{memory_id}", body)
 
     def update_batch(
         self,
@@ -336,7 +387,8 @@ class CloudDriver(BaseStorage):
         Bulk PATCH via POST /api/v1/pdm/signatures/batch-update.
 
         Per-index UpdateBatchResult with id + optional error, like local drivers.
-        Bulk route errors (including 404) raise.
+        Bulk route errors (including 404) raise. Payload keys outside Companion
+        PATCH allowlist are stripped (same as ``update``).
         """
         if not updates:
             return []
@@ -349,17 +401,10 @@ class CloudDriver(BaseStorage):
         prepared: list[tuple[int, str, dict]] = []
         for index, (memory_id, fields) in enumerate(updates):
             try:
-                body = dict(fields)
-                body.pop("user", None)
-                body.pop("id", None)
-                for key in (
-                    "last_retrieved",
-                    "created_at",
-                    "t_deadline",
-                    "t_event_at",
-                ):
-                    if key in body and isinstance(body[key], datetime):
-                        body[key] = body[key].isoformat()
+                body = _sanitise_patch_fields(fields)
+                if not body:
+                    # Nothing left after stripping derived-only updates.
+                    continue
                 prepared.append((index, memory_id, body))
             except Exception as exc:
                 results[index] = UpdateBatchResult(

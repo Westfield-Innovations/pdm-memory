@@ -180,7 +180,9 @@ class TestCloudDriverAuthIntegration:
         
         mock_get_200 = MagicMock()
         mock_get_200.status_code = 200
-        mock_get_200.json.return_value = {"results": []}
+        # CloudDriver.list() uses GET /pdm/signatures → {signatures: [...]}
+        mock_get_200.json.return_value = {"signatures": [], "next_cursor_id": None}
+        mock_get_200.content = b'{"signatures":[]}'
         
         # Mock side effects: first 401, then 200
         mock_get.side_effect = [mock_get_401, mock_get_200]

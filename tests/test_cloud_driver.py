@@ -587,6 +587,70 @@ class TestCloudBatchMethods:
         body = mock_post.call_args.kwargs["json"]
         assert body["updates"][0] == {"id": "mid-1", "p_magnitude": 80.0}
 
+    @patch("httpx.post")
+    def test_update_batch_strips_effective_spike_keeps_v_counters(self, mock_post):
+        """Reinforce payload: derive spike server-side, persist V-counters."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = b"{}"
+        mock_resp.json.return_value = {
+            "results": [{"index": 0, "id": "mid-1", "error": None}]
+        }
+        mock_post.return_value = mock_resp
+
+        results = _driver().update_batch(
+            [
+                (
+                    "mid-1",
+                    {
+                        "p_magnitude": 82.5,
+                        "effective_spike": 90.0,
+                        "retrieval_count": 3,
+                        "last_retrieved": "2026-08-05T10:00:00+00:00",
+                        "validation_prediction_total": 1,
+                        "validation_prediction_correct": 1,
+                    },
+                )
+            ]
+        )
+        assert results[0].error is None
+        body = mock_post.call_args.kwargs["json"]["updates"][0]
+        assert body == {
+            "id": "mid-1",
+            "p_magnitude": 82.5,
+            "retrieval_count": 3,
+            "last_retrieved": "2026-08-05T10:00:00+00:00",
+            "validation_prediction_total": 1,
+            "validation_prediction_correct": 1,
+        }
+        assert "effective_spike" not in body
+
+    @patch("httpx.patch")
+    def test_update_strips_effective_spike_keeps_v_counters(self, mock_patch):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = b"{}"
+        mock_resp.json.return_value = {}
+        mock_patch.return_value = mock_resp
+
+        _driver().update(
+            "mid-1",
+            p_magnitude=77.0,
+            effective_spike=50.0,
+            validation_prediction_total=2,
+            validation_prediction_correct=1,
+        )
+        assert mock_patch.call_args.kwargs["json"] == {
+            "p_magnitude": 77.0,
+            "validation_prediction_total": 2,
+            "validation_prediction_correct": 1,
+        }
+
+    @patch("httpx.patch")
+    def test_update_noop_when_only_stripped_fields(self, mock_patch):
+        _driver().update("mid-1", effective_spike=1.0)
+        mock_patch.assert_not_called()
+
     def test_get_many_empty(self):
         assert _driver().get_many([]) == {}
 
