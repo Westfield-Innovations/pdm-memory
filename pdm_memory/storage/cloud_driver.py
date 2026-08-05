@@ -31,7 +31,7 @@ from pdm_memory.storage.errors import CloudNotFoundError, CloudStorageError
 logger = logging.getLogger(__name__)
 
 # Default AZUS Companion API base URL
-DEFAULT_CLOUD_URL = "https://azus.ai"
+DEFAULT_CLOUD_URL = "https://api.azus.ai"
 
 # Match companion_api.pdm.signature_mutations.MAX_BATCH_SIZE
 _API_BATCH_MAX = 100
