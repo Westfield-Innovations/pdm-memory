@@ -18,5 +18,10 @@ python examples/industrial_safety_gate.py
 | `handling_contradictions.py` | `detect_torsion` / `reconcile_torsion` — self-healing |
 | `temporal_recall_demo.py` | `event_at` / `deadline` (PDM-T) + `search_cost` window |
 | `industrial_safety_gate.py` | Oil Field Blueprint — Auto-Discovery, GAA block, `audit_and_heal` |
+| `pdm-memory-plugin-echo/` | External plugin scaffold (`plugin.json` + entrypoint) |
+
+Plugin authoring: [docs/PLUGIN_AUTHORING.md](../docs/PLUGIN_AUTHORING.md).
+
+External plugins need `trust_plugins=True` (or `plugin_allowlist`) — default is Fail Closed.
 
 Each script uses `with Memory(...) as mem:` and a fresh temp SQLite file.

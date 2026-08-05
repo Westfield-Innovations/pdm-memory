@@ -35,8 +35,11 @@ from __future__ import annotations
 import builtins
 import logging
 import os
+from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from itertools import count
 from pathlib import Path
 from typing import Any
 
@@ -59,18 +62,43 @@ from pdm_memory.core.signature import (
     MemoryHit,
     SignatureRecord,
 )
-from pdm_memory.models import AlignmentReport, MemoryListPage, SurfaceReport, TorsionReport
+from pdm_memory.models import (
+    AlignmentReport,
+    MemoryListPage,
+    MemoryStatusReport,
+    PluginStatusEntry,
+    SurfaceReport,
+    TorsionReport,
+)
+from pdm_memory.plugins.base import BasePDMPlugin
+from pdm_memory.plugins.manager import PluginManager
+from pdm_memory.plugins.proxy import PluginMemoryProxy
 from pdm_memory.storage.base import BaseStorage
 from pdm_memory.types import (
     HookEvent,
-    PostRecallHook,
-    PostSaveHook,
-    PreSaveHook,
     RecallHook,
     TorsionJudge,
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _HookEntry:
+    """Ordered hook registration (lower priority runs first; seq breaks ties)."""
+
+    priority: int
+    seq: int
+    hook: Any
+
+
+class IntegrityBlock(Exception):
+    """
+    Integrity veto — a ``pre_save`` hook blocked persistence.
+
+    Hooks may raise this directly, or return ``None`` / ``False``
+    (converted to ``IntegrityBlock`` by Memory).
+    """
 
 
 class Memory:
@@ -89,6 +117,13 @@ class Memory:
         engine:      Custom RetrievalEngine instance (override for testing).
         storage:     Pre-built :class:`BaseStorage` instance (bypasses ``store`` URL).
         torsion_judge: Optional callback to flag torsion pairs rules-only detection misses.
+        autoload_plugins: If True (default), discover and install concrete plugins
+                     from ``pdm_memory/plugins/``. External ``pdm-memory-plugin-*``
+                     folders load only when ``trust_plugins=True`` or allowlisted.
+        trust_plugins: If True, autoload discovers external plugin packages
+                     (arbitrary code). Default False — Fail Closed.
+        plugin_allowlist: Absolute/relative paths of trusted external plugin dirs
+                     (or parents). Ignored when ``trust_plugins=True``.
     """
 
     def __init__(
@@ -102,17 +137,29 @@ class Memory:
         engine: RetrievalEngine | None = None,
         storage: BaseStorage | None = None,
         torsion_judge: TorsionJudge | None = None,
+        autoload_plugins: bool = True,
+        trust_plugins: bool = False,
+        plugin_allowlist: Sequence[str] | None = None,
     ) -> None:
         self._user = user
         self._engine = engine or RetrievalEngine()
         self._torsion_judge = torsion_judge
-        self._pre_save_hooks: list[PreSaveHook] = []
-        self._post_save_hooks: list[PostSaveHook] = []
-        self._post_recall_hooks: list[PostRecallHook] = []
+        self._hook_seq = count()
+        self._pre_save_hooks: list[_HookEntry] = []
+        self._post_save_hooks: list[_HookEntry] = []
+        self._post_recall_hooks: list[_HookEntry] = []
         self._token = token
         self._refresh_token = refresh_token
         self._cloud_url = cloud_url
         self._cloud_driver: Any | None = None  # lazy init
+        env_trust = os.environ.get("PDM_TRUST_PLUGINS", "").strip().lower()
+        if env_trust in {"1", "true", "yes", "on"}:
+            trust_plugins = True
+        self._trust_plugins = bool(trust_plugins)
+        self._plugin_allowlist: tuple[str, ...] = tuple(
+            str(Path(p).expanduser().resolve())
+            for p in (plugin_allowlist or ())
+        )
         if storage is not None:
             if not isinstance(storage, BaseStorage):
                 raise TypeError(
@@ -121,46 +168,339 @@ class Memory:
             self._storage = storage
         else:
             self._storage = self._init_storage(store, token, refresh_token, cloud_url, store_raw)
+        self._plugin_manager = PluginManager(self)
+        if autoload_plugins:
+            self._plugin_manager.autoload()
         logger.debug("[PDM] Memory initialised | user=%s store=%s", user, store)
 
     # ------------------------------------------------------------------
     # Internal hooks (Lean Core / Middleware)
     # ------------------------------------------------------------------
 
-    def add_hook(self, event: HookEvent, hook: Any) -> None:
+    def add_hook(
+        self,
+        event: HookEvent,
+        hook: Any,
+        *,
+        priority: int = 100,
+    ) -> None:
         """
         Register an internal hook for Memory middleware.
 
         Events:
-            - pre_save:  (SignatureRecord) -> SignatureRecord | None
+            - pre_save:  (SignatureRecord) -> SignatureRecord | None | False
+                         Return the (possibly mutated) record.
+                         Return None/False or raise IntegrityBlock to veto.
             - post_save: (SignatureRecord, memory_id) -> None
             - post_recall:(ctx dict) -> None
+
+        Args:
+            priority: Lower runs earlier (default 100). Stable order by registration
+                      for equal priorities.
         """
+        entry = _HookEntry(
+            priority=int(priority),
+            seq=next(self._hook_seq),
+            hook=hook,
+        )
         match event:
             case "pre_save":
-                self._pre_save_hooks.append(hook)
+                self._pre_save_hooks.append(entry)
+                self._pre_save_hooks.sort(key=lambda e: (e.priority, e.seq))
             case "post_save":
-                self._post_save_hooks.append(hook)
+                self._post_save_hooks.append(entry)
+                self._post_save_hooks.sort(key=lambda e: (e.priority, e.seq))
             case "post_recall":
-                self._post_recall_hooks.append(hook)
+                self._post_recall_hooks.append(entry)
+                self._post_recall_hooks.sort(key=lambda e: (e.priority, e.seq))
             case _:
                 raise ValueError(f"Unknown hook event: {event!r}")
 
     def _run_pre_save_hooks(self, sig: SignatureRecord) -> SignatureRecord:
-        for hook in self._pre_save_hooks:
-            updated = hook(sig)
-            if updated is not None:
-                sig = updated
+        """
+        Run pre_save hooks in priority order (Integrity gate).
+
+        Returns:
+            The final SignatureRecord.
+
+        Raises:
+            IntegrityBlock: If any hook returns ``None``/``False`` or raises it.
+            TypeError: If a hook returns an unexpected type.
+        """
+        for entry in self._pre_save_hooks:
+            updated = entry.hook(sig)
+            if updated is None or updated is False:
+                raise IntegrityBlock("Save vetoed by pre_save hook")
+            if not isinstance(updated, SignatureRecord):
+                raise TypeError(
+                    "pre_save hook must return SignatureRecord, False, or None; "
+                    f"got {type(updated).__name__}"
+                )
+            sig = updated
         return sig
 
     def _run_post_save_hooks(self, sig: SignatureRecord, memory_id: str) -> None:
-        for hook in self._post_save_hooks:
-            hook(sig, memory_id)
+        for entry in self._post_save_hooks:
+            entry.hook(sig, memory_id)
 
     def _run_post_recall_hooks(self, ctx: dict[str, Any]) -> None:
-        for hook in self._post_recall_hooks:
-            hook(ctx)
+        for entry in self._post_recall_hooks:
+            entry.hook(ctx)
 
+    # ------------------------------------------------------------------
+    # Plugins
+    # ------------------------------------------------------------------
+
+    @property
+    def plugins(self) -> dict[str, BasePDMPlugin]:
+        """Installed plugins keyed by registry name."""
+        return dict(self._plugin_manager.plugins)
+
+    def use(self, plugin_instance: BasePDMPlugin) -> Self:
+        """
+        Connect a plugin instance to this Memory (fluent connector).
+
+        1. Binds a :class:`~pdm_memory.plugins.proxy.PluginMemoryProxy` so the
+           plugin can use ``self.mem.save`` / ``self.mem.recall`` without raw
+           Memory / ``_storage`` / ``close``.
+        2. Attaches the instance as ``mem.<plugin.name>``.
+        3. Registers any callables in ``plugin_instance.hooks`` via :meth:`add_hook`
+           (ordered by plugin ``priority`` ClassVar — lower runs earlier).
+        4. Invokes ``plugin_instance.on_install()`` for optional setup.
+
+        Example::
+
+            mem.use(SledgehammerPlugin())
+            mem.sledgehammer.crush(...)
+
+        Returns:
+            ``self`` for chaining.
+        """
+        if not isinstance(plugin_instance, BasePDMPlugin):
+            raise TypeError(
+                "plugin_instance must be a BasePDMPlugin instance, "
+                f"got {type(plugin_instance).__name__}"
+            )
+
+        name = self._resolve_plugin_attr_name(plugin_instance)
+        if name in self._plugin_manager.plugins:
+            raise ValueError(f"Plugin already installed: {name!r}")
+        if hasattr(self, name) and getattr(self, name) is not plugin_instance:
+            raise ValueError(
+                f"Cannot attach plugin {name!r}: Memory already has this attribute"
+            )
+
+        self._assert_plugin_requirements(plugin_instance, name)
+
+        if not getattr(plugin_instance, "load_source", None):
+            plugin_instance.load_source = "manual"
+
+        proxy = PluginMemoryProxy(self, owner=name)
+        plugin_instance.bind(proxy)
+
+        hook_events = self._register_plugin_hooks(plugin_instance)
+        self._plugin_manager.register_instance(
+            name, plugin_instance, hooks=hook_events
+        )
+        object.__setattr__(self, name, plugin_instance)
+
+        plugin_instance.on_install()
+        return self
+
+    def unload(self, name: str) -> bool:
+        """
+        Disconnect a plugin: remove hooks, delete ``mem.<name>``, call ``on_uninstall``.
+
+        Raises:
+            ValueError: If other installed plugins still require ``name``.
+        """
+        key = str(name).strip()
+        plugin = self._plugin_manager.get(key)
+        if plugin is None:
+            return False
+
+        dependents = self._plugin_manager.dependents_of(key)
+        if dependents:
+            listed = ", ".join(f"'{d}'" for d in dependents)
+            raise ValueError(
+                f"Cannot unload plugin '{key}': still required by {listed}"
+            )
+
+        plugin.on_uninstall()
+        self._unregister_plugin_hooks(plugin)
+        self._plugin_manager.unregister(key)
+        if getattr(self, key, None) is plugin:
+            object.__delattr__(self, key)
+        plugin.mem = None
+        plugin.bound_hooks = []
+        logger.info("[PDM] Plugin unloaded: %s", key)
+        return True
+
+    def disable(self, name: str) -> bool:
+        """Alias for :meth:`unload`."""
+        return self.unload(name)
+
+    def install_plugin(self, plugin_class: type[BasePDMPlugin]) -> BasePDMPlugin:
+        """
+        Instantiate a :class:`~pdm_memory.plugins.base.BasePDMPlugin` subclass
+        and connect it via :meth:`use`.
+        """
+        return self._plugin_manager.install(plugin_class)
+
+    def _assert_plugin_requirements(
+        self, plugin: BasePDMPlugin, plugin_name: str
+    ) -> None:
+        """Fail fast when ``requires`` names/versions are not satisfied."""
+        specs = type(plugin).requirement_specs()
+        if not specs:
+            return
+
+        if any(req.name == plugin_name for req in specs):
+            raise ValueError(f"Plugin '{plugin_name}' cannot require itself")
+
+        unmet = self._plugin_manager.unmet_requirements(type(plugin))
+        if not unmet:
+            return
+
+        if len(unmet) == 1:
+            raise ValueError(
+                f"Plugin '{plugin_name}' requires {unmet[0]}. Please install it first"
+            )
+        listed = ", ".join(unmet)
+        raise ValueError(
+            f"Plugin '{plugin_name}' requires {listed}. Please install them first"
+        )
+
+    def status(
+        self,
+        *,
+        color: bool | None = None,
+        print_report: bool = False,
+    ) -> MemoryStatusReport:
+        """
+        Alive panel: storage health + installed plugin map.
+
+        Returns a structured :class:`~pdm_memory.models.MemoryStatusReport`.
+        Print it for a colorized box (TTY / ``NO_COLOR`` respected)::
+
+            print(mem.status())
+            mem.status(print_report=True, color=True)
+
+        Args:
+            color: Force ANSI on/off; ``None`` auto-detects.
+            print_report: If True, print the rendered panel to stdout.
+        """
+        from pdm_memory import __version__ as sdk_version
+
+        alive = False
+        try:
+            alive = bool(self._storage.ping())
+        except Exception:
+            alive = False
+
+        memory_count: int | None
+        try:
+            memory_count = int(self._storage.count(user=self._user))
+        except Exception:
+            memory_count = None
+
+        plugins: list[PluginStatusEntry] = []
+        for name, plugin in self._plugin_manager.plugins.items():
+            version = str(
+                getattr(plugin, "version", None)
+                or getattr(type(plugin), "version", "0.0.0")
+            )
+            plugins.append(
+                PluginStatusEntry(
+                    name=name,
+                    version=version,
+                    class_name=type(plugin).__name__,
+                    hooks=list(plugin.bound_hooks),
+                    source=str(getattr(plugin, "load_source", None) or "manual"),
+                )
+            )
+
+        report = MemoryStatusReport(
+            alive=alive,
+            user=self._user,
+            store=type(self._storage).__name__,
+            sdk_version=str(sdk_version),
+            memory_count=memory_count,
+            plugins=plugins,
+        )
+        if print_report:
+            print(report.render(color=color))
+        return report
+
+    def _resolve_plugin_attr_name(self, plugin: BasePDMPlugin) -> str:
+        raw = getattr(plugin, "name", None) or type(plugin).__name__
+        name = str(raw).strip()
+        if not name or not name.isidentifier() or name.startswith("_"):
+            raise ValueError(
+                f"Plugin name must be a public Python identifier, got {name!r}"
+            )
+        if name in type(self).__dict__:
+            raise ValueError(
+                f"Plugin name {name!r} collides with Memory class attribute"
+            )
+        return name
+
+    def _register_plugin_hooks(self, plugin: BasePDMPlugin) -> list[str]:
+        hooks = getattr(plugin, "hooks", None) or {}
+        if not isinstance(hooks, dict):
+            raise TypeError(
+                f"plugin.hooks must be a dict[HookEvent, Callable|list], "
+                f"got {type(hooks).__name__}"
+            )
+        plugin._hook_registrations = []
+        bound_events: list[str] = []
+        for event, handlers in hooks.items():
+            if callable(handlers):
+                sequence: list[Any] = [handlers]
+            elif isinstance(handlers, (list, tuple)):
+                sequence = list(handlers)
+            else:
+                raise TypeError(
+                    f"hooks[{event!r}] must be a callable or sequence of callables, "
+                    f"got {type(handlers).__name__}"
+                )
+            event_name = str(event)
+            priority = int(getattr(type(plugin), "priority", 100))
+            for handler in sequence:
+                if not callable(handler):
+                    raise TypeError(
+                        f"hooks[{event!r}] contains non-callable {type(handler).__name__}"
+                    )
+                self.add_hook(event, handler, priority=priority)
+                plugin._hook_registrations.append((event_name, handler))
+            if event_name not in bound_events:
+                bound_events.append(event_name)
+        plugin.bound_hooks = list(bound_events)
+        return bound_events
+
+    def _unregister_plugin_hooks(self, plugin: BasePDMPlugin) -> None:
+        """Remove handlers previously registered by this plugin instance."""
+        registrations = list(getattr(plugin, "_hook_registrations", []) or [])
+        for event, handler in registrations:
+            match event:
+                case "pre_save":
+                    self._pre_save_hooks = [
+                        e for e in self._pre_save_hooks if e.hook is not handler
+                    ]
+                case "post_save":
+                    self._post_save_hooks = [
+                        e for e in self._post_save_hooks if e.hook is not handler
+                    ]
+                case "post_recall":
+                    self._post_recall_hooks = [
+                        e for e in self._post_recall_hooks if e.hook is not handler
+                    ]
+                case _:
+                    logger.warning(
+                        "[PDM] Unknown hook event on unload: %s", event
+                    )
+        plugin._hook_registrations = []
+        plugin.bound_hooks = []
     @classmethod
     def from_env(cls, *, prefix: str = "PDM", **kwargs: Any) -> Memory:
         """
@@ -387,7 +727,11 @@ class Memory:
                         phase_privilege=float(item.get("phase_privilege", 1.0)),
                         idempotency_key=idempotency_key or None,
                     )
-                    sig = self._run_pre_save_hooks(sig)
+                    try:
+                        sig = self._run_pre_save_hooks(sig)
+                    except IntegrityBlock:
+                        skipped += 1
+                        continue
                     sigs_to_save.append(sig)
                 except Exception:
                     errors += 1

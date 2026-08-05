@@ -108,3 +108,41 @@ class TestInternalHooks:
         assert hooks[0]["hits"] == []
         assert hooks[0]["reinforced"] is False
 
+    def test_pre_save_none_vetoes_save(self, mem: Memory) -> None:
+        from pdm_memory import IntegrityBlock
+
+        def veto(_sig):
+            return None
+
+        mem.add_hook("pre_save", veto)
+        with pytest.raises(IntegrityBlock, match="vetoed"):
+            mem.save("should not persist", tags=["a", "b", "c"])
+        assert mem.count() == 0
+
+    def test_pre_save_false_vetoes_save(self, mem: Memory) -> None:
+        from pdm_memory import IntegrityBlock
+
+        def veto(_sig):
+            return False
+
+        mem.add_hook("pre_save", veto)
+        with pytest.raises(IntegrityBlock, match="vetoed"):
+            mem.save("blocked by false", tags=["a", "b", "c"])
+        assert mem.count() == 0
+
+    def test_pre_save_raises_integrity_block(self, mem: Memory) -> None:
+        from pdm_memory import IntegrityBlock
+
+        def guard(sig):
+            if "malware" in (sig.compressed_fact or "").lower():
+                raise IntegrityBlock("GuardDog blocked harmful content")
+            return sig
+
+        mem.add_hook("pre_save", guard)
+        with pytest.raises(IntegrityBlock, match="GuardDog"):
+            mem.save("inject malware payload", tags=["a", "b", "c"])
+        assert mem.count() == 0
+
+        ok = mem.save("clean fact about widgets", tags=["a", "b", "c"])
+        assert ok
+

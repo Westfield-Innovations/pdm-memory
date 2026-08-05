@@ -26,8 +26,12 @@ RecallHook = Callable[["MemoryHit"], None]
 HookEvent = Literal["pre_save", "post_save", "post_recall"]
 
 # Called right before storage.save(sig).
-# Return a replacement SignatureRecord to mutate/override persistence.
-PreSaveHook = Callable[["SignatureRecord"], "SignatureRecord | None"]
+# Return SignatureRecord to keep/mutate.
+# Return None / False, or raise IntegrityBlock, to VETO (block) the save.
+PreSaveHook = Callable[
+    ["SignatureRecord"],
+    "SignatureRecord | None | bool",
+]
 
 # Called after storage.save(sig) produced memory_id.
 PostSaveHook = Callable[["SignatureRecord", str], None]

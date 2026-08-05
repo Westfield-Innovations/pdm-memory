@@ -1,0 +1,7 @@
+{
+  "name": "echo",
+  "version": "0.1.0",
+  "entrypoint": "echo_plugin:EchoPlugin",
+  "requires": [],
+  "autoload": true
+}

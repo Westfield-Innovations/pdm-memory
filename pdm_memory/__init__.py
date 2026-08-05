@@ -20,16 +20,39 @@ See README.md for full documentation.
 """
 
 from pdm_memory.core.signature import DrawerInfo, MemoryHit
-from pdm_memory.memory import Memory
-from pdm_memory.models import AlignmentReport, SurfaceReport, TorsionReport
+from pdm_memory.memory import IntegrityBlock, Memory
+from pdm_memory.models import (
+    AlignmentReport,
+    MemoryStatusReport,
+    PluginStatusEntry,
+    SurfaceReport,
+    TorsionReport,
+)
+from pdm_memory.plugins import (
+    EXTERNAL_PLUGIN_DIR_PREFIX,
+    BasePDMPlugin,
+    PluginCapabilityError,
+    PluginManager,
+    PluginManifestError,
+    PluginMemoryProxy,
+)
 from pdm_memory.storage.factory import create_storage, register_storage
 
 __version__ = "0.2.3"
 __all__ = [
     "AlignmentReport",
+    "BasePDMPlugin",
     "DrawerInfo",
+    "EXTERNAL_PLUGIN_DIR_PREFIX",
+    "IntegrityBlock",
     "Memory",
     "MemoryHit",
+    "MemoryStatusReport",
+    "PluginCapabilityError",
+    "PluginManager",
+    "PluginManifestError",
+    "PluginMemoryProxy",
+    "PluginStatusEntry",
     "SurfaceReport",
     "TorsionReport",
     "__version__",

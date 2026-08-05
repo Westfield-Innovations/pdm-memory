@@ -126,3 +126,147 @@ class SurfaceReport:
             "alignment": self.alignment,
             "alignment_score": round(float(self.alignment_score), 4),
         }
+
+
+# ---------------------------------------------------------------------------
+# Memory / plugin status (Alive panel)
+# ---------------------------------------------------------------------------
+
+
+def _ansi_enabled(color: bool | None) -> bool:
+    """Auto-detect TTY; honor ``NO_COLOR`` unless ``color`` is set explicitly."""
+    import os
+    import sys
+
+    if color is False:
+        return False
+    if color is True:
+        return True
+    if os.environ.get("NO_COLOR"):
+        return False
+    return bool(getattr(sys.stdout, "isatty", lambda: False)())
+
+
+@dataclass(slots=True)
+class PluginStatusEntry:
+    """One installed plugin as seen by :meth:`Memory.status`."""
+
+    name: str
+    version: str
+    class_name: str
+    hooks: list[str] = field(default_factory=list)
+    source: str = "manual"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "version": self.version,
+            "class_name": self.class_name,
+            "hooks": list(self.hooks),
+            "source": self.source,
+        }
+
+
+@dataclass(slots=True)
+class MemoryStatusReport:
+    """
+    Structured + printable snapshot of Memory health and plugin map.
+
+    Use::
+
+        report = mem.status()
+        print(report)                 # ANSI when stdout is a TTY
+        print(report.render(color=True))
+        data = report.as_dict()
+    """
+
+    alive: bool
+    user: str
+    store: str
+    sdk_version: str
+    memory_count: int | None
+    plugins: list[PluginStatusEntry] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "alive": self.alive,
+            "user": self.user,
+            "store": self.store,
+            "sdk_version": self.sdk_version,
+            "memory_count": self.memory_count,
+            "plugins": [p.as_dict() for p in self.plugins],
+        }
+
+    def render(self, *, color: bool | None = None) -> str:
+        """Human-readable panel; ``color=None`` auto-detects TTY / ``NO_COLOR``."""
+        use_color = _ansi_enabled(color)
+
+        def c(code: str, text: str) -> str:
+            if not use_color:
+                return text
+            return f"\033[{code}m{text}\033[0m"
+
+        # Styles: bold, dim, green, cyan, yellow, magenta, red, blue
+        bold = lambda t: c("1", t)
+        dim = lambda t: c("2", t)
+        green = lambda t: c("32", t)
+        cyan = lambda t: c("36", t)
+        yellow = lambda t: c("33", t)
+        magenta = lambda t: c("35", t)
+        red = lambda t: c("31", t)
+        blue = lambda t: c("34", t)
+        title_style = lambda t: c("1;36", t)
+
+        width = 52
+        top = "╔" + "═" * width + "╗"
+        mid = "╠" + "═" * width + "╣"
+        soft = "╠" + "─" * width + "╣"
+        bot = "╚" + "═" * width + "╝"
+
+        def row(content: str) -> str:
+            # Strip ANSI for padding width
+            plain = content
+            if "\033[" in content:
+                import re
+
+                plain = re.sub(r"\033\[[0-9;]*m", "", content)
+            pad = max(0, width - len(plain))
+            return f"║ {content}{' ' * pad}║"
+
+        status_dot = green("● ALIVE") if self.alive else red("● DEAD")
+        title = f"{title_style('PDM Memory')}  {status_dot}"
+
+        lines = [
+            top,
+            row(title),
+            mid,
+            row(f"{dim('user')}    {self.user}"),
+            row(f"{dim('store')}   {blue(self.store)}"),
+            row(f"{dim('sdk')}     v{self.sdk_version}"),
+        ]
+        if self.memory_count is not None:
+            lines.append(row(f"{dim('memories')} {self.memory_count}"))
+
+        lines.append(soft)
+        lines.append(row(bold(f"Plugins ({len(self.plugins)})")))
+
+        if not self.plugins:
+            lines.append(row(dim("(none — brain is stock)")))
+        else:
+            for plugin in self.plugins:
+                hooks = ", ".join(plugin.hooks) if plugin.hooks else "—"
+                label = green("[Plugin]")
+                name = cyan(plugin.name)
+                ver = yellow(f"v{plugin.version}")
+                lines.append(row(f"{label} {name} {ver}"))
+                lines.append(row(f"         {dim('Hooks:')} {magenta(hooks)}"))
+                source = plugin.source or "manual"
+                if len(source) > 40:
+                    source = "…" + source[-39:]
+                lines.append(row(f"         {dim('Source:')} {blue(source)}"))
+
+        lines.append(bot)
+        return "\n".join(lines)
+
+    def __str__(self) -> str:
+        return self.render(color=None)
