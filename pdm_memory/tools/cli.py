@@ -279,6 +279,7 @@ def cmd_ui(args: argparse.Namespace) -> None:
         host=args.host,
         port=args.port,
         open_browser=not args.no_browser,
+        allow_remote=bool(getattr(args, "allow_remote", False)),
     )
 
 
@@ -480,6 +481,11 @@ def main() -> None:
     )
     p_ui.add_argument("--host", type=str, default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
     p_ui.add_argument("--port", type=int, default=8080, help="Bind port (default: 8080)")
+    p_ui.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="Allow binding on non-loopback hosts (unsafe; Explorer has no auth)",
+    )
     p_ui.add_argument(
         "--no-browser",
         action="store_true",

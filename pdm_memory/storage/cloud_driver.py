@@ -476,22 +476,28 @@ class CloudDriver(BaseStorage):
         drawer: str | None = None,
         cursor_id: str | None = None,
         include_deleted: bool = False,
+        tag_any: builtins.list[str] | tuple[str, ...] | None = None,
     ) -> builtins.list[SignatureRecord]:
         """
         GET /api/v1/pdm/signatures — keyset list, mirrors Postgres/SQLite.
 
         Storage scan endpoint (no retrieve side effects). Pages transparently
         when ``limit`` exceeds ``_API_PAGE_MAX`` (server max page size).
+        Optional ``tag_any`` is filtered client-side (API has no tag param yet).
         """
         if limit <= 0:
             return []
+
+        tags = {t.strip().lower() for t in (tag_any or ()) if t and str(t).strip()}
+        # Over-fetch when tag-filtering so callers can still fill ``limit`` matches.
+        need = limit if not tags else min(max(limit * 5, limit), 2_000)
 
         records: builtins.list[SignatureRecord] = []
         next_cursor = cursor_id
         path = "/api/v1/pdm/signatures"
 
-        while len(records) < limit:
-            page_limit = min(limit - len(records), _API_PAGE_MAX)
+        while len(records) < need:
+            page_limit = min(need - len(records), _API_PAGE_MAX)
             params: dict = {"limit": page_limit, "min_p": min_pressure}
             if drawer:
                 params["drawer"] = drawer
@@ -519,16 +525,30 @@ class CloudDriver(BaseStorage):
                 for item in items
                 if isinstance(item, dict)
             ]
+            raw_count = len(page_records)
             if not include_deleted:
                 page_records = [
                     rec for rec in page_records if not self._record_deleted(rec)
                 ]
-            if not page_records:
+            if tags:
+                page_records = [
+                    rec
+                    for rec in page_records
+                    if {tag.lower() for tag in (rec.intent_tags or []) if tag} & tags
+                ]
+
+            if raw_count == 0:
                 break
 
-            records.extend(page_records)
-            next_cursor = data.get("next_cursor_id") or page_records[-1].id
-            if len(page_records) < page_limit:
+            if page_records:
+                records.extend(page_records)
+
+            next_cursor = data.get("next_cursor_id")
+            if not next_cursor and page_records:
+                next_cursor = page_records[-1].id
+            if raw_count < page_limit:
+                break
+            if not next_cursor:
                 break
 
         return records[:limit]

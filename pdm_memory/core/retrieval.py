@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from pdm_memory.types import TorsionJudge
 
 from pdm_memory.core.constraints import (
+    build_presence_index,
     collect_occupants,
     detect_constraint_violation,
     entity_exclusion_pair,
@@ -125,6 +126,8 @@ _INTEGRITY_DRAWERS: frozenset[str] = frozenset(
 _INTEGRITY_TAGS: frozenset[str] = frozenset(
     {"anchor", "foundational", "goal", "policy", "principle", "rule", "stewardship"}
 )
+# Cap pairs per shared tag — hot tags otherwise go O(n²).
+_TAG_FANOUT_CAP: int = 64
 # PDM-T: how hard urgency energy lifts ranking / Phase-1 gate
 _TEMPORAL_RANK_BOOST: float = 0.35
 _TEMPORAL_GATE_BOOST: float = 0.25
@@ -348,7 +351,6 @@ class RetrievalEngine:
         theta_eff = self._compute_threshold(base_threshold, search_cost)
 
         coupled: list[tuple[NodeCoupling, MemoryHit]] = []
-        damped: list[NodeCoupling] = []
 
         # Infer domain/regime from query if not specified
         query_tags = self._tokenize_query(query) if query else []
@@ -375,18 +377,8 @@ class RetrievalEngine:
             # Urgent deadlines get a soft lift through the Phase-1 pressure gate
             p_gate = p_eff * (1.0 + _TEMPORAL_GATE_BOOST * e_temporal)
 
-            # Phase 1 gate
+            # Phase 1 gate — skip coupling for below-threshold records (not returned).
             if p_gate < theta_eff:
-                coupling = self._compute_coupling(
-                    rec,
-                    query_tags,
-                    p_eff,
-                    rec.p_magnitude,
-                    effective_domain,
-                    effective_regime,
-                    target_pressure,
-                )
-                damped.append(coupling)
                 continue
 
             # Phase 2: impedance matching
@@ -400,27 +392,25 @@ class RetrievalEngine:
                 target_pressure,
             )
 
-            if coupling.is_coupled:
-                if query_tags and self._semantic_query_overlap(rec, query_tags) < 0.12:
-                    damped.append(coupling)
-                    continue
-                hit = MemoryHit.from_record(
-                    rec,
-                    p_eff,
-                    decay,
-                    i_weight,
-                    v,
-                    coupling_score=coupling.coupling_score,
-                    tag_overlap=coupling.tag_overlap,
-                    domain_match=coupling.domain_match,
-                    regime_match=coupling.regime_match,
-                    pressure_proximity=coupling.pressure_proximity,
-                    e_temporal=e_temporal,
-                    is_urgent=is_urgent,
-                )
-                coupled.append((coupling, hit))
-            else:
-                damped.append(coupling)
+            if not coupling.is_coupled:
+                continue
+            if query_tags and self._semantic_query_overlap(rec, query_tags) < 0.12:
+                continue
+            hit = MemoryHit.from_record(
+                rec,
+                p_eff,
+                decay,
+                i_weight,
+                v,
+                coupling_score=coupling.coupling_score,
+                tag_overlap=coupling.tag_overlap,
+                domain_match=coupling.domain_match,
+                regime_match=coupling.regime_match,
+                pressure_proximity=coupling.pressure_proximity,
+                e_temporal=e_temporal,
+                is_urgent=is_urgent,
+            )
+            coupled.append((coupling, hit))
 
         # Sort: event-window matches first (when query is time-relative),
         # then coupling × P_eff × (1 + deadline urgency + window boost).
@@ -819,7 +809,9 @@ class RetrievalEngine:
             return []
 
         by_id: dict[str, SignatureRecord] = {r.id: r for r in records if r.id}
-        clusters = self._build_torsion_clusters(list(by_id.values()))
+        records_list = list(by_id.values())
+        presence_index = build_presence_index(records_list)
+        clusters = self._build_torsion_clusters(records_list)
 
         reports: list[TorsionReport] = []
         seen_pairs: set[tuple[str, str]] = set()
@@ -827,12 +819,13 @@ class RetrievalEngine:
 
         # Rules are asymmetric: every stewardship/foundational anchor must be
         # checked against signals from every other drawer.
-        for rule, signal in self._integrity_candidate_pairs(list(by_id.values())):
+        for rule, signal in self._integrity_candidate_pairs(records_list):
             pair_key = (rule.id, signal.id) if rule.id < signal.id else (signal.id, rule.id)
             report = self._score_integrity_violation(
                 rule,
                 signal,
-                occupancy_records=list(by_id.values()),
+                occupancy_records=records_list,
+                presence_index=presence_index,
             )
             if report is None:
                 continue
@@ -843,7 +836,10 @@ class RetrievalEngine:
 
         # Exclusive spatial slots: multiple occupants of a capacity-1 place are
         # Entity Exclusion even when cluster_id was never supplied.
-        for report in self._entity_exclusion_reports(list(by_id.values())):
+        for report in self._entity_exclusion_reports(
+            records_list,
+            presence_index=presence_index,
+        ):
             pair_key = (
                 (report.signature_a_id, report.signature_b_id)
                 if report.signature_a_id < report.signature_b_id
@@ -880,11 +876,34 @@ class RetrievalEngine:
         self,
         records: Sequence[SignatureRecord],
     ) -> Iterator[tuple[SignatureRecord, SignatureRecord]]:
+        """Yield (anchor, signal) only when cue tokens/tags overlap.
+
+        Avoids anchors × signals Cartesian product. Cue-less anchors (rare)
+        still scan all signals to fail closed on opaque stewardship rules.
+        """
         anchors = [record for record in records if self._is_integrity_anchor(record)]
         signals = [record for record in records if not self._is_integrity_anchor(record)]
+        if not anchors or not signals:
+            return
+
+        signal_cues: list[tuple[SignatureRecord, frozenset[str]]] = [
+            (signal, self._integrity_cues(signal)) for signal in signals
+        ]
         for anchor in anchors:
-            for signal in signals:
-                yield anchor, signal
+            cues = self._integrity_cues(anchor)
+            if not cues:
+                for signal, _ in signal_cues:
+                    yield anchor, signal
+                continue
+            for signal, signal_cue in signal_cues:
+                if cues & signal_cue:
+                    yield anchor, signal
+
+    @classmethod
+    def _integrity_cues(cls, record: SignatureRecord) -> frozenset[str]:
+        tags = {tag.lower() for tag in (record.intent_tags or []) if tag}
+        tokens = set(cls._tokenize_query(record.compressed_fact or ""))
+        return frozenset(tags | tokens)
 
     @staticmethod
     def _is_integrity_anchor(record: SignatureRecord) -> bool:
@@ -905,12 +924,14 @@ class RetrievalEngine:
         signal: SignatureRecord,
         *,
         occupancy_records: Sequence[SignatureRecord] | None = None,
+        presence_index: dict[str, list] | None = None,
     ) -> TorsionReport | None:
         violation = detect_constraint_violation(
             rule,
             signal.compressed_fact or "",
             candidate_tags=signal.intent_tags or [],
             occupancy_records=occupancy_records or (),
+            presence_index=presence_index,
         )
         if violation is None:
             return None
@@ -941,6 +962,8 @@ class RetrievalEngine:
     def _entity_exclusion_reports(
         self,
         records: Sequence[SignatureRecord],
+        *,
+        presence_index: dict[str, list] | None = None,
     ) -> list[TorsionReport]:
         """Pairwise Entity Exclusion for exclusive spatial slots."""
         reports: list[TorsionReport] = []
@@ -949,7 +972,11 @@ class RetrievalEngine:
             slot = parse_exclusive_slot(rule.compressed_fact or "")
             if slot is None:
                 continue
-            occupants = collect_occupants(records, location=slot.location)
+            occupants = collect_occupants(
+                records,
+                location=slot.location,
+                presence_index=presence_index,
+            )
             if len(occupants) <= slot.capacity:
                 continue
             for i, left in enumerate(occupants):
@@ -1133,6 +1160,13 @@ class RetrievalEngine:
         for ids in tag_index.values():
             if len(ids) < 2:
                 continue
+            # Hot-tag fan-out cap: keep highest-pressure ids so we don't explode.
+            if len(ids) > _TAG_FANOUT_CAP:
+                ids = sorted(
+                    ids,
+                    key=lambda rid: (by_id[rid].p_magnitude, rid),
+                    reverse=True,
+                )[:_TAG_FANOUT_CAP]
             for i in range(len(ids)):
                 for j in range(i + 1, len(ids)):
                     yield from emit(ids[i], ids[j])

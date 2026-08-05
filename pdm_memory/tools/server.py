@@ -80,17 +80,39 @@ def _build_resonance_links(
     threshold: float = RESONANCE_LINK_THRESHOLD,
     max_links: int = MAX_LINKS,
 ) -> list[dict[str, Any]]:
-    scored: list[tuple[float, str, str]] = []
-    n = len(records)
-    for i in range(n):
-        for j in range(i + 1, n):
-            res = _tag_jaccard(records[i].intent_tags, records[j].intent_tags)
-            if res >= threshold:
-                scored.append((res, records[i].id, records[j].id))
-    scored.sort(key=lambda t: t[0], reverse=True)
+    """Tag-inverted pairing — avoids full N² when tag fanout is bounded."""
+    by_tag: dict[str, list[int]] = {}
+    for idx, rec in enumerate(records):
+        seen_tags: set[str] = set()
+        for tag in rec.intent_tags or []:
+            key = tag.lower().strip()
+            if not key or key in seen_tags:
+                continue
+            seen_tags.add(key)
+            by_tag.setdefault(key, []).append(idx)
+
+    scored: dict[tuple[str, str], float] = {}
+    max_fanout = 64
+    for indexes in by_tag.values():
+        if len(indexes) < 2:
+            continue
+        # Hot tags explode pairs — bound work per tag.
+        bucket = indexes if len(indexes) <= max_fanout else indexes[:max_fanout]
+        for i_pos, left_i in enumerate(bucket):
+            for right_i in bucket[i_pos + 1 :]:
+                res = _tag_jaccard(records[left_i].intent_tags, records[right_i].intent_tags)
+                if res < threshold:
+                    continue
+                a_id, b_id = records[left_i].id, records[right_i].id
+                key = (a_id, b_id) if a_id < b_id else (b_id, a_id)
+                prev = scored.get(key)
+                if prev is None or res > prev:
+                    scored[key] = res
+
+    ranked = sorted(scored.items(), key=lambda item: item[1], reverse=True)
     return [
         {"source": a, "target": b, "resonance": round(res, 4)}
-        for res, a, b in scored[:max_links]
+        for (a, b), res in ranked[:max_links]
     ]
 
 
@@ -336,6 +358,8 @@ def run_server(
     host: str = "127.0.0.1",
     port: int = 8080,
     open_browser: bool = True,
+    *,
+    allow_remote: bool = False,
 ) -> None:
     """Start uvicorn and optionally open the system browser."""
     try:
@@ -349,6 +373,14 @@ def run_server(
     import threading
     import time
     import webbrowser
+
+    normalized_host = (host or "127.0.0.1").strip().lower()
+    is_loopback = normalized_host in {"127.0.0.1", "localhost", "::1"}
+    if not is_loopback and not allow_remote:
+        raise SystemExit(
+            f"Refusing to bind PDM Explorer on non-loopback host '{host}'. "
+            "Use --host 127.0.0.1 (default) or pass --allow-remote explicitly."
+        )
 
     app = create_app(store=store, user=user)
     url = f"http://{host}:{port}"

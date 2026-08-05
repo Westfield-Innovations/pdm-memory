@@ -415,6 +415,28 @@ class SQLiteDriver(BaseStorage):
         ).fetchone()
         return mapping_to_record(row) if row else None
 
+    def find_by_hashes(
+        self,
+        hashes: builtins.list[str],
+        user: str = "default",
+    ) -> dict[str, SignatureRecord]:
+        cleaned = [h.strip() for h in hashes if h and h.strip()]
+        if not cleaned:
+            return {}
+        # Deduplicate while preserving order for stable tests
+        unique: list[str] = list(dict.fromkeys(cleaned))
+        placeholders = ",".join("?" for _ in unique)
+        rows = self._conn().execute(
+            f"SELECT * FROM pdm_signatures WHERE user = ? AND is_deleted = 0 "
+            f"AND compressed_fact_hash IN ({placeholders})",
+            [user, *unique],
+        ).fetchall()
+        result: dict[str, SignatureRecord] = {}
+        for row in rows:
+            rec = mapping_to_record(row)
+            result[str(row["compressed_fact_hash"])] = rec
+        return result
+
     def find_by_idempotency_key(
         self,
         idempotency_key: str,
@@ -426,6 +448,28 @@ class SQLiteDriver(BaseStorage):
             (user, idempotency_key.strip()),
         ).fetchone()
         return mapping_to_record(row) if row else None
+
+    def find_by_idempotency_keys(
+        self,
+        keys: builtins.list[str],
+        user: str = "default",
+    ) -> dict[str, SignatureRecord]:
+        cleaned = [k.strip() for k in keys if k and str(k).strip()]
+        if not cleaned:
+            return {}
+        unique: list[str] = list(dict.fromkeys(cleaned))
+        placeholders = ",".join("?" for _ in unique)
+        rows = self._conn().execute(
+            f"SELECT * FROM pdm_signatures WHERE user = ? AND is_deleted = 0 "
+            f"AND idempotency_key IN ({placeholders})",
+            [user, *unique],
+        ).fetchall()
+        result: dict[str, SignatureRecord] = {}
+        for row in rows:
+            key = row["idempotency_key"]
+            if key:
+                result[str(key)] = mapping_to_record(row)
+        return result
 
     def ping(self) -> bool:
         try:
@@ -562,6 +606,7 @@ class SQLiteDriver(BaseStorage):
         drawer: str | None = None,
         cursor_id: str | None = None,
         include_deleted: bool = False,
+        tag_any: builtins.list[str] | tuple[str, ...] | None = None,
     ) -> builtins.list[SignatureRecord]:
         where = ["user = ?", "p_magnitude >= ?"]
         params: list = [user, min_pressure]
@@ -570,6 +615,14 @@ class SQLiteDriver(BaseStorage):
         if drawer:
             where.append("drawer_domain = ?")
             params.append(drawer)
+        tags = [t.strip().lower() for t in (tag_any or ()) if t and str(t).strip()]
+        if tags:
+            # intent_tags stored as JSON array text — substring match on quoted token.
+            tag_clauses: list[str] = []
+            for tag in tags[:32]:
+                tag_clauses.append("LOWER(intent_tags) LIKE ?")
+                params.append(f'%"{tag}"%')
+            where.append("(" + " OR ".join(tag_clauses) + ")")
         if cursor_id:
             cursor = self._conn().execute(
                 "SELECT p_magnitude FROM pdm_signatures WHERE id = ? AND user = ?",

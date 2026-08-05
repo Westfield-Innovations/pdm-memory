@@ -173,6 +173,7 @@ def detect_constraint_violation(
     *,
     candidate_tags: Sequence[str] = (),
     occupancy_records: Sequence[SignatureRecord] = (),
+    presence_index: dict[str, list[OccupancyFact]] | None = None,
 ) -> ConstraintViolation | None:
     """Return a hard violation when candidate text breaks a stored rule."""
     rule_text = (rule.compressed_fact or "").strip()
@@ -196,6 +197,7 @@ def detect_constraint_violation(
         rule_text,
         candidate,
         occupancy_records=occupancy_records,
+        presence_index=presence_index,
     )
     violations = [violation for violation in (magnitude, role, occupancy) if violation is not None]
     return max(violations, key=lambda violation: violation.strength, default=None)
@@ -253,12 +255,31 @@ def parse_admission(text: str) -> OccupancyFact | None:
     )
 
 
+def build_presence_index(
+    records: Sequence[SignatureRecord],
+) -> dict[str, list[OccupancyFact]]:
+    """One-pass location → present entities index for occupancy checks."""
+    index: dict[str, dict[str, OccupancyFact]] = {}
+    for record in records:
+        if _is_rule_like(record):
+            continue
+        presence = parse_presence(record.compressed_fact or "", source_id=record.id)
+        if presence is None:
+            continue
+        bucket = index.setdefault(presence.location, {})
+        bucket[presence.entity.casefold()] = presence
+    return {location: list(by_entity.values()) for location, by_entity in index.items()}
+
+
 def collect_occupants(
     records: Sequence[SignatureRecord],
     *,
     location: str,
+    presence_index: dict[str, list[OccupancyFact]] | None = None,
 ) -> list[OccupancyFact]:
     """Unique present entities for a normalized location."""
+    if presence_index is not None:
+        return list(presence_index.get(location, ()))
     by_entity: dict[str, OccupancyFact] = {}
     for record in records:
         if _is_rule_like(record):
@@ -300,6 +321,7 @@ def _detect_occupancy_violation(
     candidate_text: str,
     *,
     occupancy_records: Sequence[SignatureRecord],
+    presence_index: dict[str, list[OccupancyFact]] | None = None,
 ) -> ConstraintViolation | None:
     slot = parse_exclusive_slot(rule_text)
     if slot is None:
@@ -314,7 +336,11 @@ def _detect_occupancy_violation(
     if request.location != slot.location:
         return None
 
-    occupants = collect_occupants(occupancy_records, location=slot.location)
+    occupants = collect_occupants(
+        occupancy_records,
+        location=slot.location,
+        presence_index=presence_index,
+    )
     occupant_names = {item.entity.casefold() for item in occupants}
     projected = set(occupant_names)
     projected.add(request.entity.casefold())
