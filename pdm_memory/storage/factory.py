@@ -10,6 +10,8 @@ Supported ``store`` values:
     ./local.db                          SQLite file path (legacy)
     sqlite:///./local.db                SQLite URL
     postgresql://user:pass@host/db        PostgreSQL (requires ``pdm-memory[postgres]``)
+    qdrant://localhost:6333/collection    Qdrant (requires ``pdm-memory[qdrant]``)
+    qdrant://memory/collection            Qdrant in-process (:memory:)
     cloud                               AZUS Companion API (requires ``token``)
 
 Custom backends::
@@ -102,6 +104,17 @@ def _build_cloud(
     return CloudDriver(auth=auth, base_url=cloud_url, user=user)
 
 
+def _build_qdrant(store: str, *, store_raw: bool, **_: Any) -> BaseStorage:
+    try:
+        from pdm_memory.storage.qdrant_driver import QdrantDriver
+    except ImportError as exc:
+        raise ImportError(
+            "Qdrant storage requires qdrant-client and tenacity. "
+            'Install with: pip install "pdm-memory[qdrant]"'
+        ) from exc
+    return QdrantDriver.from_url(store, store_raw=store_raw)
+
+
 def _sqlite_path_from_url(store: str) -> str:
     parsed = urlparse(store)
     if parsed.scheme.lower() not in {"sqlite", "file"}:
@@ -132,6 +145,8 @@ def _resolve_scheme(store: str) -> tuple[str, str]:
         return "sqlite", trimmed
     if scheme in {"postgresql", "postgres"}:
         return "postgresql", trimmed
+    if scheme in {"qdrant", "qdrants", "qdrant+http", "qdrant+https", "qdrant+memory", "qdrant-memory"}:
+        return "qdrant", trimmed
     if scheme == "cloud":
         return "cloud", trimmed
     return scheme, trimmed
@@ -183,6 +198,7 @@ _BUILTIN_SCHEMES.update(
         "file": _build_sqlite,
         "postgresql": _build_postgres,
         "postgres": _build_postgres,
+        "qdrant": _build_qdrant,
         "cloud": _build_cloud,
     }
 )

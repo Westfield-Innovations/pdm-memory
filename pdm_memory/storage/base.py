@@ -44,7 +44,7 @@ class BaseStorage(ABC):
     """
     Abstract storage interface for PDM signatures.
 
-    Every concrete driver (SQLite, Postgres, Cloud) implements the full
+    Every concrete driver (SQLite, Postgres, Qdrant, Cloud) implements the full
     required surface. Defaults remain only for helpers that are not yet
     uniform across drivers (``count``, ``find_by_hashes``,
     ``find_by_idempotency_keys``) and for no-ops (``transaction``, ``close``).

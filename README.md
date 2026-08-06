@@ -87,6 +87,31 @@ Store only SHA-256 hashes of memory text — the content never touches disk:
 mem = Memory(store="./private.db", store_raw=False)
 ```
 
+### Storage backends
+
+Pick one via `store=` — same `Memory` API for all:
+
+| `store` | Extra | Notes |
+|---------|-------|--------|
+| `./app.db` / `sqlite:///…` | (stdlib) | Default local file |
+| `postgresql://user:pass@host/db` | `pdm-memory[postgres]` | Shared SQL |
+| `qdrant://host:6333/collection` | `pdm-memory[qdrant]` | Payload document store (not ANN recall) |
+| `qdrant://memory/collection` | `pdm-memory[qdrant]` | In-process Qdrant for tests |
+| `cloud` | (httpx) | AZUS Companion API — requires `token` |
+
+```python
+# Qdrant (pip install "pdm-memory[qdrant]")
+mem = Memory(store="qdrant://localhost:6333/pdm_signatures")
+
+# TLS + API key
+mem = Memory(store="qdrants://qdrant.example:6334/pdm?api_key=SECRET")
+
+# Opt into gRPC when port 6334 is available
+mem = Memory(store="qdrant://localhost:6333/pdm?prefer_grpc=true")
+```
+
+PDM still retrieves via pressure/resonance (`list` → TAS). Qdrant holds signature payloads; vectors are placeholders. Updates use `set_payload`; drawer stats are denormalized counters; transient network errors retry with jitter.
+
 ---
 
 ## ☁️ Ecosystem Mode (AZUS Cloud)

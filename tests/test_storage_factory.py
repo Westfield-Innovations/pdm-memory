@@ -127,6 +127,17 @@ class TestStorageFactory:
         ):
             create_storage("postgresql://localhost/pdm")
 
+    def test_qdrant_memory_scheme(self):
+        import uuid
+
+        pytest.importorskip("qdrant_client")
+        from pdm_memory.storage.qdrant_driver import QdrantDriver
+
+        name = f"fac_{uuid.uuid4().hex[:8]}"
+        driver = create_storage(f"qdrant://memory/{name}")
+        assert isinstance(driver, QdrantDriver)
+        driver.close()
+
     def test_unknown_scheme(self):
         with pytest.raises(ValueError, match="Unsupported storage scheme"):
             create_storage("mongodb://localhost/pdm")
