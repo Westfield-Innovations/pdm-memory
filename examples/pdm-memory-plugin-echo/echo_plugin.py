@@ -12,8 +12,7 @@ class EchoPlugin(BasePDMPlugin):
     """
     Demo plugin. Loaded only when::
 
-        Memory(..., trust_plugins=True)
-        # or plugin_allowlist=[path to this folder]
+        Memory(..., plugin_allowlist=["/path/to/pdm-memory-plugin-echo"])
     """
 
     # Manifest overrides name/version/requires/autoload when discovered externally.

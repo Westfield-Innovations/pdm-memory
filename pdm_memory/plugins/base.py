@@ -12,6 +12,7 @@ from abc import ABC
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from pdm_memory.plugins.proxy import DEFAULT_CAPABILITIES
 from pdm_memory.plugins.versions import PluginRequirement, parse_requirements
 
 if TYPE_CHECKING:
@@ -60,6 +61,10 @@ class BasePDMPlugin(ABC):
 
     #: Hook run order — lower runs earlier (GuardDog=10 before Auditor=100).
     priority: ClassVar[int] = 100
+
+    #: Capability tokens for :class:`~pdm_memory.plugins.proxy.PluginMemoryProxy`.
+    #: Default: ``read`` | ``write`` | ``recall`` (no ``admin_io``, no ``peer``).
+    capabilities: ClassVar[frozenset[str]] = DEFAULT_CAPABILITIES
 
     def __init__(self) -> None:
         self.mem: Memory | PluginMemoryProxy | None = None

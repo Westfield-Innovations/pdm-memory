@@ -2,6 +2,7 @@
   "name": "echo",
   "version": "0.1.0",
   "entrypoint": "echo_plugin:EchoPlugin",
+  "entrypoint_sha256": "fe79ea37672d117a02a901a7b9c600c264c560ebd5c48fba8e4346a2f4d95028",
   "requires": [],
   "autoload": true
 }

@@ -22,6 +22,7 @@ python examples/industrial_safety_gate.py
 
 Plugin authoring: [docs/PLUGIN_AUTHORING.md](../docs/PLUGIN_AUTHORING.md).
 
-External plugins need `trust_plugins=True` (or `plugin_allowlist`) — default is Fail Closed.
+External plugins need `plugin_allowlist=[...]` (recommended) — default is Fail Closed.
+`trust_plugins=True` is deprecated (cwd children only).
 
 Each script uses `with Memory(...) as mem:` and a fresh temp SQLite file.

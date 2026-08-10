@@ -35,6 +35,7 @@ from __future__ import annotations
 import builtins
 import logging
 import os
+import warnings
 from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
@@ -72,7 +73,11 @@ from pdm_memory.models import (
 )
 from pdm_memory.plugins.base import BasePDMPlugin
 from pdm_memory.plugins.manager import PluginManager
-from pdm_memory.plugins.proxy import PluginMemoryProxy
+from pdm_memory.plugins.proxy import (
+    DEFAULT_CAPABILITIES,
+    PluginMemoryProxy,
+    normalize_capabilities,
+)
 from pdm_memory.storage.base import BaseStorage
 from pdm_memory.types import (
     HookEvent,
@@ -119,11 +124,13 @@ class Memory:
         torsion_judge: Optional callback to flag torsion pairs rules-only detection misses.
         autoload_plugins: If True (default), discover and install concrete plugins
                      from ``pdm_memory/plugins/``. External ``pdm-memory-plugin-*``
-                     folders load only when ``trust_plugins=True`` or allowlisted.
-        trust_plugins: If True, autoload discovers external plugin packages
-                     (arbitrary code). Default False — Fail Closed.
+                     folders load only when listed in ``plugin_allowlist``
+                     (recommended) or via deprecated ``trust_plugins=True``.
+        trust_plugins: Deprecated. If True (and allowlist empty), autoload
+                     discovers ``pdm-memory-plugin-*`` **direct children of cwd**
+                     only — no parent-tree walk. Prefer ``plugin_allowlist``.
         plugin_allowlist: Absolute/relative paths of trusted external plugin dirs
-                     (or parents). Ignored when ``trust_plugins=True``.
+                     (or parents). Authoritative when set.
     """
 
     def __init__(
@@ -160,6 +167,15 @@ class Memory:
             str(Path(p).expanduser().resolve())
             for p in (plugin_allowlist or ())
         )
+        if self._trust_plugins:
+            warnings.warn(
+                "Memory(trust_plugins=True) / PDM_TRUST_PLUGINS is deprecated; "
+                "use plugin_allowlist=[...] to pin trusted external plugin paths. "
+                "Without an allowlist, only pdm-memory-plugin-* directories that are "
+                "direct children of cwd are considered.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         if storage is not None:
             if not isinstance(storage, BaseStorage):
                 raise TypeError(
@@ -295,7 +311,20 @@ class Memory:
         if not getattr(plugin_instance, "load_source", None):
             plugin_instance.load_source = "manual"
 
-        proxy = PluginMemoryProxy(self, owner=name)
+        raw_caps = getattr(type(plugin_instance), "capabilities", DEFAULT_CAPABILITIES)
+        try:
+            caps = normalize_capabilities(raw_caps)
+        except ValueError as exc:
+            raise ValueError(
+                f"Plugin {name!r} has invalid capabilities: {exc}"
+            ) from exc
+
+        proxy = PluginMemoryProxy(
+            self,
+            owner=name,
+            capabilities=caps,
+            allowed_peers=type(plugin_instance).required_plugins(),
+        )
         plugin_instance.bind(proxy)
 
         hook_events = self._register_plugin_hooks(plugin_instance)

@@ -24,6 +24,8 @@ from pdm_memory.plugins.manifest import (
     MANIFEST_FILENAME,
     PluginManifestError,
     load_manifest,
+    sha256_file,
+    verify_entrypoint_sha256,
 )
 from pdm_memory.plugins.versions import check_requirement
 
@@ -66,17 +68,26 @@ class PluginManager:
         return Path(__file__).resolve().parent
 
     @staticmethod
-    def find_external_plugin_dirs(start: Path | str | None = None) -> list[Path]:
+    def find_external_plugin_dirs(
+        start: Path | str | None = None,
+        *,
+        walk_ancestors: bool = True,
+    ) -> list[Path]:
         """
-        Walk from ``start`` (default: cwd) up to filesystem root and collect
-        directories named ``pdm-memory-plugin-<name>``.
+        Collect directories named ``pdm-memory-plugin-<name>``.
+
+        When ``walk_ancestors`` is True (default), walks from ``start``
+        (default: cwd) up to the filesystem root. When False, only lists
+        direct children of ``start`` (legacy ``trust_plugins`` mode).
         """
         cursor = Path(start) if start is not None else Path.cwd()
         cursor = cursor.resolve()
         found: list[Path] = []
         seen: set[Path] = set()
 
-        for directory in [cursor, *cursor.parents]:
+        directories = [cursor, *cursor.parents] if walk_ancestors else [cursor]
+
+        for directory in directories:
             try:
                 children = list(directory.iterdir())
             except OSError as exc:
@@ -104,26 +115,72 @@ class PluginManager:
         """
         External plugins are arbitrary code.
 
-        Trusted when ``Memory(trust_plugins=True)`` or the resolved path is
-        under / equal to an entry in ``plugin_allowlist``.
+        Trusted when the resolved path is under / equal to an entry in
+        ``plugin_allowlist``, or (deprecated) when ``trust_plugins=True``
+        and no allowlist is configured.
         """
         mem = self._memory
-        if getattr(mem, "_trust_plugins", False):
-            return True
+        allowlist = getattr(mem, "_plugin_allowlist", ()) or ()
         resolved = Path(plugin_dir).resolve()
         resolved_s = str(resolved)
-        for allowed in getattr(mem, "_plugin_allowlist", ()) or ():
+        for allowed in allowlist:
             allowed_path = Path(allowed).resolve()
             allowed_s = str(allowed_path)
             if resolved_s == allowed_s:
                 return True
-            # Allow listing a parent that contains the plugin dir.
             try:
                 resolved.relative_to(allowed_path)
                 return True
             except ValueError:
                 continue
-        return False
+        if allowlist:
+            # Allowlist is authoritative when present.
+            return False
+        return bool(getattr(mem, "_trust_plugins", False))
+
+    def allowlist_plugin_dirs(self) -> list[Path]:
+        """
+        Resolve ``plugin_allowlist`` entries to concrete plugin directories.
+
+        An entry may be the plugin directory itself or a parent that
+        contains ``pdm-memory-plugin-*`` children.
+        """
+        mem = self._memory
+        found: list[Path] = []
+        seen: set[Path] = set()
+        for allowed in getattr(mem, "_plugin_allowlist", ()) or ():
+            root = Path(allowed).resolve()
+            if not root.is_dir():
+                logger.warning(
+                    "[PDM] plugin_allowlist entry is not a directory: %s", root
+                )
+                continue
+            candidates: list[Path] = []
+            if root.name.startswith(EXTERNAL_PLUGIN_DIR_PREFIX) and (
+                root / MANIFEST_FILENAME
+            ).is_file():
+                candidates.append(root)
+            else:
+                try:
+                    children = list(root.iterdir())
+                except OSError as exc:
+                    logger.warning(
+                        "[PDM] Cannot list allowlist dir %s: %s", root, exc
+                    )
+                    continue
+                for child in children:
+                    if (
+                        child.is_dir()
+                        and child.name.startswith(EXTERNAL_PLUGIN_DIR_PREFIX)
+                        and (child / MANIFEST_FILENAME).is_file()
+                    ):
+                        candidates.append(child.resolve())
+            for path in candidates:
+                if path in seen:
+                    continue
+                seen.add(path)
+                found.append(path)
+        return found
 
     def discover(self, directory: Path | str | None = None) -> list[type[BasePDMPlugin]]:
         """
@@ -145,7 +202,7 @@ class PluginManager:
             if not self.is_external_dir_trusted(root):
                 logger.warning(
                     "[PDM] Skipping untrusted external plugin dir %s "
-                    "(pass trust_plugins=True or plugin_allowlist)",
+                    "(use plugin_allowlist=...)",
                     root,
                 )
                 return []
@@ -188,12 +245,28 @@ class PluginManager:
         """
         Load exactly one plugin class via ``plugin.json`` entrypoint.
 
+        Manifest metadata is applied via a thin subclass (the imported
+        class ClassVars are never mutated).
+
         Raises:
-            PluginManifestError: Missing/invalid manifest or entrypoint.
+            PluginManifestError: Missing/invalid manifest, entrypoint, or
+                sha256 pin mismatch.
         """
         root = Path(plugin_dir).resolve()
         manifest = load_manifest(root)
         file_path, class_name = manifest.resolve_entrypoint_file(root)
+
+        digest = sha256_file(file_path)
+        pinned = bool(manifest.entrypoint_sha256)
+        if manifest.entrypoint_sha256:
+            verify_entrypoint_sha256(file_path, manifest.entrypoint_sha256)
+        else:
+            logger.warning(
+                "[PDM] External plugin %s at %s has no entrypoint_sha256 pin",
+                manifest.name,
+                root,
+            )
+
         module = self._load_module(file_path)
         obj = getattr(module, class_name, None)
         if obj is None:
@@ -209,19 +282,32 @@ class PluginManager:
                 f"entrypoint {class_name!r} must be a concrete BasePDMPlugin"
             )
 
-        # Manifest is authoritative for discovery metadata.
-        obj.name = manifest.name  # type: ignore[misc]
-        obj.version = manifest.version  # type: ignore[misc]
-        obj.requires = list(manifest.requires)  # type: ignore[misc]
-        obj.autoload = bool(manifest.autoload)  # type: ignore[misc]
+        # Manifest is authoritative — wrap without mutating the imported class.
+        bound = type(
+            f"{obj.__name__}FromManifest",
+            (obj,),
+            {
+                "name": manifest.name,
+                "version": manifest.version,
+                "requires": list(manifest.requires),
+                "autoload": bool(manifest.autoload),
+            },
+        )
+        bound.__module__ = obj.__module__
+        bound.__qualname__ = f"{obj.__qualname__}FromManifest"
+
         logger.info(
-            "[PDM] Loaded %s v%s from %s (%s)",
+            "[PDM] External plugin loaded name=%s version=%s dir=%s "
+            "entrypoint=%s entrypoint_sha256=%s sha256_pinned=%s requires=%s",
             manifest.name,
             manifest.version,
-            root.name,
+            str(root),
             manifest.entrypoint,
+            digest,
+            pinned,
+            list(manifest.requires),
         )
-        return obj
+        return bound
 
     def discover_all(
         self,
@@ -246,18 +332,51 @@ class PluginManager:
             _add(self.discover(builtin_directory))
 
         if include_external:
-            for plugin_dir in self.find_external_plugin_dirs(external_start):
-                if not self.is_external_dir_trusted(plugin_dir):
-                    logger.warning(
-                        "[PDM] Skipping untrusted external plugin dir %s "
-                        "(pass trust_plugins=True or plugin_allowlist)",
-                        plugin_dir,
+            mem = self._memory
+            has_allow = bool(getattr(mem, "_plugin_allowlist", ()) or ())
+            has_trust = bool(getattr(mem, "_trust_plugins", False))
+            if not has_allow and not has_trust:
+                logger.debug(
+                    "[PDM] Skipping external plugin discovery "
+                    "(neither plugin_allowlist nor trust_plugins)"
+                )
+            else:
+                candidates: list[Path] = []
+                seen_dirs: set[Path] = set()
+
+                def _push(paths: Sequence[Path]) -> None:
+                    for path in paths:
+                        resolved = path.resolve()
+                        if resolved in seen_dirs:
+                            continue
+                        seen_dirs.add(resolved)
+                        candidates.append(resolved)
+
+                if has_allow:
+                    _push(self.find_external_plugin_dirs(
+                        external_start, walk_ancestors=True
+                    ))
+                    _push(self.allowlist_plugin_dirs())
+                elif has_trust:
+                    # Deprecated: cwd children only — no parent-tree ascent.
+                    _push(
+                        self.find_external_plugin_dirs(
+                            external_start, walk_ancestors=False
+                        )
                     )
-                    continue
-                # Fail-fast: broken / missing plugin.json aborts discovery.
-                cls = self.load_from_manifest(plugin_dir)
-                setattr(cls, _SOURCE_ATTR, f"external:{plugin_dir.resolve()}")
-                _add([cls])
+
+                for plugin_dir in candidates:
+                    if not self.is_external_dir_trusted(plugin_dir):
+                        logger.warning(
+                            "[PDM] Skipping untrusted external plugin dir %s "
+                            "(use plugin_allowlist=...)",
+                            plugin_dir,
+                        )
+                        continue
+                    # Fail-fast: broken / missing plugin.json aborts discovery.
+                    cls = self.load_from_manifest(plugin_dir)
+                    setattr(cls, _SOURCE_ATTR, f"external:{plugin_dir.resolve()}")
+                    _add([cls])
 
         return classes
 
@@ -455,6 +574,7 @@ class PluginManager:
             module_name = f"pdm_memory.plugins.{path.stem}"
             return importlib.import_module(module_name)
 
+        # Isolated load: do not mutate sys.path (no sibling-module shadowing).
         module_name = f"_pdm_plugin_{path.stem}_{uuid.uuid4().hex}"
         spec = importlib.util.spec_from_file_location(module_name, path)
         if spec is None or spec.loader is None:
@@ -462,20 +582,8 @@ class PluginManager:
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
         try:
-            plugin_root = str(path.parent)
-            sys_path_added = False
-            if plugin_root not in sys.path:
-                sys.path.insert(0, plugin_root)
-                sys_path_added = True
-            try:
-                assert spec.loader is not None
-                spec.loader.exec_module(module)
-            finally:
-                if sys_path_added:
-                    try:
-                        sys.path.remove(plugin_root)
-                    except ValueError:
-                        pass
+            assert spec.loader is not None
+            spec.loader.exec_module(module)
         except Exception:
             sys.modules.pop(module_name, None)
             raise

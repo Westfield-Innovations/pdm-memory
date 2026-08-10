@@ -82,7 +82,10 @@ class TestUseConnector:
         from pdm_memory import PluginMemoryProxy
 
         assert isinstance(plugin.mem, PluginMemoryProxy)
-        assert plugin.mem.unwrap() is mem
+        from pdm_memory.plugins.proxy import as_memory
+
+        assert as_memory(plugin.mem) is mem
+        assert not hasattr(PluginMemoryProxy, "unwrap")
         assert mem.plugins["sledgehammer"] is plugin
         assert plugin.bound_hooks == ["pre_save", "post_save"]
         assert plugin.load_source == "manual"
@@ -326,7 +329,9 @@ class TestInstallPlugin:
         from pdm_memory import PluginMemoryProxy
 
         assert isinstance(plugin.mem, PluginMemoryProxy)
-        assert plugin.mem.unwrap() is mem
+        from pdm_memory.plugins.proxy import as_memory
+
+        assert as_memory(plugin.mem) is mem
         assert plugin.saved_id is not None
         assert mem.plugins["probe"] is plugin
         assert mem.probe is plugin
@@ -375,7 +380,9 @@ class EchoPlugin(BasePDMPlugin):
         from pdm_memory import PluginMemoryProxy
 
         assert isinstance(instance.mem, PluginMemoryProxy)
-        assert instance.mem.unwrap() is mem
+        from pdm_memory.plugins.proxy import as_memory
+
+        assert as_memory(instance.mem) is mem
         assert instance.load_source == "manual"
 
     def test_autoload_builtin_plugins_dir_is_safe(self, tmp_path: Path) -> None:
@@ -409,11 +416,16 @@ class TestExternalPluginFolders:
         requires: list[str] | None = None,
         autoload: bool = True,
         module: str = "echo_plugin",
-    ) -> None:
+        pin_sha256: bool = True,
+        bad_sha256: str | None = None,
+    ) -> Path:
         import json
 
+        from pdm_memory.plugins.manifest import sha256_file
+
         plugin_dir.mkdir(parents=True, exist_ok=True)
-        (plugin_dir / f"{module}.py").write_text(
+        entry = plugin_dir / f"{module}.py"
+        entry.write_text(
             f"""
 from pdm_memory.plugins.base import BasePDMPlugin
 
@@ -423,16 +435,21 @@ class {class_name}(BasePDMPlugin):
 """,
             encoding="utf-8",
         )
-        manifest = {
+        manifest: dict = {
             "name": name,
             "version": version,
             "entrypoint": f"{module}:{class_name}",
             "requires": requires or [],
             "autoload": autoload,
         }
+        if bad_sha256 is not None:
+            manifest["entrypoint_sha256"] = bad_sha256
+        elif pin_sha256:
+            manifest["entrypoint_sha256"] = sha256_file(entry)
         (plugin_dir / "plugin.json").write_text(
             json.dumps(manifest), encoding="utf-8"
         )
+        return entry
 
     def test_find_external_plugin_dirs_walks_parents(self, tmp_path: Path) -> None:
         workspace = tmp_path / "workspace"
@@ -442,8 +459,11 @@ class {class_name}(BasePDMPlugin):
         plugin_dir.mkdir()
         (plugin_dir / "echo.py").write_text("# placeholder\n", encoding="utf-8")
 
-        found = PluginManager.find_external_plugin_dirs(app)
+        found = PluginManager.find_external_plugin_dirs(app, walk_ancestors=True)
         assert plugin_dir.resolve() in found
+        assert (
+            PluginManager.find_external_plugin_dirs(app, walk_ancestors=False) == []
+        )
 
     def test_autoload_external_from_cwd_tree(self, tmp_path: Path) -> None:
         workspace = tmp_path / "project"
@@ -459,14 +479,15 @@ class {class_name}(BasePDMPlugin):
                 include_builtin=False,
                 include_external=True,
             )
-            # trust_plugins=False by default — external skipped
+            # Fail closed — no allowlist / trust
             assert classes == []
 
+            # Parent-tree layout requires allowlist (trust_plugins is cwd-only).
             m2 = Memory(
                 store=str(tmp_path / "ext2b.db"),
                 user="u",
                 autoload_plugins=False,
-                trust_plugins=True,
+                plugin_allowlist=[str(plugin_dir)],
             )
             try:
                 classes = m2._plugin_manager.discover_all(
@@ -477,6 +498,9 @@ class {class_name}(BasePDMPlugin):
                 assert len(classes) == 1
                 assert classes[0].name == "echo"
                 assert classes[0].version == "0.1.0"
+                # Imported class ClassVars must remain untouched.
+                base = classes[0].__bases__[0]
+                assert base.__name__ == "EchoPlugin"
                 m2._plugin_manager._install_discovered(classes)
                 assert "echo" in m2.plugins
                 assert getattr(m2.echo, "ready", False) is True
@@ -500,7 +524,6 @@ class {class_name}(BasePDMPlugin):
         )
         m = Memory(store=str(tmp_path / "bad.db"), user="u", autoload_plugins=False)
         try:
-            # Untrusted: skipped without reading manifest (no fail).
             assert (
                 m._plugin_manager.discover_all(
                     external_start=workspace,
@@ -508,12 +531,13 @@ class {class_name}(BasePDMPlugin):
                 )
                 == []
             )
-            m2 = Memory(
-                store=str(tmp_path / "bad2.db"),
-                user="u",
-                autoload_plugins=False,
-                trust_plugins=True,
-            )
+            with pytest.warns(DeprecationWarning, match="trust_plugins"):
+                m2 = Memory(
+                    store=str(tmp_path / "bad2.db"),
+                    user="u",
+                    autoload_plugins=False,
+                    trust_plugins=True,
+                )
             try:
                 with pytest.raises(PluginManifestError, match="missing plugin.json"):
                     m2._plugin_manager.discover_all(
@@ -534,15 +558,79 @@ class {class_name}(BasePDMPlugin):
             plugin_dir, name="ping", class_name="PingPlugin", module="ping"
         )
         monkeypatch.chdir(workspace)
-        m = Memory(
-            store=str(tmp_path / "ping.db"),
-            user="u",
-            autoload_plugins=True,
-            trust_plugins=True,
-        )
+        with pytest.warns(DeprecationWarning, match="trust_plugins"):
+            m = Memory(
+                store=str(tmp_path / "ping.db"),
+                user="u",
+                autoload_plugins=True,
+                trust_plugins=True,
+            )
         try:
             assert "ping" in m.plugins
             assert m.ping.load_source.startswith("external:")
+        finally:
+            m.close()
+
+    def test_trust_plugins_does_not_walk_parents(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        workspace = tmp_path / "root"
+        nested = workspace / "app"
+        nested.mkdir(parents=True)
+        plugin_dir = workspace / "pdm-memory-plugin-up"
+        self._write_manifested_plugin(plugin_dir, name="up")
+        monkeypatch.chdir(nested)
+        with pytest.warns(DeprecationWarning, match="trust_plugins"):
+            m = Memory(
+                store=str(tmp_path / "up.db"),
+                user="u",
+                autoload_plugins=True,
+                trust_plugins=True,
+            )
+        try:
+            assert "up" not in m.plugins
+        finally:
+            m.close()
+
+    def test_entrypoint_sha256_mismatch_fails(self, tmp_path: Path) -> None:
+        from pdm_memory import PluginManifestError
+
+        plugin_dir = tmp_path / "pdm-memory-plugin-evil"
+        self._write_manifested_plugin(
+            plugin_dir,
+            name="evil",
+            bad_sha256="0" * 64,
+        )
+        m = Memory(
+            store=str(tmp_path / "evil.db"),
+            user="u",
+            autoload_plugins=False,
+            plugin_allowlist=[str(plugin_dir)],
+        )
+        try:
+            with pytest.raises(PluginManifestError, match="sha256 mismatch"):
+                m._plugin_manager.load_from_manifest(plugin_dir)
+        finally:
+            m.close()
+
+    def test_load_does_not_mutate_sys_path(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        import sys
+
+        plugin_dir = tmp_path / "pdm-memory-plugin-path"
+        self._write_manifested_plugin(plugin_dir, name="path_check")
+        before = list(sys.path)
+        m = Memory(
+            store=str(tmp_path / "path.db"),
+            user="u",
+            autoload_plugins=False,
+            plugin_allowlist=[str(plugin_dir)],
+        )
+        try:
+            m._plugin_manager.load_from_manifest(plugin_dir)
+            assert sys.path == before
+            assert str(plugin_dir.resolve()) not in sys.path
         finally:
             m.close()
 
@@ -586,7 +674,6 @@ class {class_name}(BasePDMPlugin):
             assert "allow_me" in m.plugins
         finally:
             m.close()
-
 
 class TestPluginStorage:
     def test_plugin_drawer_isolation(self, mem: Memory) -> None:
@@ -694,6 +781,111 @@ class TestPluginProxyAndPriority:
 
         with pytest.raises(PluginCapabilityError, match="private"):
             _ = mem.nosy.mem._storage  # type: ignore[attr-defined]
+
+    def test_proxy_denies_admin_io_by_default(
+        self, mem: Memory, tmp_path: Path
+    ) -> None:
+        from pdm_memory import PluginCapabilityError
+        from pdm_memory.plugins.proxy import CAP_ADMIN_IO, DEFAULT_CAPABILITIES
+
+        class DefaultPlugin(BasePDMPlugin):
+            name = "default_caps"
+
+            def dump(self, path: Path) -> None:
+                assert self.mem is not None
+                self.mem.export_json(path)
+
+        class IoPlugin(BasePDMPlugin):
+            name = "io_caps"
+            capabilities = DEFAULT_CAPABILITIES | {CAP_ADMIN_IO}
+
+            def dump(self, path: Path) -> int:
+                assert self.mem is not None
+                return self.mem.export_json(path)
+
+        mem.use(DefaultPlugin())
+        out = tmp_path / "leak.json"
+        with pytest.raises(PluginCapabilityError, match="admin_io"):
+            mem.default_caps.dump(out)
+        assert not out.exists()
+
+        mem.use(IoPlugin())
+        mem.save("seed", tags=["a", "b", "c"])
+        assert mem.io_caps.dump(tmp_path / "ok.json") >= 1
+
+    def test_proxy_denies_peer_without_capability(self, mem: Memory) -> None:
+        from pdm_memory import PluginCapabilityError
+        from pdm_memory.plugins.proxy import CAP_PEER, DEFAULT_CAPABILITIES
+
+        class Peer(BasePDMPlugin):
+            name = "peer_target"
+
+            def ping(self) -> str:
+                return "pong"
+
+        class Stranger(BasePDMPlugin):
+            name = "stranger_target"
+
+            def ping(self) -> str:
+                return "hi"
+
+        class Caller(BasePDMPlugin):
+            name = "caller"
+
+            def call_peer(self) -> str:
+                assert self.mem is not None
+                return self.mem.peer_target.ping()
+
+        class DepCaller(BasePDMPlugin):
+            name = "dep_caller"
+            requires = ["peer_target"]
+
+            def call_peer(self) -> str:
+                assert self.mem is not None
+                return self.mem.peer_target.ping()
+
+            def call_stranger(self) -> str:
+                assert self.mem is not None
+                return self.mem.stranger_target.ping()
+
+        class TrustedCaller(BasePDMPlugin):
+            name = "trusted_caller"
+            capabilities = DEFAULT_CAPABILITIES | {CAP_PEER}
+
+            def call_stranger(self) -> str:
+                assert self.mem is not None
+                return self.mem.stranger_target.ping()
+
+        mem.use(Peer()).use(Stranger()).use(Caller()).use(DepCaller()).use(
+            TrustedCaller()
+        )
+        with pytest.raises(PluginCapabilityError, match="peer"):
+            mem.caller.call_peer()
+        assert mem.dep_caller.call_peer() == "pong"
+        with pytest.raises(PluginCapabilityError, match="peer"):
+            mem.dep_caller.call_stranger()
+        assert mem.trusted_caller.call_stranger() == "hi"
+
+    def test_proxy_unwrap_not_public(self, mem: Memory) -> None:
+        from pdm_memory import PluginCapabilityError, PluginMemoryProxy
+        from pdm_memory.plugins.proxy import as_memory
+
+        class Tiny(BasePDMPlugin):
+            name = "tiny"
+
+        mem.use(Tiny())
+        assert not hasattr(PluginMemoryProxy, "unwrap")
+        with pytest.raises(PluginCapabilityError):
+            _ = mem.tiny.mem.unwrap()  # type: ignore[attr-defined]
+        assert as_memory(mem.tiny.mem) is mem
+
+    def test_unknown_capability_fails_fast(self, mem: Memory) -> None:
+        class Bad(BasePDMPlugin):
+            name = "bad_caps"
+            capabilities = frozenset({"read", "nuke_from_orbit"})
+
+        with pytest.raises(ValueError, match="Unknown plugin capabilities"):
+            mem.use(Bad())
 
     def test_hook_priority_orders_plugins(self, mem: Memory) -> None:
         order: list[str] = []

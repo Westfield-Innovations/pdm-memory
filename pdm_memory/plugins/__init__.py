@@ -15,11 +15,30 @@ from pdm_memory.plugins.manifest import (
     MANIFEST_FILENAME,
     PluginManifest,
     PluginManifestError,
+    sha256_file,
 )
-from pdm_memory.plugins.proxy import PluginCapabilityError, PluginMemoryProxy
+from pdm_memory.plugins.proxy import (
+    CAP_ADMIN_IO,
+    CAP_PEER,
+    CAP_READ,
+    CAP_RECALL,
+    CAP_WRITE,
+    DEFAULT_CAPABILITIES,
+    KNOWN_CAPABILITIES,
+    PluginCapabilityError,
+    PluginMemoryProxy,
+    as_memory,
+)
 
 __all__ = [
+    "CAP_ADMIN_IO",
+    "CAP_PEER",
+    "CAP_READ",
+    "CAP_RECALL",
+    "CAP_WRITE",
+    "DEFAULT_CAPABILITIES",
     "EXTERNAL_PLUGIN_DIR_PREFIX",
+    "KNOWN_CAPABILITIES",
     "MANIFEST_FILENAME",
     "PLUGIN_DRAWER_PREFIX",
     "BasePDMPlugin",
@@ -28,4 +47,6 @@ __all__ = [
     "PluginManifest",
     "PluginManifestError",
     "PluginMemoryProxy",
+    "as_memory",
+    "sha256_file",
 ]

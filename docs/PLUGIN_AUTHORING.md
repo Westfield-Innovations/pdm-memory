@@ -32,14 +32,37 @@ mem.use(GuardDog())
 
 ## Capability proxy
 
-After `mem.use(...)`, `plugin.mem` is a **`PluginMemoryProxy`**:
+After `mem.use(...)`, `plugin.mem` is a **`PluginMemoryProxy`**. Access is gated by
+`capabilities` on the plugin class (fail closed):
 
-| Allowed | Denied |
-|---------|--------|
-| `save`, `recall`, `get`, `list`, `delete`, … | `close`, `_storage`, `use`, `unload` |
-| peer plugins (`mem.GeoTagger`) | private attrs (`_*`) |
+```python
+from pdm_memory.plugins.proxy import (
+    CAP_ADMIN_IO,
+    CAP_PEER,
+    CAP_READ,
+    CAP_RECALL,
+    CAP_WRITE,
+    DEFAULT_CAPABILITIES,
+)
 
-Escape hatch for tests only: `plugin.mem.unwrap()`.
+class DumpPlugin(BasePDMPlugin):
+    name = "dumper"
+    # Default = read | write | recall (no dump/inject, no peer calls)
+    capabilities = DEFAULT_CAPABILITIES | {CAP_ADMIN_IO, CAP_PEER}
+```
+
+| Capability | Unlocks |
+|------------|---------|
+| `read` | `get`, `list`, `list_drawers`, `count`, `status`, `explain`, … |
+| `write` | `save`, `save_many`, `update*`, `delete`, `reinforce`, … |
+| `recall` | `recall` |
+| `admin_io` | `export_json`, `export_csv`, `import_json` (opt-in) |
+| `peer` | call **any** installed plugin via `self.mem.<PeerName>` |
+| *(declared `requires`)* | call listed dependency plugins without `peer` |
+
+Always denied: `close`, `_storage`, `use`, `unload`, private `_*`.
+
+There is **no** `unwrap()` on the proxy. Tests/SDK internals may use `as_memory(plugin.mem)`.
 
 Plugin-private data: drawer `plugin:<name>` via `plugin_save` / `plugin_recall` / `plugin_list`.
 
@@ -58,35 +81,34 @@ pdm-memory-plugin-echo/
   "name": "echo",
   "version": "0.1.0",
   "entrypoint": "echo_plugin:EchoPlugin",
+  "entrypoint_sha256": "<sha256 of echo_plugin.py>",
   "requires": [],
   "autoload": true
 }
 ```
 
-Place the folder as a sibling of your app (or any parent of cwd). Discovery walks cwd → root.
+Pin `entrypoint_sha256` (64 hex chars, optional `sha256:` prefix). Missing pin → warning;
+mismatch → fail fast. Entrypoint is loaded **without** mutating `sys.path` — keep the
+plugin in one file or depend on installed packages only.
 
 ### Trust (Fail Closed)
 
-External plugins are **arbitrary code**. Defaults:
+External plugins are **arbitrary code**. Default: ignored.
+
+**Recommended** — path allowlist (exact plugin dir or parent):
 
 ```python
-Memory(store="./app.db")  # trust_plugins=False → external dirs ignored
-```
-
-Opt in:
-
-```python
-Memory(store="./app.db", trust_plugins=True)
-
-# or path allowlist (absolute or parent of the plugin dir)
 Memory(
     store="./app.db",
     plugin_allowlist=["/abs/path/to/pdm-memory-plugin-echo"],
 )
 ```
 
-Env override (same as `trust_plugins=True`): `PDM_TRUST_PLUGINS=1`.
+**Deprecated** — `trust_plugins=True` / `PDM_TRUST_PLUGINS=1`:
+loads only `pdm-memory-plugin-*` that are **direct children of cwd** (no parent walk).
+Emits `DeprecationWarning`. Prefer allowlist.
 
+When both are set, **allowlist is authoritative**.
 ## Hooks & priority
 
 ```python

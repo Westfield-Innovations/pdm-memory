@@ -8,7 +8,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -17,9 +20,52 @@ from pdm_memory.plugins.versions import parse_requirements
 
 MANIFEST_FILENAME = "plugin.json"
 
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
 
 class PluginManifestError(ValueError):
     """Invalid or missing external plugin manifest — fail fast."""
+
+
+def sha256_file(path: Path | str) -> str:
+    """Hex SHA-256 digest of a file (streaming)."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def normalize_sha256(value: str) -> str:
+    """Accept raw hex or ``sha256:<hex>``; return lowercase hex."""
+    raw = value.strip().lower()
+    if raw.startswith("sha256:"):
+        raw = raw[7:].strip()
+    if not _SHA256_HEX.match(raw):
+        raise PluginManifestError(
+            f"plugin.json 'entrypoint_sha256' must be 64 hex chars, got {value!r}"
+        )
+    return raw
+
+
+def verify_entrypoint_sha256(path: Path | str, expected: str) -> str:
+    """
+    Verify file digest against pinned hex.
+
+    Returns:
+        Actual digest (always).
+
+    Raises:
+        PluginManifestError: Mismatch.
+    """
+    actual = sha256_file(path)
+    want = normalize_sha256(expected)
+    if not hmac.compare_digest(actual, want):
+        raise PluginManifestError(
+            f"entrypoint sha256 mismatch for {Path(path).name}: "
+            f"expected {want}, got {actual}"
+        )
+    return actual
 
 
 @dataclass(slots=True)
@@ -31,6 +77,7 @@ class PluginManifest:
     version: str = "0.0.0"
     requires: list[str] = field(default_factory=list)
     autoload: bool = True
+    entrypoint_sha256: str | None = None
     path: Path | None = None
 
     @classmethod
@@ -68,12 +115,18 @@ class PluginManifest:
         if not isinstance(autoload, bool):
             raise PluginManifestError("plugin.json 'autoload' must be a boolean")
 
+        pinned: str | None = None
+        raw_pin = data.get("entrypoint_sha256")
+        if raw_pin is not None and str(raw_pin).strip():
+            pinned = normalize_sha256(str(raw_pin))
+
         return cls(
             name=name,
             entrypoint=entrypoint,
             version=version,
             requires=requires,
             autoload=autoload,
+            entrypoint_sha256=pinned,
             path=path,
         )
 
