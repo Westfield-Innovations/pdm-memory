@@ -121,7 +121,13 @@ class GuardDog(BasePDMPlugin):
     priority = 10   # runs before Auditor
 ```
 
-Hook events: `pre_save`, `post_save`, `post_recall`. Integrity veto: return `None`/`False` or raise `IntegrityBlock`.
+Hook events: `pre_save`, `post_save`, `post_recall`.
+
+- `pre_save`: Integrity veto — return `None`/`False` or raise `IntegrityBlock`. Exceptions propagate.
+- `post_save` / `post_recall`: **exceptions are isolated** (logged); later hooks and the
+  caller still proceed. Never put required transaction logic only in `post_*`.
+- `post_recall` receives :class:`~pdm_memory.types.PostRecallContext`
+  (`ctx.query` or `ctx["query"]`; `ctx.source` is `"recall"` or `"surface"`).
 
 ## Requirements
 

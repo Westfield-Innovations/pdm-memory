@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from itertools import count
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from typing_extensions import Self
 
@@ -81,6 +81,7 @@ from pdm_memory.plugins.proxy import (
 from pdm_memory.storage.base import BaseStorage
 from pdm_memory.types import (
     HookEvent,
+    PostRecallContext,
     RecallHook,
     TorsionJudge,
 )
@@ -208,7 +209,9 @@ class Memory:
                          Return the (possibly mutated) record.
                          Return None/False or raise IntegrityBlock to veto.
             - post_save: (SignatureRecord, memory_id) -> None
-            - post_recall:(ctx dict) -> None
+                         Exceptions are isolated (logged); later hooks still run.
+            - post_recall:(PostRecallContext) -> None
+                         Same isolation. ``ctx`` supports ``ctx.query`` and ``ctx["query"]``.
 
         Args:
             priority: Lower runs earlier (default 100). Stable order by registration
@@ -257,11 +260,51 @@ class Memory:
 
     def _run_post_save_hooks(self, sig: SignatureRecord, memory_id: str) -> None:
         for entry in self._post_save_hooks:
-            entry.hook(sig, memory_id)
+            try:
+                entry.hook(sig, memory_id)
+            except Exception:
+                logger.exception(
+                    "[PDM] post_save hook failed (isolated) memory_id=%s hook=%s",
+                    memory_id,
+                    getattr(entry.hook, "__qualname__", repr(entry.hook)),
+                )
 
-    def _run_post_recall_hooks(self, ctx: dict[str, Any]) -> None:
+    def _run_post_recall_hooks(self, ctx: PostRecallContext) -> None:
         for entry in self._post_recall_hooks:
-            entry.hook(ctx)
+            try:
+                entry.hook(ctx)
+            except Exception:
+                logger.exception(
+                    "[PDM] post_recall hook failed (isolated) query=%s source=%s hook=%s",
+                    ctx.query,
+                    ctx.source,
+                    getattr(entry.hook, "__qualname__", repr(entry.hook)),
+                )
+
+    def _build_post_recall_context(
+        self,
+        *,
+        query: str,
+        k: int,
+        hits: Sequence[MemoryHit],
+        reinforced: bool,
+        min_pressure: float = 0.0,
+        search_cost: float = 0.5,
+        drawer: str | None = None,
+        diversity_bias: float | None = None,
+        source: Literal["recall", "surface"] = "recall",
+    ) -> PostRecallContext:
+        return PostRecallContext(
+            query=query,
+            k=k,
+            hits=tuple(hits),
+            reinforced=reinforced,
+            min_pressure=min_pressure,
+            search_cost=search_cost,
+            drawer=drawer,
+            diversity_bias=diversity_bias,
+            source=source,
+        )
 
     # ------------------------------------------------------------------
     # Plugins
@@ -1047,17 +1090,19 @@ class Memory:
             page_size=page_size,
         )
         if not records:
-            ctx: dict[str, Any] = {
-                "query": query,
-                "k": k,
-                "hits": [],
-                "reinforced": False,
-                "min_pressure": min_pressure,
-                "search_cost": search_cost,
-                "drawer": drawer,
-                "diversity_bias": diversity_bias,
-            }
-            self._run_post_recall_hooks(ctx)
+            self._run_post_recall_hooks(
+                self._build_post_recall_context(
+                    query=query,
+                    k=k,
+                    hits=(),
+                    reinforced=False,
+                    min_pressure=min_pressure,
+                    search_cost=search_cost,
+                    drawer=drawer,
+                    diversity_bias=diversity_bias,
+                    source="recall",
+                )
+            )
             return []
 
         hits = self._engine.recall(
@@ -1076,17 +1121,19 @@ class Memory:
         if reinforced:
             self._apply_reinforcement(hits)
 
-        ctx = {
-            "query": query,
-            "k": k,
-            "hits": hits,
-            "reinforced": reinforced,
-            "min_pressure": min_pressure,
-            "search_cost": search_cost,
-            "drawer": drawer,
-            "diversity_bias": diversity_bias,
-        }
-        self._run_post_recall_hooks(ctx)
+        self._run_post_recall_hooks(
+            self._build_post_recall_context(
+                query=query,
+                k=k,
+                hits=hits,
+                reinforced=reinforced,
+                min_pressure=min_pressure,
+                search_cost=search_cost,
+                drawer=drawer,
+                diversity_bias=diversity_bias,
+                source="recall",
+            )
+        )
         return hits
 
     def surface(
@@ -1126,16 +1173,17 @@ class Memory:
         if reinforced:
             self._apply_reinforcement(hits)
         self._run_post_recall_hooks(
-            {
-                "query": query,
-                "k": k,
-                "hits": hits,
-                "reinforced": reinforced,
-                "min_pressure": 0.0,
-                "search_cost": search_cost,
-                "drawer": None,
-                "diversity_bias": None,
-            }
+            self._build_post_recall_context(
+                query=query,
+                k=k,
+                hits=hits,
+                reinforced=reinforced,
+                min_pressure=0.0,
+                search_cost=search_cost,
+                drawer=None,
+                diversity_bias=DEFAULT_DIVERSITY_BIAS,
+                source="surface",
+            )
         )
         torsion_reports = self._engine.detect_torsion(
             records,

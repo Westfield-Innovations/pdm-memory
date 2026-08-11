@@ -6,7 +6,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
 if TYPE_CHECKING:
@@ -24,6 +25,50 @@ RecallHook = Callable[["MemoryHit"], None]
 # -----------------------------
 
 HookEvent = Literal["pre_save", "post_save", "post_recall"]
+PostRecallSource = Literal["recall", "surface"]
+
+
+@dataclass(frozen=True, slots=True)
+class PostRecallContext:
+    """
+    Typed context for ``post_recall`` hooks.
+
+    Supports attribute access (``ctx.query``) and Mapping-style
+    ``ctx["query"]`` for backward compatibility with dict-shaped hooks.
+    """
+
+    query: str
+    k: int
+    hits: tuple["MemoryHit", ...]
+    reinforced: bool
+    min_pressure: float = 0.0
+    search_cost: float = 0.5
+    drawer: str | None = None
+    diversity_bias: float | None = None
+    source: PostRecallSource = "recall"
+
+    def __getitem__(self, key: str) -> Any:
+        try:
+            return getattr(self, key)
+        except AttributeError as exc:
+            raise KeyError(key) from exc
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(asdict(self))
+
+    def __len__(self) -> int:
+        return len(asdict(self))
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+    def keys(self) -> Sequence[str]:
+        return tuple(asdict(self).keys())
+
+    def as_dict(self) -> dict[str, Any]:
+        """Shallow dict copy (hits remain the same objects)."""
+        return asdict(self)
+
 
 # Called right before storage.save(sig).
 # Return SignatureRecord to keep/mutate.
@@ -36,6 +81,5 @@ PreSaveHook = Callable[
 # Called after storage.save(sig) produced memory_id.
 PostSaveHook = Callable[["SignatureRecord", str], None]
 
-# Called at the end of recall(), after optional on_recall() + reinforcement writes.
-# Receives a context dict to avoid locking plugins to a specific parameter list.
-PostRecallHook = Callable[[dict[str, Any]], None]
+# Called at the end of recall()/surface(), after optional on_recall() + reinforce.
+PostRecallHook = Callable[[PostRecallContext], None]

@@ -37,6 +37,7 @@ from pdm_memory.plugins import (
     PluginMemoryProxy,
 )
 from pdm_memory.storage.factory import create_storage, register_storage
+from pdm_memory.types import PostRecallContext
 
 __version__ = "0.2.3"
 __all__ = [
@@ -53,6 +54,7 @@ __all__ = [
     "PluginManifestError",
     "PluginMemoryProxy",
     "PluginStatusEntry",
+    "PostRecallContext",
     "SurfaceReport",
     "TorsionReport",
     "__version__",
