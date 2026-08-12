@@ -41,7 +41,6 @@ _CAPABILITY_ATTRS: Final[dict[str, frozenset[str]]] = {
             "explain",
             "detect_torsion",
             "surface",
-            "plugins",
         }
     ),
     CAP_WRITE: frozenset(
@@ -53,6 +52,7 @@ _CAPABILITY_ATTRS: Final[dict[str, frozenset[str]]] = {
             "update_many",
             "delete",
             "reinforce",
+            "penalize",
             "reconcile_torsion",
         }
     ),

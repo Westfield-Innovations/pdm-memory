@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
 if TYPE_CHECKING:
@@ -26,6 +26,18 @@ RecallHook = Callable[["MemoryHit"], None]
 
 HookEvent = Literal["pre_save", "post_save", "post_recall"]
 PostRecallSource = Literal["recall", "surface"]
+
+_POST_RECALL_FIELD_NAMES: tuple[str, ...] = (
+    "query",
+    "k",
+    "hits",
+    "reinforced",
+    "min_pressure",
+    "search_cost",
+    "drawer",
+    "diversity_bias",
+    "source",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,21 +65,24 @@ class PostRecallContext:
         except AttributeError as exc:
             raise KeyError(key) from exc
 
+    def __contains__(self, key: object) -> bool:
+        return isinstance(key, str) and key in _POST_RECALL_FIELD_NAMES
+
     def __iter__(self) -> Iterator[str]:
-        return iter(asdict(self))
+        return iter(_POST_RECALL_FIELD_NAMES)
 
     def __len__(self) -> int:
-        return len(asdict(self))
+        return len(_POST_RECALL_FIELD_NAMES)
 
     def get(self, key: str, default: Any = None) -> Any:
         return getattr(self, key, default)
 
     def keys(self) -> Sequence[str]:
-        return tuple(asdict(self).keys())
+        return _POST_RECALL_FIELD_NAMES
 
     def as_dict(self) -> dict[str, Any]:
-        """Shallow dict copy (hits remain the same objects)."""
-        return asdict(self)
+        """Shallow dict copy — ``hits`` keeps the same MemoryHit objects."""
+        return {f.name: getattr(self, f.name) for f in fields(self)}
 
 
 # Called right before storage.save(sig).

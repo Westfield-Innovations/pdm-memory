@@ -82,6 +82,25 @@ class TestIdempotencyKey:
             assert a == b
             assert mem.count() == 1
 
+    def test_idempotency_key_reusable_after_soft_delete(self, tmp_path):
+        db = str(tmp_path / "idem_reuse.db")
+        with Memory(store=db, user="u") as mem:
+            first = mem.save(
+                "Pay invoice once",
+                tags=["pay", "invoice", "once"],
+                idempotency_key="reuse-key",
+            )
+            assert mem.delete(first) is True
+            second = mem.save(
+                "Pay invoice again",
+                tags=["pay", "invoice", "again"],
+                idempotency_key="reuse-key",
+            )
+            assert second != first
+            assert mem.get(second) is not None
+            assert mem.get(first) is None
+            assert mem.count() == 1
+
 
 class TestStoragePing:
     def test_sqlite_ping(self, tmp_path):

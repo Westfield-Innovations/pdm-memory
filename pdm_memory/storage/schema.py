@@ -88,7 +88,7 @@ CREATE INDEX IF NOT EXISTS idx_pdm_user_id
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pdm_user_idempotency
     ON pdm_signatures (user, idempotency_key)
-    WHERE idempotency_key IS NOT NULL;
+    WHERE idempotency_key IS NOT NULL AND is_deleted = 0;
 
 CREATE TABLE IF NOT EXISTS pdm_drawers (
     domain          TEXT NOT NULL,
@@ -144,7 +144,7 @@ CREATE INDEX IF NOT EXISTS idx_pdm_user_id
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pdm_user_idempotency
     ON pdm_signatures ("user", idempotency_key)
-    WHERE idempotency_key IS NOT NULL;
+    WHERE idempotency_key IS NOT NULL AND is_deleted = 0;
 
 CREATE TABLE IF NOT EXISTS pdm_drawers (
     domain          TEXT NOT NULL,
@@ -174,10 +174,12 @@ def apply_sqlite_migrations(conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_pdm_user_id "
         "ON pdm_signatures (user, id)"
     )
+    # Recreate: live rows only — soft-deleted keys must be reusable.
+    conn.execute("DROP INDEX IF EXISTS idx_pdm_user_idempotency")
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_pdm_user_idempotency "
         "ON pdm_signatures (user, idempotency_key) "
-        "WHERE idempotency_key IS NOT NULL"
+        "WHERE idempotency_key IS NOT NULL AND is_deleted = 0"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pdm_user_event_at "
@@ -204,10 +206,11 @@ def apply_postgres_migrations(conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_pdm_user_id "
         'ON pdm_signatures ("user", id)'
     )
+    conn.execute("DROP INDEX IF EXISTS idx_pdm_user_idempotency")
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_pdm_user_idempotency "
         'ON pdm_signatures ("user", idempotency_key) '
-        "WHERE idempotency_key IS NOT NULL"
+        "WHERE idempotency_key IS NOT NULL AND is_deleted = 0"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pdm_user_event_at "

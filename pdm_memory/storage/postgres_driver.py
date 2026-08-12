@@ -352,7 +352,8 @@ class PostgresDriver(BaseStorage):
             conn = self._conn()
             row = conn.execute(
                 """
-                SELECT p_magnitude, retrieval_count, t_persistence, phase_privilege
+                SELECT p_magnitude, retrieval_count, t_persistence, phase_privilege,
+                       validation_prediction_total, validation_prediction_correct
                 FROM pdm_signatures
                 WHERE id = %s AND "user" = %s AND is_deleted = 0
                 FOR UPDATE
@@ -373,16 +374,28 @@ class PostgresDriver(BaseStorage):
                 float(row["t_persistence"]),
                 float(row["phase_privilege"]),
             )
+            new_total = int(row["validation_prediction_total"] or 0) + 1
+            new_correct = int(row["validation_prediction_correct"] or 0) + 1
             conn.execute(
                 """
                 UPDATE pdm_signatures
                 SET p_magnitude = %s,
                     effective_spike = %s,
                     retrieval_count = retrieval_count + 1,
-                    last_retrieved = %s
+                    last_retrieved = %s,
+                    validation_prediction_total = %s,
+                    validation_prediction_correct = %s
                 WHERE id = %s AND "user" = %s AND is_deleted = 0
                 """,
-                (new_p, new_spike, last_retrieved, memory_id, user),
+                (
+                    new_p,
+                    new_spike,
+                    last_retrieved,
+                    new_total,
+                    new_correct,
+                    memory_id,
+                    user,
+                ),
             )
     def update_batch(
         self,

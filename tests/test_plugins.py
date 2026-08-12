@@ -782,6 +782,33 @@ class TestPluginProxyAndPriority:
         with pytest.raises(PluginCapabilityError, match="private"):
             _ = mem.nosy.mem._storage  # type: ignore[attr-defined]
 
+    def test_proxy_allows_penalize_and_denies_plugins_dict(
+        self, mem: Memory
+    ) -> None:
+        from pdm_memory import PluginCapabilityError
+
+        class Signal(BasePDMPlugin):
+            name = "signal"
+
+            def down(self, memory_id: str) -> None:
+                assert self.mem is not None
+                self.mem.penalize(memory_id)
+
+            def leak(self) -> None:
+                assert self.mem is not None
+                _ = self.mem.plugins
+
+        mid = mem.save("penalty target fact", tags=["a", "b", "c"], p_magnitude=80.0)
+        mem.use(Signal())
+        mem.signal.down(mid)
+        rec = mem._storage.get(mid, user="test_user")
+        assert rec is not None
+        assert rec.validation_prediction_total == 1
+        assert rec.validation_prediction_correct == 0
+
+        with pytest.raises(PluginCapabilityError, match="plugins"):
+            mem.signal.leak()
+
     def test_proxy_denies_admin_io_by_default(
         self, mem: Memory, tmp_path: Path
     ) -> None:

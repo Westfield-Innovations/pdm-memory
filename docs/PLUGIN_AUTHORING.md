@@ -54,7 +54,7 @@ class DumpPlugin(BasePDMPlugin):
 | Capability | Unlocks |
 |------------|---------|
 | `read` | `get`, `list`, `list_drawers`, `count`, `status`, `explain`, … |
-| `write` | `save`, `save_many`, `update*`, `delete`, `reinforce`, … |
+| `write` | `save`, `save_many`, `update*`, `delete`, `reinforce`, `penalize`, … |
 | `recall` | `recall` |
 | `admin_io` | `export_json`, `export_csv`, `import_json` (opt-in) |
 | `peer` | call **any** installed plugin via `self.mem.<PeerName>` |

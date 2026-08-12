@@ -150,12 +150,14 @@ def test_recall_auto_reinforce_updates_v_counters(tmp_mem):
 
     rec_before = tmp_mem._storage.get(mem_id, user="test")
     total_before = rec_before.validation_prediction_total
+    correct_before = rec_before.validation_prediction_correct
 
-    tmp_mem.recall("correct answer test", k=1, reinforce=True)
+    hits = tmp_mem.recall("correct answer test", k=1, reinforce=True)
+    assert any(h.id == mem_id for h in hits)
 
     rec_after = tmp_mem._storage.get(mem_id, user="test")
-    # At least total should have increased (hit was returned)
-    assert rec_after.validation_prediction_total >= total_before
+    assert rec_after.validation_prediction_total == total_before + 1
+    assert rec_after.validation_prediction_correct == correct_before + 1
 
 
 # ---------------------------------------------------------------------------

@@ -54,7 +54,7 @@ class BasePDMPlugin(ABC):
     version: ClassVar[str] = "0.0.0"
 
     #: Hard deps — names or version specs: ``"GeoTagger"``, ``"GeoTagger>=1.2"``.
-    requires: ClassVar[list[str]] = []
+    requires: ClassVar[Sequence[str]] = ()
 
     #: When False, :meth:`PluginManager.autoload` skips this class (opt-in via ``mem.use``).
     autoload: ClassVar[bool] = True

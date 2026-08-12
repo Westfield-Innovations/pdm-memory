@@ -2238,6 +2238,12 @@ class Memory:
                             "effective_spike": new_spike,
                             "retrieval_count": (rec.retrieval_count or 0) + 1,
                             "last_retrieved": now,
+                            "validation_prediction_total": (
+                                (rec.validation_prediction_total or 0) + 1
+                            ),
+                            "validation_prediction_correct": (
+                                (rec.validation_prediction_correct or 0) + 1
+                            ),
                         },
                     )
                 )
