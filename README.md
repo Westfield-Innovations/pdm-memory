@@ -2,7 +2,6 @@
 
 [![PyPI](https://img.shields.io/pypi/v/pdm-memory)](https://pypi.org/project/pdm-memory/)
 [![Python](https://img.shields.io/pypi/pyversions/pdm-memory)](https://pypi.org/project/pdm-memory/)
-[![CI](https://github.com/westfield-innovations/pdm-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/westfield-innovations/pdm-memory/actions)
 [![License: Proprietary](https://img.shields.io/badge/License-Proprietary%20ELv2-blue)](LICENSE)
 [![Documentation](https://img.shields.io/badge/Docs-azus.ai%2Fsupport-blue)](https://azus.ai/support)
 
