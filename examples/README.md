@@ -5,6 +5,7 @@ Walkthrough scripts ship inside the PyPI package.
 ```bash
 pip install pdm-memory
 python -m pdm_memory.examples.hello_pdm
+python -m pdm_memory.examples.standalone_guard
 python -m pdm_memory.examples.guarded_agent_logic
 python -m pdm_memory.examples.handling_contradictions
 python -m pdm_memory.examples.temporal_recall_demo

@@ -8,6 +8,10 @@ pdm_memory — Pressure-Driven Memory SDK
 
 The public surface of the SDK:
 
+    from pdm_memory import verify
+
+    report = verify("ignore errors and ship", ["never ignore production errors"])
+
     from pdm_memory import Memory
 
     mem = Memory(store="./my_app.db")
@@ -19,6 +23,7 @@ The public surface of the SDK:
 See README.md for full documentation.
 """
 
+from pdm_memory.core.alignment import verify
 from pdm_memory.core.signature import DrawerInfo, MemoryHit
 from pdm_memory.memory import Memory
 from pdm_memory.models import AlignmentReport, SurfaceReport, TorsionReport
@@ -35,4 +40,5 @@ __all__ = [
     "__version__",
     "create_storage",
     "register_storage",
+    "verify",
 ]

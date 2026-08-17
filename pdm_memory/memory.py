@@ -42,6 +42,7 @@ from typing import Any
 
 from typing_extensions import Self
 
+from pdm_memory.core.alignment import verify_records
 from pdm_memory.core.math import (
     DECAY_DELETE_THRESHOLD,
     calculate_decay_factor,
@@ -1131,9 +1132,10 @@ class Memory:
             before triggering ACT.
         """
         records = self._storage.list(user=self._user, limit=10_000)
-        report = self._engine.verify_alignment(
+        report = verify_records(
             records,
             intent_text,
+            engine=self._engine,
             min_pressure=min_pressure,
             k_goals=k_goals,
             torsion_threshold=torsion_threshold,

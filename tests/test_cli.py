@@ -210,3 +210,17 @@ class TestCLIHeal:
 
         with Memory(store=db, user="default") as mem:
             assert mem.count() == before
+
+
+class TestCLIStandaloneVerify:
+    def test_verify_goal_blocks_without_store(self):
+        output, code = run_cli(
+            [
+                "verify",
+                "ignore errors and ship",
+                "--goal",
+                "never ignore production errors",
+            ]
+        )
+        assert code == 2
+        assert "TORSION" in output

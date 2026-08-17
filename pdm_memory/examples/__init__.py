@@ -4,6 +4,7 @@ from __future__ import annotations
 
 EXAMPLES = (
     "hello_pdm",
+    "standalone_guard",
     "guarded_agent_logic",
     "handling_contradictions",
     "temporal_recall_demo",

@@ -11,7 +11,7 @@ Your LLM forgets everything between conversations. The standard fix — stuff a 
 
 - 🔑 **Your API key.** Works with your existing Anthropic/OpenAI account.
 - 🗄️ **Your storage.** One local file. Your data never leaves your machine. Check the source — there's no phone-home in it.
-- 🛡️ **Guarded agents.** Blocks actions that contradict stored goals. Catches contradicting facts automatically.
+- 🛡️ **Guarded agents.** Pass a rule as a string — blocks actions that contradict it. No store required. Catches contradicting facts automatically.
 - ⚡ **Ten minutes.** `pip install pdm-memory` → three lines → persistent memory.
 
 📖 **Documentation:** [azus.ai/support](https://azus.ai/support)
@@ -253,13 +253,37 @@ print(system_block)
 
 ## 🛡️ Guarded Agents (GAA & Torsion)
 
-PDM is not only retrieval. Before an agent **acts**, `verify_alignment()` scores the proposed intent against stored stewardship goals and returns **ALIGNED**, **CONFLICT**, or **TORSION**. `detect_torsion()` finds contradicting facts already in memory.
+Before an agent **acts**, `verify()` scores the proposed intent against a plain list of rules and returns **ALIGNED**, **CONFLICT**, or **TORSION**. No store, account, or signup.
 
 Statuses:
 
 - **ALIGNED** — safe to proceed (`report.is_safe_to_act` is `True`)
 - **CONFLICT** — soft mismatch / missing anchors (fail-closed by default)
 - **TORSION** — hard contradiction — block the ACT
+
+```python
+from pdm_memory import verify
+
+report = verify(
+    "ignore errors and ship the build",
+    ["never ignore production errors"],
+)
+print(report.status, report.is_safe_to_act)  # TORSION False
+
+good = verify(
+    "run full validation suite then ship with reliability checks enabled",
+    ["Prioritize high reliability and careful validation before shipping"],
+)
+print(good.status, good.is_safe_to_act)  # ALIGNED True
+
+def guarded_act(intent, tool_call, goals):
+    report = verify(intent, goals)
+    if not report.is_safe_to_act:
+        raise PermissionError(f"GAA blocked ACT: {report.status}")
+    return tool_call()
+```
+
+When goals already live in a PDM store, `Memory.verify_alignment()` is the same gate over stored stewardship signatures:
 
 ```python
 from pdm_memory import Memory
@@ -291,12 +315,6 @@ print(bad.status, bad.is_safe_to_act)   # TORSION False
 # Allow an action that resonates with those goals.
 good = mem.verify_alignment("validate thoroughly then deploy with reliability checks")
 print(good.status, good.is_safe_to_act)  # ALIGNED True
-
-def guarded_act(mem, intent, tool_call):
-    report = mem.verify_alignment(intent)
-    if not report.is_safe_to_act:
-        raise PermissionError(f"GAA blocked ACT: {report.status}")
-    return tool_call()
 ```
 
 Catch contradicting facts already in the store:
@@ -325,7 +343,7 @@ for report in mem.detect_torsion(threshold=0.5):
     print(report.torsion_score, report.conflict_kind, report.explanation)
 ```
 
-Full walkthroughs: `python -m pdm_memory.examples.guarded_agent_logic` and `python -m pdm_memory.examples.handling_contradictions`.
+Full walkthroughs: `python -m pdm_memory.examples.standalone_guard`, `python -m pdm_memory.examples.guarded_agent_logic` and `python -m pdm_memory.examples.handling_contradictions`.
 
 ---
 
@@ -416,7 +434,8 @@ All scripts below ship inside the wheel — run them with `python -m`:
 ```bash
 pip install pdm-memory
 python -m pdm_memory.examples.hello_pdm                 # save / recall / explain
-python -m pdm_memory.examples.guarded_agent_logic       # GAA: TORSION vs ALIGNED
+python -m pdm_memory.examples.standalone_guard          # GAA: no store
+python -m pdm_memory.examples.guarded_agent_logic       # GAA: store-backed TORSION vs ALIGNED
 python -m pdm_memory.examples.handling_contradictions     # detect + reconcile torsion
 python -m pdm_memory.examples.temporal_recall_demo        # event_at + deadline (PDM-T)
 python -m pdm_memory.examples.industrial_safety_gate      # Oil Field: Auto-Discovery + heal
@@ -501,6 +520,9 @@ pdm-cli decay --store ./my_app.db
 # Show stats
 pdm-cli stats --store ./my_app.db
 
+# Store-free GAA — no .db required
+pdm-cli verify "ignore errors and ship" --goal "never ignore production errors"
+
 # List drawers (categories)
 pdm-cli drawers --store ./my_app.db
 
@@ -530,6 +552,19 @@ API endpoints used by the UI: `GET /api/v1/memory-map`, `GET /api/v1/torsion`.
 
 ## 📖 API Reference
 
+### `verify(intent_text, goals)`
+
+Store-free Goal-Anchor Alignment. Pass a proposed action and one or more rule strings. Returns `AlignmentReport` (`ALIGNED` / `CONFLICT` / `TORSION`). No SQLite, cloud, or account.
+
+| Arg | Description |
+|-----|-------------|
+| `intent_text` | Proposed action / intent to validate |
+| `goals` | One rule string, or a list of rule strings |
+| `torsion_threshold` | Peak torsion that escalates to `TORSION` (default `0.70`) |
+| `conflict_threshold` | Soft-mismatch floor for `CONFLICT` (default `0.40`) |
+
+Use `report.is_safe_to_act` (True only when `status == "ALIGNED"`) before triggering ACT.
+
 ### `Memory(store, user, token, refresh_token, cloud_url, store_raw)`
 
 | Method | Description |
@@ -537,7 +572,7 @@ API endpoints used by the UI: `GET /api/v1/memory-map`, `GET /api/v1/torsion`.
 | `save(text, source, tags, p_magnitude, t_persistence, drawer, regime, deadline, dedupe=True, idempotency_key=None)` | Store a memory (content dedupe and/or idempotency when storage supports it) |
 | `save_many(items, dedupe=True)` → `dict` | Batch save; returns `{saved, skipped, errors}` |
 | `recall(query, k, min_pressure, search_cost, drawer, reinforce)` → `List[MemoryHit]` | Retrieve top-k relevant memories |
-| `verify_alignment(intent_text, min_pressure, k_goals, torsion_threshold)` → `AlignmentReport` | GAA gate before an agent ACT (`ALIGNED` / `CONFLICT` / `TORSION`) |
+| `verify_alignment(intent_text, min_pressure, k_goals, torsion_threshold)` → `AlignmentReport` | Same GAA gate against goals already stored in Memory |
 | `detect_torsion(drawer, threshold)` → `List[TorsionReport]` | Find contradicting facts (Reverse Resonance) |
 | `reinforce(memory_id, coupling_score)` | Manually raise a memory's pressure (and V-counters where supported) |
 | `delete(memory_id)` → `bool` | Soft-delete when storage supports it |
