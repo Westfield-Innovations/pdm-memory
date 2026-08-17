@@ -97,6 +97,39 @@ Connect to the **AZUS Companion API** so memories sync across devices and the co
 
 CloudDriver expects a Companion build that exposes the PDM SDK routes (list, batch, by-hash / by-idempotency-key, soft-delete). Older deploys still support single-row `ingest` / get / patch / hard delete only.
 
+### Getting your JWT access token
+
+AZUS Cloud uses standard JWT auth. If you already have an AZUS account, sign in and use the returned `access` token as `token="..."`.
+
+If you do not have an account yet, create one here:
+
+- Web signup: [azus.ai/auth/register](https://azus.ai/auth/register)
+- API signup: `POST https://api.azus.ai/api/v1/accounts/auth/register/`
+- API login: `POST https://api.azus.ai/api/v1/accounts/auth/login/`
+- Token refresh: `POST https://api.azus.ai/api/v1/accounts/token/refresh/`
+
+Example registration flow:
+
+```python
+import requests
+
+r = requests.post(
+    "https://api.azus.ai/api/v1/accounts/auth/register/",
+    json={
+        "email": "user@example.com",
+        "username": "user123",
+        "password": "SecurePass123!",
+        "profile": {"first_name": "John", "last_name": "Doe"},
+    },
+)
+data = r.json()
+
+access_token = data["tokens"]["access"]
+refresh_token = data["tokens"]["refresh"]
+```
+
+Use the returned JWTs directly with `Memory(store="cloud", ...)`:
+
 ### Connect to the Cloud
 
 ```python
