@@ -69,7 +69,7 @@ where = ["."]
 include = ["pdm_memory*"]
 
 [tool.setuptools.package-data]
-pdm_memory = ["tools/static/*"]
+pdm_memory = ["tools/static/*", "examples/README.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

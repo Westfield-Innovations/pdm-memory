@@ -59,7 +59,7 @@ mem = Memory(store="./my_app_memory.db")
 
 # Write: PDM assigns pressure and stores a signature.
 mem.save("User prefers metric units and short answers", source="chat",
-         tags=["units", "formatting", "preferences"])
+         tags=["units", "formatting", "preferences"], p_magnitude=85)
 
 # Read: resonance retrieval — surfaces what's relevant, not just what matches.
 hits = mem.recall("how should I format the answer?", k=5)
@@ -301,18 +301,63 @@ mem.ingest(
 
 ## 🛠️ Developer Tools
 
-### Examples (DX walkthrough)
+### Quick Start (PyPI install)
+
+Everything below works after `pip install pdm-memory` — no repository clone required.
+
+```bash
+pip install pdm-memory
+python -m pdm_memory.examples.hello_pdm
+```
+
+Inline smoke test:
+
+```bash
+python -c "
+from pdm_memory import Memory
+mem = Memory(store='./demo.db')
+mem.save('User prefers metric units and short answers', source='demo',
+         tags=['units', 'formatting', 'preferences'], p_magnitude=85)
+for h in mem.recall('how should I format the answer?', k=3):
+    print(h.text, round(h.pressure, 1))
+"
+```
+
+Other PyPI-shipped tools:
+
+```bash
+python -m pdm_memory.bench --quick   # smoke benchmark (5 scenarios)
+pdm-cli stats --store ./demo.db      # inspect the store created above
+```
+
+### Example walkthroughs (bundled in PyPI)
+
+All scripts below ship inside the wheel — run them with `python -m`:
+
+```bash
+pip install pdm-memory
+python -m pdm_memory.examples.hello_pdm                 # save / recall / explain
+python -m pdm_memory.examples.guarded_agent_logic       # GAA: TORSION vs ALIGNED
+python -m pdm_memory.examples.handling_contradictions     # detect + reconcile torsion
+python -m pdm_memory.examples.temporal_recall_demo        # event_at + deadline (PDM-T)
+python -m pdm_memory.examples.industrial_safety_gate      # Oil Field: Auto-Discovery + heal
+```
+
+See [`pdm_memory/examples/README.md`](pdm_memory/examples/README.md).
+
+From a source checkout, the wrappers in [`examples/`](examples/) delegate to the same modules:
 
 ```bash
 pip install .
-python examples/hello_pdm.py                 # save / recall / explain
-python examples/guarded_agent_logic.py       # GAA: TORSION vs ALIGNED
-python examples/handling_contradictions.py   # detect + reconcile torsion
-python examples/temporal_recall_demo.py      # event_at + deadline (PDM-T)
-python examples/industrial_safety_gate.py    # Oil Field: Auto-Discovery + heal
+python examples/hello_pdm.py
 ```
 
-See [`examples/README.md`](examples/README.md).
+To run the test suite (contributors):
+
+```bash
+pip install ".[dev]"
+pytest
+```
 
 ### The explain Method
 
