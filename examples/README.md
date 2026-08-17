@@ -1,22 +1,21 @@
 # PDM SDK Examples
 
-Standalone scripts that teach Westfield Pressure, Resonance, and Torsion.
+Walkthrough scripts ship inside the PyPI package.
+
+```bash
+pip install pdm-memory
+python -m pdm_memory.examples.hello_pdm
+python -m pdm_memory.examples.guarded_agent_logic
+python -m pdm_memory.examples.handling_contradictions
+python -m pdm_memory.examples.temporal_recall_demo
+python -m pdm_memory.examples.industrial_safety_gate
+```
+
+From a source checkout you can also run the wrappers in this directory:
 
 ```bash
 pip install .
 python examples/hello_pdm.py
-python examples/guarded_agent_logic.py
-python examples/handling_contradictions.py
-python examples/temporal_recall_demo.py
-python examples/industrial_safety_gate.py
 ```
 
-| Script | Teaches |
-|--------|---------|
-| `hello_pdm.py` | `save` / `recall` / `explain` — Pressure + Resonance |
-| `guarded_agent_logic.py` | `verify_alignment` (GAA) — TORSION vs ALIGNED before ACT |
-| `handling_contradictions.py` | `detect_torsion` / `reconcile_torsion` — self-healing |
-| `temporal_recall_demo.py` | `event_at` / `deadline` (PDM-T) + `search_cost` window |
-| `industrial_safety_gate.py` | Oil Field Blueprint — Auto-Discovery, GAA block, `audit_and_heal` |
-
-Each script uses `with Memory(...) as mem:` and a fresh temp SQLite file.
+See [`pdm_memory/examples/README.md`](../pdm_memory/examples/README.md) for the full script guide.

@@ -2,7 +2,6 @@
 
 [![PyPI](https://img.shields.io/pypi/v/pdm-memory)](https://pypi.org/project/pdm-memory/)
 [![Python](https://img.shields.io/pypi/pyversions/pdm-memory)](https://pypi.org/project/pdm-memory/)
-[![CI](https://github.com/westfield-innovations/pdm-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/westfield-innovations/pdm-memory/actions)
 [![License: Proprietary](https://img.shields.io/badge/License-Proprietary%20ELv2-blue)](LICENSE)
 [![Documentation](https://img.shields.io/badge/Docs-azus.ai%2Fsupport-blue)](https://azus.ai/support)
 
@@ -12,11 +11,12 @@ Your LLM forgets everything between conversations. The standard fix — stuff a 
 
 - 🔑 **Your API key.** Works with your existing Anthropic/OpenAI account.
 - 🗄️ **Your storage.** One local file. Your data never leaves your machine. Check the source — there's no phone-home in it.
+- 🛡️ **Guarded agents.** Blocks actions that contradict stored goals. Catches contradicting facts automatically.
 - ⚡ **Ten minutes.** `pip install pdm-memory` → three lines → persistent memory.
 
 📖 **Documentation:** [azus.ai/support](https://azus.ai/support)
 
-**Benchmarks vs standard RAG:** [azus.ai/pdm/benchmarks](https://azus.ai/pdm/benchmarks)
+**Benchmarks vs standard RAG:** PDM wins **7 of 8** metrics — **15×** fewer tokens, **35×** less storage. One loss published. [See full methodology →](https://azus.ai/pdm/benchmarks)
 
 ---
 
@@ -26,10 +26,11 @@ Your LLM forgets everything between conversations. The standard fix — stuff a 
 1. [Privacy Mode](#-privacy-mode-local-sqlite)
 2. [Ecosystem Mode](#-ecosystem-mode-azus-cloud)
 3. [LLM Adapters](#-llm-adapters)
-4. [Data Ingestion](#-data-ingestion)
-5. [Developer Tools](#-developer-tools)
-6. [API Reference](#-api-reference)
-7. [License](#-license)
+4. [Guarded Agents (GAA & Torsion)](#-guarded-agents-gaa--torsion)
+5. [Data Ingestion](#-data-ingestion)
+6. [Developer Tools](#-developer-tools)
+7. [API Reference](#-api-reference)
+8. [License](#-license)
 
 ---
 
@@ -59,7 +60,7 @@ mem = Memory(store="./my_app_memory.db")
 
 # Write: PDM assigns pressure and stores a signature.
 mem.save("User prefers metric units and short answers", source="chat",
-         tags=["units", "formatting", "preferences"])
+         tags=["units", "formatting", "preferences"], p_magnitude=85)
 
 # Read: resonance retrieval — surfaces what's relevant, not just what matches.
 hits = mem.recall("how should I format the answer?", k=5)
@@ -96,6 +97,39 @@ Connect to the **AZUS Companion API** so memories sync across devices and the co
 **Cloud endpoint:** default base URL is `https://api.azus.ai` (not the marketing site `https://azus.ai`). Staging: `https://staging.azus.ai`.
 
 CloudDriver expects a Companion build that exposes the PDM SDK routes (list, batch, by-hash / by-idempotency-key, soft-delete). Older deploys still support single-row `ingest` / get / patch / hard delete only.
+
+### Getting your JWT access token
+
+AZUS Cloud uses standard JWT auth. If you already have an AZUS account, sign in and use the returned `access` token as `token="..."`.
+
+If you do not have an account yet, create one here:
+
+- Web signup: [azus.ai/auth/register](https://azus.ai/auth/register)
+- API signup: `POST https://api.azus.ai/api/v1/accounts/auth/register/`
+- API login: `POST https://api.azus.ai/api/v1/accounts/auth/login/`
+- Token refresh: `POST https://api.azus.ai/api/v1/accounts/token/refresh/`
+
+Example registration flow:
+
+```python
+import requests
+
+r = requests.post(
+    "https://api.azus.ai/api/v1/accounts/auth/register/",
+    json={
+        "email": "user@example.com",
+        "username": "user123",
+        "password": "SecurePass123!",
+        "profile": {"first_name": "John", "last_name": "Doe"},
+    },
+)
+data = r.json()
+
+access_token = data["tokens"]["access"]
+refresh_token = data["tokens"]["refresh"]
+```
+
+Use the returned JWTs directly with `Memory(store="cloud", ...)`:
 
 ### Connect to the Cloud
 
@@ -217,6 +251,84 @@ print(system_block)
 
 ---
 
+## 🛡️ Guarded Agents (GAA & Torsion)
+
+PDM is not only retrieval. Before an agent **acts**, `verify_alignment()` scores the proposed intent against stored stewardship goals and returns **ALIGNED**, **CONFLICT**, or **TORSION**. `detect_torsion()` finds contradicting facts already in memory.
+
+Statuses:
+
+- **ALIGNED** — safe to proceed (`report.is_safe_to_act` is `True`)
+- **CONFLICT** — soft mismatch / missing anchors (fail-closed by default)
+- **TORSION** — hard contradiction — block the ACT
+
+```python
+from pdm_memory import Memory
+
+mem = Memory(store="./agent.db")
+
+# Goal signatures live in stewardship / foundational drawers.
+mem.save(
+    "Core goal: high reliability; never ignore production errors",
+    tags=["reliability", "errors", "goal", "integrity"],
+    drawer="stewardship",
+    p_magnitude=92,
+    source="policy",
+    metadata={"iaw": 0.90, "role": "goal"},
+)
+mem.save(
+    "Foundational principle: validate before deploy",
+    tags=["validation", "deploy", "principle", "quality"],
+    drawer="foundational",
+    p_magnitude=88,
+    source="policy",
+    metadata={"iaw": 0.85, "role": "goal"},
+)
+
+# Block an action that opposes stored goals.
+bad = mem.verify_alignment("ignore errors and bypass validation")
+print(bad.status, bad.is_safe_to_act)   # TORSION False
+
+# Allow an action that resonates with those goals.
+good = mem.verify_alignment("validate thoroughly then deploy with reliability checks")
+print(good.status, good.is_safe_to_act)  # ALIGNED True
+
+def guarded_act(mem, intent, tool_call):
+    report = mem.verify_alignment(intent)
+    if not report.is_safe_to_act:
+        raise PermissionError(f"GAA blocked ACT: {report.status}")
+    return tool_call()
+```
+
+Catch contradicting facts already in the store:
+
+```python
+from datetime import datetime, timezone
+
+mem.save(
+    "Project Orion launch date is 2026-08-01",
+    tags=["orion", "launch", "deadline", "project"],
+    drawer="product",
+    p_magnitude=70,
+    deadline=datetime(2026, 8, 1, tzinfo=timezone.utc),
+    metadata={"cluster_id": "orion-launch"},
+)
+mem.save(
+    "Project Orion launch date is 2026-09-01",
+    tags=["orion", "launch", "deadline", "project"],
+    drawer="product",
+    p_magnitude=72,
+    deadline=datetime(2026, 9, 1, tzinfo=timezone.utc),
+    metadata={"cluster_id": "orion-launch"},
+)
+
+for report in mem.detect_torsion(threshold=0.5):
+    print(report.torsion_score, report.conflict_kind, report.explanation)
+```
+
+Full walkthroughs: `python -m pdm_memory.examples.guarded_agent_logic` and `python -m pdm_memory.examples.handling_contradictions`.
+
+---
+
 ## 📥 Data Ingestion
 
 ### Import Legacy Data
@@ -268,18 +380,63 @@ mem.ingest(
 
 ## 🛠️ Developer Tools
 
-### Examples (DX walkthrough)
+### Quick Start (PyPI install)
+
+Everything below works after `pip install pdm-memory` — no repository clone required.
+
+```bash
+pip install pdm-memory
+python -m pdm_memory.examples.hello_pdm
+```
+
+Inline smoke test:
+
+```bash
+python -c "
+from pdm_memory import Memory
+mem = Memory(store='./demo.db')
+mem.save('User prefers metric units and short answers', source='demo',
+         tags=['units', 'formatting', 'preferences'], p_magnitude=85)
+for h in mem.recall('how should I format the answer?', k=3):
+    print(h.text, round(h.pressure, 1))
+"
+```
+
+Other PyPI-shipped tools:
+
+```bash
+python -m pdm_memory.bench --quick   # smoke benchmark (5 scenarios)
+pdm-cli stats --store ./demo.db      # inspect the store created above
+```
+
+### Example walkthroughs (bundled in PyPI)
+
+All scripts below ship inside the wheel — run them with `python -m`:
+
+```bash
+pip install pdm-memory
+python -m pdm_memory.examples.hello_pdm                 # save / recall / explain
+python -m pdm_memory.examples.guarded_agent_logic       # GAA: TORSION vs ALIGNED
+python -m pdm_memory.examples.handling_contradictions     # detect + reconcile torsion
+python -m pdm_memory.examples.temporal_recall_demo        # event_at + deadline (PDM-T)
+python -m pdm_memory.examples.industrial_safety_gate      # Oil Field: Auto-Discovery + heal
+```
+
+See [`pdm_memory/examples/README.md`](pdm_memory/examples/README.md).
+
+From a source checkout, the wrappers in [`examples/`](examples/) delegate to the same modules:
 
 ```bash
 pip install .
-python examples/hello_pdm.py                 # save / recall / explain
-python examples/guarded_agent_logic.py       # GAA: TORSION vs ALIGNED
-python examples/handling_contradictions.py   # detect + reconcile torsion
-python examples/temporal_recall_demo.py      # event_at + deadline (PDM-T)
-python examples/industrial_safety_gate.py    # Oil Field: Auto-Discovery + heal
+python examples/hello_pdm.py
 ```
 
-See [`examples/README.md`](examples/README.md).
+To run the test suite (contributors):
+
+```bash
+pip install ".[dev]"
+pytest
+```
 
 ### The explain Method
 
@@ -380,6 +537,8 @@ API endpoints used by the UI: `GET /api/v1/memory-map`, `GET /api/v1/torsion`.
 | `save(text, source, tags, p_magnitude, t_persistence, drawer, regime, deadline, dedupe=True, idempotency_key=None)` | Store a memory (content dedupe and/or idempotency when storage supports it) |
 | `save_many(items, dedupe=True)` → `dict` | Batch save; returns `{saved, skipped, errors}` |
 | `recall(query, k, min_pressure, search_cost, drawer, reinforce)` → `List[MemoryHit]` | Retrieve top-k relevant memories |
+| `verify_alignment(intent_text, min_pressure, k_goals, torsion_threshold)` → `AlignmentReport` | GAA gate before an agent ACT (`ALIGNED` / `CONFLICT` / `TORSION`) |
+| `detect_torsion(drawer, threshold)` → `List[TorsionReport]` | Find contradicting facts (Reverse Resonance) |
 | `reinforce(memory_id, coupling_score)` | Manually raise a memory's pressure (and V-counters where supported) |
 | `delete(memory_id)` → `bool` | Soft-delete when storage supports it |
 | `decay(dry_run)` → `dict` | Trigger decay pass (runs automatically on recall) |
