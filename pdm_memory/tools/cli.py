@@ -18,6 +18,7 @@ Usage:
     pdm-cli detect-torsion --store ./local.db --threshold 0.6 --drawer deadlines
     pdm-cli search "dark mode" --store ./local.db --search-cost 0.85
     pdm-cli verify "ignore validation errors and ship" --store ./local.db
+    pdm-cli verify "ignore errors and ship" --goal "never ignore production errors"
     pdm-cli ui --store ./local.db --port 8080
 
 Core commands need no extra packages. ``ui`` requires: pip install "pdm-memory[ui]"
@@ -223,23 +224,33 @@ def cmd_heal(args: argparse.Namespace) -> None:
 
 
 def cmd_verify(args: argparse.Namespace) -> None:
-    from pdm_memory import Memory
+    goals = list(getattr(args, "goals", None) or [])
+    if goals:
+        from pdm_memory import verify
 
-    with Memory(store=args.store, user=args.user) as mem:
-        report = mem.verify_alignment(
+        report = verify(
             args.intent,
-            min_pressure=args.min_pressure,
+            goals,
             torsion_threshold=args.torsion_threshold,
         )
-        print(report.render())
-        if args.json:
-            import json
+    else:
+        from pdm_memory import Memory
 
-            print(json.dumps(report.as_dict(), indent=2))
-        if report.status == "TORSION":
-            sys.exit(2)
-        if report.status == "CONFLICT":
-            sys.exit(1)
+        with Memory(store=args.store, user=args.user) as mem:
+            report = mem.verify_alignment(
+                args.intent,
+                min_pressure=args.min_pressure,
+                torsion_threshold=args.torsion_threshold,
+            )
+    print(report.render())
+    if args.json:
+        import json
+
+        print(json.dumps(report.as_dict(), indent=2))
+    if report.status == "TORSION":
+        sys.exit(2)
+    if report.status == "CONFLICT":
+        sys.exit(1)
 
 
 def cmd_sync(args: argparse.Namespace) -> None:
@@ -444,9 +455,16 @@ def main() -> None:
     p_verify = subparsers.add_parser(
         "verify",
         parents=[sub_parent_parser],
-        help="Verify intent alignment against high-IAW goal anchors (GAA)",
+        help="Verify intent against rules (`--goal`) or stored goal anchors",
     )
     p_verify.add_argument("intent", help="Proposed action / intent text")
+    p_verify.add_argument(
+        "--goal",
+        action="append",
+        dest="goals",
+        default=None,
+        help="Rule to check against (repeatable). If set, no store is opened.",
+    )
     p_verify.add_argument(
         "--min-pressure",
         type=float,

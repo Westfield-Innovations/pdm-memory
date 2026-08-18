@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from pdm_memory import AlignmentReport, Memory
+from pdm_memory import AlignmentReport, Memory, verify
 from pdm_memory.core.alignment import compute_iaw, select_goal_anchors, verify_alignment
 from pdm_memory.core.retrieval import RetrievalEngine
 from pdm_memory.core.signature import SignatureRecord
@@ -157,6 +157,46 @@ class TestGAAEngine:
         assert len(selected) == 1
         assert selected[0].id == high.id
         assert compute_iaw(high) > compute_iaw(low)
+
+
+class TestStandaloneVerify:
+    def test_torsion_without_store(self) -> None:
+        report = verify(
+            "ignore errors and ship the build",
+            ["never ignore production errors"],
+        )
+        assert report.status == "TORSION"
+        assert report.is_safe_to_act is False
+        assert report.anchor_count == 1
+        assert report.torsion >= 0.70
+
+    def test_aligned_without_store(self) -> None:
+        report = verify(
+            "run full validation suite then ship with reliability checks enabled",
+            "Prioritize high reliability and careful validation before shipping",
+        )
+        assert report.status == "ALIGNED"
+        assert report.is_safe_to_act is True
+        assert report.score >= 0.45
+
+    def test_empty_goals_fail_closed(self) -> None:
+        report = verify("do something risky", [])
+        assert report.status == "CONFLICT"
+        assert report.anchor_count == 0
+        assert report.is_safe_to_act is False
+
+    def test_single_string_goal_accepted(self) -> None:
+        report = verify(
+            "ignore errors and ship the build",
+            "never ignore production errors",
+        )
+        assert isinstance(report, AlignmentReport)
+        assert report.status == "TORSION"
+
+    def test_public_import(self) -> None:
+        from pdm_memory import verify as public_verify
+
+        assert public_verify is verify
 
 
 class TestGAAMemoryAndCLI:

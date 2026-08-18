@@ -510,6 +510,96 @@ def verify_alignment(
     )
 
 
+def verify_records(
+    records: Sequence[SignatureRecord],
+    intent_text: str,
+    *,
+    engine: RetrievalEngine | None = None,
+    min_pressure: float = DEFAULT_MIN_PRESSURE,
+    k_goals: int = DEFAULT_K_GOALS,
+    torsion_threshold: float = TORSION_STATUS_THRESHOLD,
+    conflict_threshold: float = CONFLICT_STATUS_THRESHOLD,
+) -> AlignmentReport:
+    """
+    Run GAA against in-memory signatures. Constructs a store-free
+    ``RetrievalEngine`` when ``engine`` is omitted.
+    """
+    if engine is None:
+        from pdm_memory.core.retrieval import RetrievalEngine as _Engine
+
+        engine = _Engine()
+    return verify_alignment(
+        engine,
+        records,
+        intent_text,
+        min_pressure=min_pressure,
+        k_goals=k_goals,
+        torsion_threshold=torsion_threshold,
+        conflict_threshold=conflict_threshold,
+    )
+
+
+def _records_from_goals(goals: str | Sequence[str]) -> list[SignatureRecord]:
+    """Turn plain rule strings into stewardship Goal Signatures."""
+    texts = [goals] if isinstance(goals, str) else list(goals)
+    records: list[SignatureRecord] = []
+    for raw in texts:
+        text = str(raw).strip()
+        if not text:
+            continue
+        tags = ["goal"]
+        for tok in _tokenize(text):
+            if tok not in tags:
+                tags.append(tok)
+        records.append(
+            SignatureRecord(
+                compressed_fact=text,
+                intent_tags=tags,
+                drawer_domain="stewardship",
+                domain="core_fact",
+                p_magnitude=90.0,
+                phase_privilege=1.5,
+                metadata={"role": "goal", "iaw": 0.85},
+                source="verify",
+            )
+        )
+    return records
+
+
+def verify(
+    intent_text: str,
+    goals: str | Sequence[str],
+    *,
+    torsion_threshold: float = TORSION_STATUS_THRESHOLD,
+    conflict_threshold: float = CONFLICT_STATUS_THRESHOLD,
+) -> AlignmentReport:
+    """
+    Store-free Goal-Anchor Alignment gate.
+
+    Compare a proposed intent to a plain list of rules. No Memory store,
+    account, or signup required. Every non-blank goal counts.
+
+    Args:
+        intent_text: Proposed action / intent to validate.
+        goals: One rule string, or a sequence of rule strings.
+        torsion_threshold: Peak torsion that escalates status to TORSION.
+        conflict_threshold: Soft-mismatch floor for CONFLICT.
+
+    Returns:
+        AlignmentReport — use ``is_safe_to_act`` or ``status == "ALIGNED"``
+        before triggering ACT.
+    """
+    records = _records_from_goals(goals)
+    return verify_records(
+        records,
+        intent_text,
+        min_pressure=0.0,
+        k_goals=max(len(records), 1),
+        torsion_threshold=torsion_threshold,
+        conflict_threshold=conflict_threshold,
+    )
+
+
 def _explain_torsion(intent_text: str, peak: _AnchorScore) -> str:
     goal_snip = _snip(peak.record.compressed_fact)
     intent_snip = _snip(intent_text)
