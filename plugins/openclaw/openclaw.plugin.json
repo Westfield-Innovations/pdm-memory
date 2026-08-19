@@ -1,0 +1,15 @@
+{
+  "id": "pdm-guard",
+  "name": "PDM Guard",
+  "description": "Goal-Anchor Alignment gate for OpenClaw via before_tool_call hook.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "verifyUrl": { "type": "string" },
+      "goals": { "type": "array", "items": { "type": "string" } },
+      "timeoutMs": { "type": "number" }
+    },
+    "required": []
+  }
+}
