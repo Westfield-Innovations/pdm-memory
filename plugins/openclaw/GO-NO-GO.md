@@ -17,7 +17,7 @@ Receipts were captured in gateway logs — not screenshots.
 
 | Field | Value |
 |-------|--------|
-| **Owner** | Bohdan (engineering) |
+| **Owner** | Demian |
 | **Done** | 2026-08-20 |
 | **Runtime** | OpenClaw **2026.7.1-2** (local gateway, `openclaw tui`, agent `main`) |
 | **Block test result** | **PASS** — `exec` with `curl http://localhost:8080/api/health` blocked when rule `never hardcode localhost` active; `tool_executed: false`, `gate_status: TORSION` |
@@ -46,7 +46,7 @@ Receipts were captured in gateway logs — not screenshots.
 - Plugin: `pdm-memory/plugins/openclaw/pdm-guard.js`
 - Config: `~/.openclaw/openclaw.json` → `plugins.entries.pdm-guard`
 - Rules file: `~/.openclaw/pdm-guard-rules.json`
-- Verify sidecar: `POST http://localhost:8000/api/v1/pdm/gaa/verify/` (companion_api → `pdm_memory.verify`)
+- Verify path: `verify_bridge.py` → `pdm_memory.verify()` (local Python subprocess; no HTTP sidecar)
 - Rule management: `/pdm-guard list|add|remove` (slash command, bypasses LLM)
 
 ### Test 1 — Block
@@ -138,7 +138,7 @@ Permit receipts are logged from `after_tool_call` with `resulting_state` populat
 | Item | Status |
 |------|--------|
 | `verify(intent_text, goals)` store-free | Done — `pdm-memory` 0.2.4 |
-| Public HTTP verify endpoint | Done — `/api/v1/pdm/gaa/verify/` |
+| Local verify bridge (no HTTP) | Done — `plugins/openclaw/verify_bridge.py` |
 | AZUS doors 1–2 (explain + paste code) | Done — `pdm-standalone-guard` doc |
 | AZUS door 3 (hosted no-code guard) | Done — `guard_rules` + Junior gate |
 | Unrelated rules must not block unrelated actions | Fixed during spike — `RELEVANCE_MIN_RESONANCE` in `alignment.py` |
