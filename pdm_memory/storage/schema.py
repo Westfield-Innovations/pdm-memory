@@ -96,6 +96,40 @@ CREATE TABLE IF NOT EXISTS pdm_drawers (
     description     TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (domain, user)
 );
+
+CREATE TABLE IF NOT EXISTS pdm_source_events (
+    id                          TEXT PRIMARY KEY,
+    occurred_at                 TEXT,
+    observed_at                 TEXT,
+    ingested_at                 TEXT NOT NULL,
+    provenance                  TEXT,
+    raw_reference               TEXT,
+    capture_authority_state     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS pdm_entities (
+    id                          TEXT PRIMARY KEY,
+    canonical_name              TEXT NOT NULL,
+    current_state_version       INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS pdm_meaning_signatures (
+    id                          TEXT PRIMARY KEY,
+    source_event_id             TEXT NOT NULL,
+    entity_id                   TEXT NOT NULL,
+    compressed_fact             TEXT NOT NULL,
+    p_magnitude                 REAL NOT NULL DEFAULT 50.0,
+    intent_tags                 TEXT NOT NULL DEFAULT '[]',
+    metadata                    TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (source_event_id) REFERENCES pdm_source_events (id),
+    FOREIGN KEY (entity_id) REFERENCES pdm_entities (id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pdm_meaning_signatures_source_event_id
+    ON pdm_meaning_signatures (source_event_id);
+
+CREATE INDEX IF NOT EXISTS idx_pdm_meaning_signatures_entity_id
+    ON pdm_meaning_signatures (entity_id);
 """
 
 SCHEMA_POSTGRES = """
@@ -152,6 +186,40 @@ CREATE TABLE IF NOT EXISTS pdm_drawers (
     description     TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (domain, "user")
 );
+
+CREATE TABLE IF NOT EXISTS pdm_source_events (
+    id                          TEXT PRIMARY KEY,
+    occurred_at                 TEXT,
+    observed_at                 TEXT,
+    ingested_at                 TEXT NOT NULL,
+    provenance                  TEXT,
+    raw_reference               TEXT,
+    capture_authority_state     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS pdm_entities (
+    id                          TEXT PRIMARY KEY,
+    canonical_name              TEXT NOT NULL,
+    current_state_version       INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS pdm_meaning_signatures (
+    id                          TEXT PRIMARY KEY,
+    source_event_id             TEXT NOT NULL,
+    entity_id                   TEXT NOT NULL,
+    compressed_fact             TEXT NOT NULL,
+    p_magnitude                 DOUBLE PRECISION NOT NULL DEFAULT 50.0,
+    intent_tags                 TEXT NOT NULL DEFAULT '[]',
+    metadata                    TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (source_event_id) REFERENCES pdm_source_events (id),
+    FOREIGN KEY (entity_id) REFERENCES pdm_entities (id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pdm_meaning_signatures_source_event_id
+    ON pdm_meaning_signatures (source_event_id);
+
+CREATE INDEX IF NOT EXISTS idx_pdm_meaning_signatures_entity_id
+    ON pdm_meaning_signatures (entity_id);
 """
 
 
@@ -184,6 +252,47 @@ def apply_sqlite_migrations(conn: Any) -> None:
         "ON pdm_signatures (user, t_event_at)"
     )
 
+    # Migrations for new event-sourced tables
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS pdm_source_events (
+        id                          TEXT PRIMARY KEY,
+        occurred_at                 TEXT,
+        observed_at                 TEXT,
+        ingested_at                 TEXT NOT NULL,
+        provenance                  TEXT,
+        raw_reference               TEXT,
+        capture_authority_state     TEXT
+    );
+    """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS pdm_entities (
+        id                          TEXT PRIMARY KEY,
+        canonical_name              TEXT NOT NULL,
+        current_state_version       INTEGER NOT NULL DEFAULT 1
+    );
+    """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS pdm_meaning_signatures (
+        id                          TEXT PRIMARY KEY,
+        source_event_id             TEXT NOT NULL,
+        entity_id                   TEXT NOT NULL,
+        compressed_fact             TEXT NOT NULL,
+        p_magnitude                 REAL NOT NULL DEFAULT 50.0,
+        intent_tags                 TEXT NOT NULL DEFAULT '[]',
+        metadata                    TEXT NOT NULL DEFAULT '{}',
+        FOREIGN KEY (source_event_id) REFERENCES pdm_source_events (id),
+        FOREIGN KEY (entity_id) REFERENCES pdm_entities (id)
+    );
+    """)
+    conn.execute("""
+    CREATE INDEX IF NOT EXISTS idx_pdm_meaning_signatures_source_event_id
+        ON pdm_meaning_signatures (source_event_id);
+    """)
+    conn.execute("""
+    CREATE INDEX IF NOT EXISTS idx_pdm_meaning_signatures_entity_id
+        ON pdm_meaning_signatures (entity_id);
+    """)
+
 
 def apply_postgres_migrations(conn: Any) -> None:
     """Add Tier-3 / temporal columns/indexes to existing PostgreSQL databases."""
@@ -213,6 +322,47 @@ def apply_postgres_migrations(conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_pdm_user_event_at "
         'ON pdm_signatures ("user", t_event_at)'
     )
+
+    # Migrations for new event-sourced tables
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS pdm_source_events (
+        id                          TEXT PRIMARY KEY,
+        occurred_at                 TEXT,
+        observed_at                 TEXT,
+        ingested_at                 TEXT NOT NULL,
+        provenance                  TEXT,
+        raw_reference               TEXT,
+        capture_authority_state     TEXT
+    );
+    """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS pdm_entities (
+        id                          TEXT PRIMARY KEY,
+        canonical_name              TEXT NOT NULL,
+        current_state_version       INTEGER NOT NULL DEFAULT 1
+    );
+    """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS pdm_meaning_signatures (
+        id                          TEXT PRIMARY KEY,
+        source_event_id             TEXT NOT NULL,
+        entity_id                   TEXT NOT NULL,
+        compressed_fact             TEXT NOT NULL,
+        p_magnitude                 DOUBLE PRECISION NOT NULL DEFAULT 50.0,
+        intent_tags                 TEXT NOT NULL DEFAULT '[]',
+        metadata                    TEXT NOT NULL DEFAULT '{}',
+        FOREIGN KEY (source_event_id) REFERENCES pdm_source_events (id),
+        FOREIGN KEY (entity_id) REFERENCES pdm_entities (id)
+    );
+    """)
+    conn.execute("""
+    CREATE INDEX IF NOT EXISTS idx_pdm_meaning_signatures_source_event_id
+        ON pdm_meaning_signatures (source_event_id);
+    """)
+    conn.execute("""
+    CREATE INDEX IF NOT EXISTS idx_pdm_meaning_signatures_entity_id
+        ON pdm_meaning_signatures (entity_id);
+    """)
 
 
 def parse_dt(value: str | None) -> datetime | None:

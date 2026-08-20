@@ -452,3 +452,62 @@ class TestGetMany:
     def test_get_many_empty_returns_empty_dict(self, driver):
         assert driver.get_many([], user="alice") == {}
 
+
+class TestEventSourcing:
+    def test_schema_creation_and_insertion(self, driver):
+        conn = driver._conn()
+
+        # Ingest a source event
+        conn.execute(
+            "INSERT INTO pdm_source_events (id, occurred_at, observed_at, ingested_at, provenance, raw_reference, capture_authority_state) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("ev-1", "2026-08-20T12:00:00Z", "2026-08-20T12:05:00Z", "2026-08-20T12:06:00Z", "chat", "User said hello", "{}")
+        )
+
+        # Ingest an entity
+        conn.execute(
+            "INSERT INTO pdm_entities (id, canonical_name, current_state_version) VALUES (?, ?, ?)",
+            ("ent-1", "Carl", 1)
+        )
+
+        # Ingest a meaning signature
+        conn.execute(
+            "INSERT INTO pdm_meaning_signatures (id, source_event_id, entity_id, compressed_fact, p_magnitude, intent_tags, metadata) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("sig-1", "ev-1", "ent-1", "User greeted the system", 75.0, "['greet', 'chat']", "{}")
+        )
+
+        # Verify they are inserted correctly
+        row_ev = conn.execute("SELECT * FROM pdm_source_events WHERE id = 'ev-1'").fetchone()
+        assert row_ev["raw_reference"] == "User said hello"
+
+        row_ent = conn.execute("SELECT * FROM pdm_entities WHERE id = 'ent-1'").fetchone()
+        assert row_ent["canonical_name"] == "Carl"
+
+        row_sig = conn.execute("SELECT * FROM pdm_meaning_signatures WHERE id = 'sig-1'").fetchone()
+        assert row_sig["compressed_fact"] == "User greeted the system"
+
+    def test_source_events_append_only(self, driver):
+        conn = driver._conn()
+        import sqlite3
+
+        conn.execute(
+            "INSERT INTO pdm_source_events (id, occurred_at, observed_at, ingested_at, provenance, raw_reference, capture_authority_state) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("ev-2", "2026-08-20T12:00:00Z", "2026-08-20T12:05:00Z", "2026-08-20T12:06:00Z", "chat", "Do not modify", "{}")
+        )
+        conn.commit()
+
+        # UPDATE should fail
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            conn.execute("UPDATE pdm_source_events SET provenance = 'email' WHERE id = 'ev-2'")
+
+        # DELETE should fail
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            conn.execute("DELETE FROM pdm_source_events WHERE id = 'ev-2'")
+
+        # Verify the record is still intact
+        row_ev = conn.execute("SELECT * FROM pdm_source_events WHERE id = 'ev-2'").fetchone()
+        assert row_ev["provenance"] == "chat"
+
+

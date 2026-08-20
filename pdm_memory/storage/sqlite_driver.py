@@ -189,6 +189,19 @@ class SQLiteDriver(BaseStorage):
             # Optimise connection performance pragmas
             self._local.conn.execute("PRAGMA synchronous=NORMAL")
             self._local.conn.execute("PRAGMA temp_store=MEMORY")
+
+            # Enforce append-only rules at the SQLite driver layer for pdm_source_events
+            SQLITE_DELETE = getattr(sqlite3, "SQLITE_DELETE", 21)
+            SQLITE_UPDATE = getattr(sqlite3, "SQLITE_UPDATE", 23)
+            SQLITE_DENY = getattr(sqlite3, "SQLITE_DENY", 1)
+            SQLITE_OK = getattr(sqlite3, "SQLITE_OK", 0)
+
+            def authorizer_callback(action, arg1, arg2, dbname, source):
+                if action in (SQLITE_DELETE, SQLITE_UPDATE) and arg1 == "pdm_source_events":
+                    return SQLITE_DENY
+                return SQLITE_OK
+
+            self._local.conn.set_authorizer(authorizer_callback)
         return self._local.conn
 
     def close(self) -> None:
