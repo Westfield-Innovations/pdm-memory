@@ -193,6 +193,26 @@ class TestStandaloneVerify:
         assert isinstance(report, AlignmentReport)
         assert report.status == "TORSION"
 
+    def test_unrelated_rules_do_not_block_unrelated_intent(self) -> None:
+        report = verify(
+            "exec (command=curl http://localhost:8080/api/health)",
+            [
+                "never write lorem ipsum",
+                "never leave TODO unresolved",
+            ],
+        )
+        assert report.status == "ALIGNED"
+        assert report.is_safe_to_act is True
+        assert report.torsion < 0.40
+
+    def test_localhost_rule_blocks_localhost_intent(self) -> None:
+        report = verify(
+            "exec (command=curl http://localhost:8080/api/health)",
+            "never hardcode localhost",
+        )
+        assert report.status == "TORSION"
+        assert report.is_safe_to_act is False
+
     def test_public_import(self) -> None:
         from pdm_memory import verify as public_verify
 

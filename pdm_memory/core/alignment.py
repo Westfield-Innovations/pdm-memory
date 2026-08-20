@@ -96,6 +96,8 @@ TORSION_STATUS_THRESHOLD: float = 0.70
 CONFLICT_STATUS_THRESHOLD: float = 0.40
 ALIGNED_MIN_SCORE: float = 0.45
 ALIGNED_MIN_RESONANCE: float = 0.30
+# Per-anchor resonance floor — intent must engage a rule before CONFLICT can block.
+RELEVANCE_MIN_RESONANCE: float = 0.15
 
 
 @dataclass(slots=True)
@@ -482,9 +484,19 @@ def verify_alignment(
     ]
     conflicting = [c for c in conflicting if c]
 
+    max_anchor_resonance = max(s.resonance for s in scored) if scored else 0.0
+    intent_engages_rule = max_anchor_resonance >= RELEVANCE_MIN_RESONANCE
+
     if torsion >= torsion_threshold:
         status = "TORSION"
         explanation = _explain_torsion(text, peak)
+    elif not intent_engages_rule and torsion < conflict_threshold:
+        status = "ALIGNED"
+        explanation = (
+            f"Intent does not engage any guard rule "
+            f"(max anchor resonance={max_anchor_resonance:.2f}, "
+            f"peak torsion={torsion:.2f}). Proceed."
+        )
     elif (
         torsion >= conflict_threshold
         or score < ALIGNED_MIN_SCORE
