@@ -9,6 +9,7 @@ python examples/guarded_agent_logic.py
 python examples/handling_contradictions.py
 python examples/temporal_recall_demo.py
 python examples/industrial_safety_gate.py
+python examples/proactive_alert_demo.py
 ```
 
 | Script | Teaches |
@@ -18,6 +19,7 @@ python examples/industrial_safety_gate.py
 | `handling_contradictions.py` | `detect_torsion` / `reconcile_torsion` — self-healing |
 | `temporal_recall_demo.py` | `event_at` / `deadline` (PDM-T) + `search_cost` window |
 | `industrial_safety_gate.py` | Oil Field Blueprint — Auto-Discovery, GAA block, `audit_and_heal` |
+| `proactive_alert_demo.py` | Observer plugin — high-P / hot-tag alerts on `post_save` |
 | `pdm-memory-plugin-echo/` | External plugin scaffold (`plugin.json` + entrypoint) |
 
 Plugin authoring: [docs/PLUGIN_AUTHORING.md](../docs/PLUGIN_AUTHORING.md).

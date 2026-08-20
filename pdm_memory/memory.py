@@ -1910,8 +1910,26 @@ class Memory:
         return self._storage.count(user=self._user)
 
     def close(self) -> None:
-        """Release storage connections. Call when done with the Memory instance."""
+        """Release plugins (workers/hooks) then storage connections."""
+        self._teardown_plugins()
         self._storage.close()
+
+    def _teardown_plugins(self) -> None:
+        """Force-uninstall every plugin. Shutdown ignores ``requires`` edges."""
+        for name in list(self._plugin_manager.plugins):
+            plugin = self._plugin_manager.get(name)
+            if plugin is None:
+                continue
+            try:
+                plugin.on_uninstall()
+            except Exception:
+                logger.exception("[PDM] plugin on_uninstall failed name=%s", name)
+            self._unregister_plugin_hooks(plugin)
+            self._plugin_manager.unregister(name)
+            if getattr(self, name, None) is plugin:
+                object.__delattr__(self, name)
+            plugin.mem = None
+            plugin.bound_hooks = []
 
     def __enter__(self) -> Self:
         return self

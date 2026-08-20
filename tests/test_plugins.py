@@ -389,8 +389,9 @@ class EchoPlugin(BasePDMPlugin):
         m = Memory(store=str(tmp_path / "auto.db"), user="u", autoload_plugins=True)
         try:
             assert isinstance(m.plugins, dict)
-            # Package plugins/ currently has no concrete autoload plugins.
-            assert m._plugin_manager.discover() == []
+            assert "observer" in m.plugins
+            names = {cls.resolved_name() for cls in m._plugin_manager.discover()}
+            assert "observer" in names
         finally:
             m.close()
 

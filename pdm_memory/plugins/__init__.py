@@ -17,6 +17,7 @@ from pdm_memory.plugins.manifest import (
     PluginManifestError,
     sha256_file,
 )
+from pdm_memory.plugins.observer import ObserverPlugin, ObserverRule
 from pdm_memory.plugins.proxy import (
     CAP_ADMIN_IO,
     CAP_PEER,
@@ -42,6 +43,8 @@ __all__ = [
     "MANIFEST_FILENAME",
     "PLUGIN_DRAWER_PREFIX",
     "BasePDMPlugin",
+    "ObserverPlugin",
+    "ObserverRule",
     "PluginCapabilityError",
     "PluginManager",
     "PluginManifest",

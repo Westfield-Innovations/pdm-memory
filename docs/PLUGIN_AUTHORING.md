@@ -149,3 +149,23 @@ print(mem.status())
 ## Scaffold
 
 See `examples/pdm-memory-plugin-echo/` for a copy-paste external plugin.
+
+## Builtin: Observer
+
+Autoloaded as ``mem.observer``. Watches ``post_save`` (non-blocking worker):
+
+```python
+mem = Memory(store="./app.db")
+mem.observer.add_rule(
+    "tank-critical",
+    threshold=95.0,
+    tags=["danger", "critical", "deadline"],
+    webhook_url="https://example.com/hooks/pdm",  # optional
+)
+mem.save("routine", tags=["ops", "log", "ok"], p_magnitude=50.0)  # silent
+mem.save("CRITICAL: leak", tags=["danger", "tank", "leak"], p_magnitude=98.0)
+mem.observer.flush()  # wait for console/webhook dispatch
+```
+
+A rule matches if **any** of: ``p_magnitude >= threshold``, hot-tag overlap, or ``drawer=``.
+Webhook POST is ``httpx`` on the worker thread — ``save()`` does not wait on the network.
