@@ -31,7 +31,7 @@ from pdm_memory.storage.errors import CloudNotFoundError, CloudStorageError
 logger = logging.getLogger(__name__)
 
 # Default AZUS Companion API base URL
-DEFAULT_CLOUD_URL = "https://api.azus.ai"
+DEFAULT_CLOUD_URL = "http://localhost:8000"
 
 # Match companion_api.pdm.signature_mutations.MAX_BATCH_SIZE
 _API_BATCH_MAX = 100
@@ -606,6 +606,40 @@ class CloudDriver(BaseStorage):
             )
             for item in items
         ]
+
+    def current_resolution(
+        self,
+        observer: str = "principal",
+        target: str = "operator",
+        domain: str = "*",
+    ) -> Any:
+        """
+        Query RelationshipChannel resolution via Companion integrity profile.
+
+        GET /api/v1/integrity/profile/?observer=&target=&domain=
+        """
+        from pdm_memory.models import RelationshipChannelResolution
+
+        path = "/api/v1/integrity/profile/"
+        params = {
+            "observer": observer,
+            "target": target,
+            "domain": domain,
+        }
+        resp = self._get(path, params=params)
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise CloudStorageError(
+                f"Unexpected integrity profile body type: {type(data).__name__}",
+                path=path,
+            )
+        channel = data.get("relationship_channel")
+        if not isinstance(channel, dict):
+            raise CloudStorageError(
+                "Integrity profile response missing 'relationship_channel' object",
+                path=path,
+            )
+        return RelationshipChannelResolution.from_payload(channel)
 
     # ------------------------------------------------------------------
     # HTTP helpers

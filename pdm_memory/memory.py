@@ -60,7 +60,13 @@ from pdm_memory.core.signature import (
     MemoryHit,
     SignatureRecord,
 )
-from pdm_memory.models import AlignmentReport, MemoryListPage, SurfaceReport, TorsionReport
+from pdm_memory.models import (
+    AlignmentReport,
+    MemoryListPage,
+    RelationshipChannelResolution,
+    SurfaceReport,
+    TorsionReport,
+)
 from pdm_memory.storage.base import BaseStorage
 from pdm_memory.types import (
     HookEvent,
@@ -1485,6 +1491,48 @@ class Memory:
     def list_drawers(self) -> builtins.list[DrawerInfo]:
         """Return all drawer categories with signature counts and avg pressure."""
         return self._storage.list_drawers(user=self._user)
+
+    def current_resolution(
+        self,
+        observer: str = "principal",
+        target: str = "operator",
+        domain: str = "*",
+    ) -> RelationshipChannelResolution:
+        """
+        Query the RelationshipChannel resolution matrix (ecosystem / cloud only).
+
+        Thin client over Companion ``GET /api/v1/integrity/profile/`` with
+        ``observer``, ``target``, and ``domain`` query params. Returns the
+        multidomain channel vector — never a single flat percentage score.
+
+        Requires ``store="cloud"`` or a JWT ``token`` (and optional ``cloud_url``)
+        so the SDK can reach the Companion integrity API.
+        """
+        from pdm_memory.storage.cloud_driver import CloudDriver
+
+        cloud: CloudDriver | None = None
+        if isinstance(self._storage, CloudDriver):
+            cloud = self._storage
+        elif self._cloud_driver is not None and isinstance(
+            self._cloud_driver, CloudDriver
+        ):
+            cloud = self._cloud_driver
+        else:
+            resolved = self._get_cloud_driver(None, None)
+            if isinstance(resolved, CloudDriver):
+                cloud = resolved
+                self._cloud_driver = cloud
+
+        if cloud is None:
+            raise RuntimeError(
+                "current_resolution requires ecosystem/cloud mode: "
+                "Memory(store='cloud', token=...) or Memory(..., token=..., cloud_url=...)."
+            )
+        return cloud.current_resolution(
+            observer=observer,
+            target=target,
+            domain=domain,
+        )
 
     def count(self) -> int:
         """Return total number of memories for this user."""
