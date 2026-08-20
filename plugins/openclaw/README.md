@@ -40,7 +40,7 @@ Before an agent **acts**, PDM Guard:
 
 1. Loads guard rules from `~/.openclaw/pdm-guard-rules.json` (or config fallback).
 2. Builds an intent string from the tool name and payload (`command`, `text`, `patch`, …).
-3. Calls `pdm_memory.verify(intent, goals)` via a local verify sidecar.
+3. Calls `pdm_memory.verify(intent, goals)` directly — spawns a short-lived Python process (`verify_bridge.py`) that imports `pdm_memory` in-process and calls the function. No HTTP, no server to run.
 4. **Blocks** the tool when `is_safe_to_act` is `False`, or **permits** it through.
 
 Statuses (same as standalone GAA):
@@ -58,14 +58,11 @@ Rule management (`pdm_guard_rule`, `/pdm-guard`) always bypasses the gate — ot
 ## 📦 Prerequisites
 
 ```bash
-pip install pdm-memory          # verify() engine (>= 0.2.4)
+pip install pdm-memory          # verify() engine (>= 0.2.4), needs Python >= 3.10
 # OpenClaw gateway with plugin hooks (tested: 2026.7.1-2)
 ```
 
-Verify sidecar — one of:
-
-- **Spike default:** `companion_api` at `http://localhost:8000/api/v1/pdm/gaa/verify/`
-- **Standalone:** any HTTP service that accepts `{ intent, goals }` and returns `{ status, is_safe_to_act, explanation, conflicting_goals }`
+The plugin spawns a `python3` process to call `verify()` — no server, sidecar, or network hop required. Point `pythonBin` (config) or `PDM_GUARD_PYTHON` (env) at whichever interpreter has `pdm-memory` installed if it isn't your default `python3`.
 
 No PDM store, AZUS account, or signup required for the gate itself.
 
@@ -90,7 +87,7 @@ No PDM store, AZUS account, or signup required for the gate itself.
           allowConversationAccess: true
         },
         config: {
-          verifyUrl: "http://localhost:8000/api/v1/pdm/gaa/verify/",
+          pythonBin: "python3",
           rulesFile: "~/.openclaw/pdm-guard-rules.json",
           timeoutMs: 8000
         }
@@ -142,16 +139,16 @@ A blocked receipt includes `"tool_executed": false` and `"resulting_state": { "e
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `verifyUrl` | `http://localhost:8000/api/v1/pdm/gaa/verify/` | POST endpoint for `verify()` |
+| `pythonBin` | `python3` | Interpreter used to run `verify_bridge.py` — must have `pdm-memory` importable |
 | `rulesFile` | `~/.openclaw/pdm-guard-rules.json` | Local rules JSON path |
-| `timeoutMs` | `8000` | Verify request timeout |
+| `timeoutMs` | `8000` | Time budget for the `verify()` subprocess before it's killed |
 | `goals` | `[]` | Legacy fallback rules when the rules file is empty |
 
 ### Environment overrides
 
 | Variable | Effect |
 |----------|--------|
-| `PDM_GUARD_URL` | Overrides `verifyUrl` |
+| `PDM_GUARD_PYTHON` | Overrides `pythonBin` |
 | `PDM_GUARD_RULES_FILE` | Overrides `rulesFile` |
 | `PDM_GUARD_GOALS` | Pipe-separated fallback rules (`rule one\|rule two`) |
 
@@ -208,7 +205,7 @@ Keep the normal coding profile in `openclaw.json`. Do **not** set `tools.allow` 
 |-----------|---------------|
 | Rules file has entries | Verify every tool call (except rule management) |
 | No rules anywhere | Fail-open — tool proceeds |
-| Verify sidecar unreachable | Fail-open — tool proceeds |
+| `verify()` process fails/times out/bad output | Fail-open — tool proceeds (`gate_status: SKIPPED_VERIFY_ERROR`) |
 | `verify()` → not safe | Block with reason shown to user |
 
 Intent strings prefer rich tool payload fields (`command`, `input`, `content`, `text`, `patch`, `script`) so `exec` / write calls carry enough context for `verify()`.
@@ -266,10 +263,11 @@ openclaw daemon restart
 From repo root:
 
 ```bash
-# unit tests (no live sidecar)
+# unit tests (no Python needed)
 node --test plugins/tests/openclaw/receipt.test.mjs plugins/tests/openclaw/rules-store.test.mjs
 
-# includes e2e against verify sidecar (companion_api must be running)
+# includes e2e — spawns verify_bridge.py directly, needs a Python >= 3.10
+# with pdm-memory installed (set PDM_GUARD_PYTHON if it's not your default python3)
 node --test plugins/tests/openclaw/*.test.mjs
 ```
 
@@ -279,6 +277,7 @@ node --test plugins/tests/openclaw/*.test.mjs
 |------|------|
 | `pdm-guard.ts` | Plugin source (`before_tool_call` + `after_tool_call`) |
 | `pdm-guard.js` | Runtime bundle loaded by OpenClaw |
+| `verify_bridge.py` | Reads `{intent, goals}` on stdin, calls `pdm_memory.verify()`, writes the report JSON to stdout |
 | `rules-store.ts` | Local rules file read/write with dedup |
 | `receipt.ts` | Receipt helpers (`resulting_state`, block/complete builders) |
 | `openclaw.plugin.json` | Manifest (`activation.onCapabilities: ["hook", "tool"]`) |
@@ -296,11 +295,11 @@ python -m pdm_memory.examples.standalone_guard
 
 ## 📖 API Reference
 
-### Verify sidecar contract
+### `verify_bridge.py` contract
 
-**POST** `{verifyUrl}`
+Invoked as `{pythonBin} verify_bridge.py`, intent/goals passed as JSON on **stdin**, report JSON printed to **stdout**. Exit code 0 on success; nonzero (with a traceback on stderr) triggers fail-open.
 
-Request:
+stdin:
 
 ```json
 {
@@ -309,20 +308,19 @@ Request:
 }
 ```
 
-Response:
+stdout:
 
 ```json
 {
   "status": "TORSION",
-  "is_safe_to_act": false,
-  "explanation": "…",
+  "score": 0.0466,
   "conflicting_goals": ["never hardcode localhost"],
-  "version": "0.2.4",
-  "elapsed_ms": 12.5
+  "explanation": "…",
+  "is_safe_to_act": false
 }
 ```
 
-Implemented by `companion_api` (`pdm/apis/gaa_verify_view.py`) and callable directly via `pdm_memory.verify()`.
+This is a thin wrapper — `report = pdm_memory.verify(intent, goals)`, then `report.as_dict()` plus `is_safe_to_act`. No HTTP, no Django, no `companion_api` dependency for the gate itself.
 
 ### `pdm_guard_rule` tool parameters
 

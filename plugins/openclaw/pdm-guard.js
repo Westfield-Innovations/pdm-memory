@@ -1,4 +1,7 @@
 // pdm-guard.ts
+import { spawn } from "node:child_process";
+import { dirname as dirname2, join as join2 } from "node:path";
+import { fileURLToPath } from "node:url";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
 // receipt.ts
@@ -300,8 +303,10 @@ async function listGuardRules(filePath) {
 }
 
 // pdm-guard.ts
-var DEFAULT_VERIFY_URL = "http://localhost:8000/api/v1/pdm/gaa/verify/";
+var DEFAULT_PYTHON_BIN = "python3";
 var GUARD_RULE_TOOL = "pdm_guard_rule";
+var PLUGIN_DIR = dirname2(fileURLToPath(import.meta.url));
+var VERIFY_BRIDGE_SCRIPT = join2(PLUGIN_DIR, "verify_bridge.py");
 function buildIntentText(toolName, params) {
   const summarize = (value, maxLen = 500) => {
     try {
@@ -351,26 +356,59 @@ async function resolveGoals(cfg) {
 function resolvePluginConfig(registeredCfg, ctx) {
   return ctx.pluginConfig ?? registeredCfg;
 }
-async function callVerify(verifyUrl, intent, goals, timeoutMs) {
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    const resp = await fetch(verifyUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ intent, goals }),
-      signal: controller.signal
-    });
-    clearTimeout(timer);
-    if (!resp.ok) {
-      console.warn(`[PDM GUARD] verify endpoint returned ${resp.status} - fail-open`);
-      return null;
+async function callVerifyFunction(pythonBin, scriptPath, intent, goals, timeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    let child;
+    try {
+      child = spawn(pythonBin, [scriptPath], { stdio: ["pipe", "pipe", "pipe"] });
+    } catch (err) {
+      console.warn(`[PDM GUARD] failed to spawn ${pythonBin} (${err}) - fail-open`);
+      finish(null);
+      return;
     }
-    return await resp.json();
-  } catch (err) {
-    console.warn(`[PDM GUARD] verify call failed (${err}) - fail-open`);
-    return null;
-  }
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      console.warn(`[PDM GUARD] verify() call timed out after ${timeoutMs}ms - fail-open`);
+      finish(null);
+    }, timeoutMs);
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      console.warn(`[PDM GUARD] verify() call failed (${err}) - fail-open`);
+      finish(null);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        console.warn(
+          `[PDM GUARD] verify() exited with code ${code} - fail-open. ${stderr.trim().slice(-500)}`
+        );
+        finish(null);
+        return;
+      }
+      try {
+        finish(JSON.parse(stdout));
+      } catch (err) {
+        console.warn(`[PDM GUARD] verify() returned invalid JSON (${err}) - fail-open`);
+        finish(null);
+      }
+    });
+    child.stdin?.write(JSON.stringify({ intent, goals }));
+    child.stdin?.end();
+  });
 }
 function formatRulesText(filePath, file) {
   const goals = goalTextsFromFile(file);
@@ -558,12 +596,12 @@ var pdm_guard_default = definePluginEntry({
         }
         const pluginCfg = resolvePluginConfig(registeredCfg, ctx);
         const { goals, source } = await resolveGoals(pluginCfg);
-        const verifyUrl = pluginCfg.verifyUrl ?? process.env.PDM_GUARD_URL ?? DEFAULT_VERIFY_URL;
+        const pythonBin = pluginCfg.pythonBin ?? process.env.PDM_GUARD_PYTHON ?? DEFAULT_PYTHON_BIN;
         const timeoutMs = pluginCfg.timeoutMs ?? 8e3;
         const params = toolEvent.params ?? {};
         const intent = buildIntentText(toolEvent.toolName, params);
         const timestamp = (/* @__PURE__ */ new Date()).toISOString();
-        if (!goals.length || !verifyUrl) {
+        if (!goals.length) {
           enqueuePendingReceipt({
             timestamp,
             proposed_action: intent,
@@ -578,15 +616,21 @@ var pdm_guard_default = definePluginEntry({
           });
           return;
         }
-        const result = await callVerify(verifyUrl, intent, goals, timeoutMs);
+        const result = await callVerifyFunction(
+          pythonBin,
+          VERIFY_BRIDGE_SCRIPT,
+          intent,
+          goals,
+          timeoutMs
+        );
         if (!result) {
           enqueuePendingReceipt({
             timestamp,
             proposed_action: intent,
-            gate_status: "SKIPPED_SIDECAR_ERROR",
+            gate_status: "SKIPPED_VERIFY_ERROR",
             governing_rules: goals,
             rules_source: source,
-            explanation: "verify() unreachable - fail-open.",
+            explanation: "verify() call failed - fail-open.",
             tool_executed: true,
             pdm_version: PDM_VERSION,
             openclaw_version: OPENCLAW_VERSION,

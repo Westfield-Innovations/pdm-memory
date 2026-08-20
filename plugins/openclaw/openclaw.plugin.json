@@ -13,7 +13,7 @@
     "type": "object",
     "additionalProperties": false,
     "properties": {
-      "verifyUrl": { "type": "string" },
+      "pythonBin": { "type": "string" },
       "rulesFile": { "type": "string" },
       "goals": { "type": "array", "items": { "type": "string" } },
       "timeoutMs": { "type": "number" }

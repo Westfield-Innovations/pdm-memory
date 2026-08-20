@@ -5,8 +5,13 @@
  * Manage rules with:
  *   - slash command /pdm-guard (bypasses LLM)
  *   - agent tool pdm_guard_rule
- * Calls companion_api /api/v1/pdm/gaa/verify/ before every other tool execution.
+ * Calls pdm_memory.verify() directly (verify_bridge.py subprocess) before
+ * every other tool execution — no HTTP endpoint involved.
  */
+
+import { spawn } from "node:child_process";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
@@ -29,11 +34,13 @@ import {
   removeGuardRule,
   type GuardRulesFile,
 } from "./rules-store";
-const DEFAULT_VERIFY_URL = "http://localhost:8000/api/v1/pdm/gaa/verify/";
+const DEFAULT_PYTHON_BIN = "python3";
 const GUARD_RULE_TOOL = "pdm_guard_rule";
+const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url));
+const VERIFY_BRIDGE_SCRIPT = join(PLUGIN_DIR, "verify_bridge.py");
 
 interface PluginConfig {
-  verifyUrl?: string;
+  pythonBin?: string;
   goals?: string[];
   rulesFile?: string;
   timeoutMs?: number;
@@ -101,8 +108,6 @@ interface VerifyResponse {
   is_safe_to_act: boolean;
   explanation: string;
   conflicting_goals: string[];
-  version: string;
-  elapsed_ms: number;
 }
 
 function buildIntentText(toolName: string, params: Record<string, unknown>): string {
@@ -169,31 +174,71 @@ function resolvePluginConfig(
   return ctx.pluginConfig ?? registeredCfg;
 }
 
-async function callVerify(
-  verifyUrl: string,
+async function callVerifyFunction(
+  pythonBin: string,
+  scriptPath: string,
   intent: string,
   goals: string[],
   timeoutMs: number,
 ): Promise<VerifyResponse | null> {
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    const resp = await fetch(verifyUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ intent, goals }),
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
-    if (!resp.ok) {
-      console.warn(`[PDM GUARD] verify endpoint returned ${resp.status} - fail-open`);
-      return null;
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value: VerifyResponse | null): void => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+
+    let child;
+    try {
+      child = spawn(pythonBin, [scriptPath], { stdio: ["pipe", "pipe", "pipe"] });
+    } catch (err) {
+      console.warn(`[PDM GUARD] failed to spawn ${pythonBin} (${err}) - fail-open`);
+      finish(null);
+      return;
     }
-    return (await resp.json()) as VerifyResponse;
-  } catch (err) {
-    console.warn(`[PDM GUARD] verify call failed (${err}) - fail-open`);
-    return null;
-  }
+
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      console.warn(`[PDM GUARD] verify() call timed out after ${timeoutMs}ms - fail-open`);
+      finish(null);
+    }, timeoutMs);
+
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk: unknown) => {
+      stdout += String(chunk);
+    });
+    child.stderr?.on("data", (chunk: unknown) => {
+      stderr += String(chunk);
+    });
+
+    child.on("error", (err: unknown) => {
+      clearTimeout(timer);
+      console.warn(`[PDM GUARD] verify() call failed (${err}) - fail-open`);
+      finish(null);
+    });
+
+    child.on("close", (code: number | null) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        console.warn(
+          `[PDM GUARD] verify() exited with code ${code} - fail-open. ${stderr.trim().slice(-500)}`,
+        );
+        finish(null);
+        return;
+      }
+      try {
+        finish(JSON.parse(stdout) as VerifyResponse);
+      } catch (err) {
+        console.warn(`[PDM GUARD] verify() returned invalid JSON (${err}) - fail-open`);
+        finish(null);
+      }
+    });
+
+    child.stdin?.write(JSON.stringify({ intent, goals }));
+    child.stdin?.end();
+  });
 }
 
 function formatRulesText(filePath: string, file: GuardRulesFile): string {
@@ -401,15 +446,15 @@ export default definePluginEntry({
 
         const pluginCfg = resolvePluginConfig(registeredCfg, ctx as BeforeToolCallContext);
         const { goals, source } = await resolveGoals(pluginCfg);
-        const verifyUrl =
-          pluginCfg.verifyUrl ?? process.env.PDM_GUARD_URL ?? DEFAULT_VERIFY_URL;
+        const pythonBin =
+          pluginCfg.pythonBin ?? process.env.PDM_GUARD_PYTHON ?? DEFAULT_PYTHON_BIN;
         const timeoutMs = pluginCfg.timeoutMs ?? 8000;
 
         const params = (toolEvent.params as Record<string, unknown>) ?? {};
         const intent = buildIntentText(toolEvent.toolName, params);
         const timestamp = new Date().toISOString();
 
-        if (!goals.length || !verifyUrl) {
+        if (!goals.length) {
           enqueuePendingReceipt({
             timestamp,
             proposed_action: intent,
@@ -425,16 +470,22 @@ export default definePluginEntry({
           return;
         }
 
-        const result = await callVerify(verifyUrl, intent, goals, timeoutMs);
+        const result = await callVerifyFunction(
+          pythonBin,
+          VERIFY_BRIDGE_SCRIPT,
+          intent,
+          goals,
+          timeoutMs,
+        );
 
         if (!result) {
           enqueuePendingReceipt({
             timestamp,
             proposed_action: intent,
-            gate_status: "SKIPPED_SIDECAR_ERROR",
+            gate_status: "SKIPPED_VERIFY_ERROR",
             governing_rules: goals,
             rules_source: source,
-            explanation: "verify() unreachable - fail-open.",
+            explanation: "verify() call failed - fail-open.",
             tool_executed: true,
             pdm_version: PDM_VERSION,
             openclaw_version: OPENCLAW_VERSION,
