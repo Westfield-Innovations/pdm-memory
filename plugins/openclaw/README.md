@@ -14,7 +14,7 @@ Nothing in OpenClaw's own plugin catalog checks a proposed action against a stat
 - 🧾 **Receipts, not screenshots.** Every gate decision logs a JSON receipt with `resulting_state` to the OpenClaw gateway log.
 - ⚡ **Five minutes.** Install plugin → add one rule → watch a violating action stop before it runs.
 
-📖 **GAA background:** [Guarded Agents — GAA & Torsion](https://azus.ai/support) · Spike report: [`GO-NO-GO.md`](GO-NO-GO.md)
+📖 **GAA background:** [Guarded Agents — GAA & Torsion](https://azus.ai/support)
 
 **Tested runtime:** OpenClaw **2026.7.1-2** (see spike report for block/permit receipts).
 
@@ -281,7 +281,6 @@ node --test plugins/tests/openclaw/*.test.mjs
 | `rules-store.ts` | Local rules file read/write with dedup |
 | `receipt.ts` | Receipt helpers (`resulting_state`, block/complete builders) |
 | `openclaw.plugin.json` | Manifest (`activation.onCapabilities: ["hook", "tool"]`) |
-| `GO-NO-GO.md` | Formal spike report (GO decision, live receipts) |
 | `plugins/tests/openclaw/` | Node test suite |
 
 Standalone GAA walkthrough (no OpenClaw):
