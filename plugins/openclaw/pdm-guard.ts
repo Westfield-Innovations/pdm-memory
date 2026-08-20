@@ -2,7 +2,7 @@
  * PDM Guard — GAA gate for OpenClaw via before_tool_call hook.
  *
  * Calls companion_api /api/v1/pdm/gaa/verify/ before every tool execution.
- * Blocks when verify() reports a direct contradiction.
+ * Blocks when verify() reports is_safe_to_act === false.
  * Fail-open if verifyUrl is unreachable or goals are empty.
  */
 
@@ -10,11 +10,35 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
 const OPENCLAW_VERSION = "2026.7.1-2";
 const PDM_VERSION = "0.2.4";
+const DEFAULT_VERIFY_URL = "http://localhost:8000/api/v1/pdm/gaa/verify/";
 
 interface PluginConfig {
-  verifyUrl: string;
-  goals: string[];
+  verifyUrl?: string;
+  goals?: string[];
   timeoutMs?: number;
+}
+
+interface PluginApi {
+  pluginConfig?: Partial<PluginConfig>;
+  on: (
+    hook: "before_tool_call",
+    handler: (event: BeforeToolCallEvent, ctx: BeforeToolCallContext) => Promise<BeforeToolCallResult | void>,
+    opts?: { priority?: number },
+  ) => void;
+}
+
+interface BeforeToolCallEvent {
+  toolName: string;
+  params?: Record<string, unknown>;
+}
+
+interface BeforeToolCallContext {
+  pluginConfig?: Partial<PluginConfig>;
+}
+
+interface BeforeToolCallResult {
+  block: boolean;
+  blockReason: string;
 }
 
 interface VerifyResponse {
@@ -66,6 +90,22 @@ function logReceipt(receipt: Receipt): void {
   console.log(`[PDM GUARD] RECEIPT: ${JSON.stringify(receipt)}`);
 }
 
+function resolveGoals(cfg: Partial<PluginConfig>): string[] {
+  if (cfg.goals?.length) return cfg.goals;
+  const fromEnv = process.env.PDM_GUARD_GOALS;
+  if (fromEnv) {
+    return fromEnv.split("|").map((g) => g.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+function resolvePluginConfig(
+  registeredCfg: Partial<PluginConfig>,
+  ctx: BeforeToolCallContext,
+): Partial<PluginConfig> {
+  return ctx.pluginConfig ?? registeredCfg;
+}
+
 async function callVerify(
   verifyUrl: string,
   intent: string,
@@ -100,27 +140,16 @@ export default definePluginEntry({
     "Goal-Anchor Alignment gate. Checks every tool call against your guard rules via pdm-memory verify().",
 
   register(api) {
+    const registeredCfg = (api as PluginApi).pluginConfig ?? {};
+
     api.on(
       "before_tool_call",
-      async (event, _ctx) => {
-        const pluginCfg = (api as unknown as { pluginConfig?: Partial<PluginConfig> }).pluginConfig ?? {};
-
-        const goals: string[] =
-          pluginCfg.goals && pluginCfg.goals.length > 0
-            ? pluginCfg.goals
-            : process.env.PDM_GUARD_GOALS
-              ? process.env.PDM_GUARD_GOALS.split("|").map((g) => g.trim()).filter(Boolean)
-              : [
-                  "never say the word banana",
-                  "never write lorem ipsum text",
-                ];
-
-        const verifyUrl: string =
-          pluginCfg.verifyUrl ??
-          process.env.PDM_GUARD_URL ??
-          "http://localhost:8000/api/v1/pdm/gaa/verify/";
-
-        const timeoutMs: number = pluginCfg.timeoutMs ?? 8000;
+      async (event, ctx) => {
+        const pluginCfg = resolvePluginConfig(registeredCfg, ctx as BeforeToolCallContext);
+        const goals = resolveGoals(pluginCfg);
+        const verifyUrl =
+          pluginCfg.verifyUrl ?? process.env.PDM_GUARD_URL ?? DEFAULT_VERIFY_URL;
+        const timeoutMs = pluginCfg.timeoutMs ?? 8000;
 
         const intent = buildIntentText(
           event.toolName,
@@ -157,12 +186,7 @@ export default definePluginEntry({
           return;
         }
 
-        const shouldBlock =
-          result.status === "TORSION" ||
-          (result.status === "CONFLICT" &&
-            Array.isArray(result.conflicting_goals) &&
-            result.conflicting_goals.length > 0);
-        const allowed = !shouldBlock;
+        const allowed = result.is_safe_to_act === true;
 
         logReceipt({
           timestamp: new Date().toISOString(),

@@ -1,27 +1,30 @@
-# PDM Guard - OpenClaw Plugin
+# PDM Guard — OpenClaw Plugin
 
-GAA gate for OpenClaw via `before_tool_call`.
-Calls `pdm-memory verify()` through `companion_api` before each tool execution.
+GAA gate for OpenClaw via `before_tool_call`. Calls `pdm-memory verify()` through `companion_api` before each tool execution.
 
 ## Files
 
-- `pdm-guard.ts` - source version
-- `pdm-guard.js` - runtime file loaded by OpenClaw
-- `openclaw.plugin.json` - plugin metadata and config schema
+- `pdm-guard.ts` — source
+- `pdm-guard.js` — runtime file loaded by OpenClaw (rebuild with esbuild after editing `.ts`)
+- `openclaw.plugin.json` — manifest (`activation.onCapabilities: ["hook"]` required)
+- `SPIKE_DEBUG_POSTMORTEM.md` — debugging notes from spike
 
 ## Config
 
-`~/.openclaw/openclaw.json`
+`~/.openclaw/openclaw.json`:
 
 ```json5
 {
   plugins: {
     load: {
-      paths: ["/Users/admin/azus/pdm-memory/plugins/openclaw/pdm-guard.js"]
+      paths: ["/path/to/pdm-memory/plugins/openclaw/pdm-guard.js"]
     },
     entries: {
       "pdm-guard": {
         enabled: true,
+        hooks: {
+          allowConversationAccess: true
+        },
         config: {
           verifyUrl: "http://localhost:8000/api/v1/pdm/gaa/verify/",
           goals: [
@@ -37,16 +40,27 @@ Calls `pdm-memory verify()` through `companion_api` before each tool execution.
 }
 ```
 
+Optional env overrides: `PDM_GUARD_URL`, `PDM_GUARD_GOALS` (pipe-separated).
+
 ## Behavior
 
-- fail-open if `goals` are empty
-- fail-open if `verifyUrl` is unreachable
-- block when `verify()` returns:
-  - `TORSION`
-  - `CONFLICT` with non-empty `conflicting_goals`
+- **Fail-open** if `goals` are empty
+- **Fail-open** if `verifyUrl` is unreachable
+- **Block** when `verify()` returns `is_safe_to_act: false`
+
+Receipts are logged as `[PDM GUARD] RECEIPT: {...}` in the OpenClaw gateway log.
+
+## Rebuild `.js` from `.ts`
+
+```bash
+cd pdm-memory/plugins/openclaw
+npx esbuild pdm-guard.ts --bundle --platform=node --format=esm \
+  --outfile=pdm-guard.js --external:openclaw --external:"openclaw/*"
+openclaw daemon restart
+```
 
 ## Notes
 
-The plugin builds a richer intent string for tools like `exec`, `apply_patch`,
-and other payload-heavy calls by preferring fields such as `command`, `input`,
-`content`, `text`, `patch`, and `script`.
+Intent strings prefer rich tool payload fields (`command`, `input`, `content`, `text`, `patch`, `script`) so exec/write calls carry enough context for `verify()`.
+
+Plugin config is read from `api.pluginConfig` at `register()` time (typed hooks do not populate `ctx.pluginConfig`).

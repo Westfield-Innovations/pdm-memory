@@ -1,7 +1,8 @@
 // pdm-guard.ts
-import { definePluginEntry } from "/opt/homebrew/lib/node_modules/openclaw/dist/plugin-sdk/plugin-entry.js";
+import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 var OPENCLAW_VERSION = "2026.7.1-2";
 var PDM_VERSION = "0.2.4";
+var DEFAULT_VERIFY_URL = "http://localhost:8000/api/v1/pdm/gaa/verify/";
 function buildIntentText(toolName, params) {
   const summarize = (value, maxLen = 500) => {
     try {
@@ -23,6 +24,17 @@ function buildIntentText(toolName, params) {
 }
 function logReceipt(receipt) {
   console.log(`[PDM GUARD] RECEIPT: ${JSON.stringify(receipt)}`);
+}
+function resolveGoals(cfg) {
+  if (cfg.goals?.length) return cfg.goals;
+  const fromEnv = process.env.PDM_GUARD_GOALS;
+  if (fromEnv) {
+    return fromEnv.split("|").map((g) => g.trim()).filter(Boolean);
+  }
+  return [];
+}
+function resolvePluginConfig(registeredCfg, ctx) {
+  return ctx.pluginConfig ?? registeredCfg;
 }
 async function callVerify(verifyUrl, intent, goals, timeoutMs) {
   try {
@@ -50,12 +62,13 @@ var pdm_guard_default = definePluginEntry({
   name: "PDM Guard",
   description: "Goal-Anchor Alignment gate. Checks every tool call against your guard rules via pdm-memory verify().",
   register(api) {
+    const registeredCfg = api.pluginConfig ?? {};
     api.on(
       "before_tool_call",
-      async (event, _ctx) => {
-        const pluginCfg = api.pluginConfig ?? {};
-        const goals = pluginCfg.goals && pluginCfg.goals.length > 0 ? pluginCfg.goals : process.env.PDM_GUARD_GOALS ? process.env.PDM_GUARD_GOALS.split("|").map((g) => g.trim()).filter(Boolean) : ["never say the word banana", "never write lorem ipsum text"];
-        const verifyUrl = pluginCfg.verifyUrl ?? process.env.PDM_GUARD_URL ?? "http://localhost:8000/api/v1/pdm/gaa/verify/";
+      async (event, ctx) => {
+        const pluginCfg = resolvePluginConfig(registeredCfg, ctx);
+        const goals = resolveGoals(pluginCfg);
+        const verifyUrl = pluginCfg.verifyUrl ?? process.env.PDM_GUARD_URL ?? DEFAULT_VERIFY_URL;
         const timeoutMs = pluginCfg.timeoutMs ?? 8e3;
         const intent = buildIntentText(
           event.toolName,
@@ -88,8 +101,7 @@ var pdm_guard_default = definePluginEntry({
           });
           return;
         }
-        const shouldBlock = result.status === "TORSION" || result.status === "CONFLICT" && Array.isArray(result.conflicting_goals) && result.conflicting_goals.length > 0;
-        const allowed = !shouldBlock;
+        const allowed = result.is_safe_to_act === true;
         logReceipt({
           timestamp: (/* @__PURE__ */ new Date()).toISOString(),
           proposed_action: intent,
