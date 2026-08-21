@@ -24,6 +24,7 @@ from datetime import datetime
 from typing import Any
 
 from pdm_memory.auth.jwt_handler import JWTAuth
+from pdm_memory.core.math import MEMORY_SHAPE_KEY
 from pdm_memory.core.signature import DrawerInfo, SignatureRecord
 from pdm_memory.storage.base import BaseStorage, SaveBatchResult, UpdateBatchResult
 from pdm_memory.storage.errors import CloudNotFoundError, CloudStorageError
@@ -845,7 +846,7 @@ class CloudDriver(BaseStorage):
         if sig.idempotency_key:
             meta["_idempotency_key"] = sig.idempotency_key
         # Preserve SDK-only fields that the public response serializer may omit
-        meta["_pdm_sdk"] = {
+        sdk_bag: dict[str, Any] = {
             "client_id": sig.id,
             "domain": sig.domain,
             "validation_prediction_total": sig.validation_prediction_total,
@@ -858,6 +859,10 @@ class CloudDriver(BaseStorage):
             "t_event_at": cls._iso(sig.t_event_at),
             "source_sdk": sig.source,
         }
+        shape = meta.get(MEMORY_SHAPE_KEY)
+        if isinstance(shape, str) and shape:
+            sdk_bag[MEMORY_SHAPE_KEY] = shape
+        meta["_pdm_sdk"] = sdk_bag
 
         payload = {
             "id": sig.id,
@@ -993,4 +998,12 @@ class CloudDriver(BaseStorage):
         }
         if record_id:
             kwargs["id"] = record_id
+        # Restore shape from SDK bag when top-level metadata was stripped.
+        out_meta = kwargs["metadata"]
+        if (
+            isinstance(out_meta, dict)
+            and MEMORY_SHAPE_KEY not in out_meta
+            and isinstance(sdk_bag.get(MEMORY_SHAPE_KEY), str)
+        ):
+            out_meta[MEMORY_SHAPE_KEY] = sdk_bag[MEMORY_SHAPE_KEY]
         return SignatureRecord(**kwargs)

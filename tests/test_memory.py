@@ -460,6 +460,7 @@ class TestShapeAwareScoring:
         report = mem.explain(mid)
         assert report.half_life_days == pytest.approx(2.0 / 24.0)
         assert report.decay_factor == pytest.approx(0.5, abs=0.05)
+        assert report.memory_shape == "ephemeral"
 
     def test_explain_structural_never_decays(self, mem):
         from datetime import datetime, timedelta, timezone
@@ -478,6 +479,68 @@ class TestShapeAwareScoring:
         report = mem.explain(mid)
         assert report.decay_factor == pytest.approx(0.0)
         assert report.p_effective > 0
+        assert report.memory_shape == "structural"
+
+
+class TestSaveShapeAndDecaySnapshot:
+    def test_save_shape_persists_in_metadata(self, mem):
+        from pdm_memory.core.math import MEMORY_SHAPE_KEY
+
+        mid = mem.save(
+            "User is busy",
+            tags=["calendar"],
+            shape="ephemeral",
+        )
+        rec = mem._storage.get(mid, user="test_user")
+        assert rec.metadata[MEMORY_SHAPE_KEY] == "ephemeral"
+
+    def test_save_infers_shape_from_text(self, mem):
+        from pdm_memory.core.math import MEMORY_SHAPE_KEY
+
+        mid = mem.save("User was born in Kyiv", tags=["bio"])
+        rec = mem._storage.get(mid, user="test_user")
+        assert rec.metadata.get(MEMORY_SHAPE_KEY) == "structural"
+
+    def test_save_rejects_unknown_shape(self, mem):
+        with pytest.raises(ValueError, match="Unknown memory shape"):
+            mem.save("Fact", tags=["a", "b", "c"], shape="not-a-shape")
+
+    def test_update_shape(self, mem):
+        from pdm_memory.core.math import MEMORY_SHAPE_KEY
+
+        mid = mem.save("User likes tea", tags=["prefs", "drink", "habit"])
+        mem.update(mid, shape="behavioral")
+        rec = mem._storage.get(mid, user="test_user")
+        assert rec.metadata[MEMORY_SHAPE_KEY] == "behavioral"
+
+    def test_decay_signature_returns_snapshot(self, mem):
+        import math
+        from datetime import datetime, timedelta, timezone
+
+        from pdm_memory.core.signature import DecaySnapshot
+
+        mid = mem.save(
+            "User was born in Kyiv",
+            tags=["bio"],
+            shape="structural",
+            t_persistence=0,
+        )
+        past = datetime.now(tz=timezone.utc) - timedelta(days=1000)
+        mem._storage.update(mid, user="test_user", last_retrieved=past, created_at=past)
+
+        snap = mem.decay(mid, now=datetime.now(tz=timezone.utc))
+        assert isinstance(snap, DecaySnapshot)
+        assert snap.memory_id == mid
+        assert snap.shape == "structural"
+        assert math.isinf(snap.half_life_days)
+        assert snap.decay_factor == 0.0
+
+    def test_decay_purge_still_returns_counts(self, mem):
+        mem.save("Keep me", tags=["a", "b", "c"], p_magnitude=80)
+        counts = mem.decay()
+        assert "deleted" in counts
+        assert "skipped" in counts
+        assert "decayed" in counts
 
 
 class TestMemoryExplain:

@@ -38,13 +38,15 @@ import os
 from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, overload
 
 from typing_extensions import Self
 
 from pdm_memory.core.alignment import verify_records
 from pdm_memory.core.math import (
     DECAY_DELETE_THRESHOLD,
+    MEMORY_SHAPE_KEY,
+    SHAPE_HALF_LIVES,
     calculate_decay_factor,
     calculate_effective_spike,
     calculate_intent_weight,
@@ -52,9 +54,12 @@ from pdm_memory.core.math import (
     calculate_v,
     half_life_for_signature,
     infer_domain,
+    infer_shape,
+    resolve_memory_shape,
 )
 from pdm_memory.core.retrieval import DEFAULT_DIVERSITY_BIAS, RetrievalEngine
 from pdm_memory.core.signature import (
+    DecaySnapshot,
     DrawerInfo,
     ExplainReport,
     MemoryHit,
@@ -221,6 +226,7 @@ class Memory:
         event_at: datetime | None = None,
         metadata: dict[str, Any] | None = None,
         *,
+        shape: str | None = None,
         dedupe: bool = True,
         dedupe_reinforce: bool = False,
         idempotency_key: str | None = None,
@@ -244,6 +250,9 @@ class Memory:
             event_at:       Optional event datetime (PDM-T ``t_event_at`` — when it
                             happened / will happen; powers "what was yesterday").
             metadata:       Arbitrary extra data attached to the memory.
+            shape:          Memory shape half-life key: ``ephemeral`` / ``behavioral`` /
+                            ``structural``. Stored in ``metadata[memory_shape]``. When
+                            omitted, inferred from tags/text when possible.
             dedupe:         If True, return existing ID when fact hash already stored.
             dedupe_reinforce: When dedupe hits, call reinforce() on the existing memory.
             idempotency_key:  If set, repeated saves with the same key return the existing ID.
@@ -286,6 +295,7 @@ class Memory:
             deadline=deadline,
             event_at=event_at,
             metadata=metadata,
+            shape=shape,
             idempotency_key=idempotency_key,
         )
         sig = self._run_pre_save_hooks(sig)
@@ -306,7 +316,7 @@ class Memory:
 
         Each item accepts the same keys as :meth:`save` (``text``, ``tags``,
         ``p_magnitude``, ``drawer``, ``source``, ``regime``, ``t_persistence``,
-        ``metadata``, ``deadline``, ``event_at``).
+        ``metadata``, ``shape``, ``deadline``, ``event_at``).
 
         Returns:
             Dict with ``saved``, ``skipped``, ``errors`` counts.
@@ -391,6 +401,7 @@ class Memory:
                         deadline=item.get("deadline") or item.get("t_deadline"),
                         event_at=item.get("event_at") or item.get("t_event_at"),
                         metadata=item.get("metadata"),
+                        shape=item.get("shape"),
                         phase_privilege=float(item.get("phase_privilege", 1.0)),
                         idempotency_key=idempotency_key or None,
                     )
@@ -508,6 +519,7 @@ class Memory:
         regime: str | None = None,
         source: str | None = None,
         metadata: dict[str, Any] | None = None,
+        shape: str | None = None,
         deadline: datetime | None = None,
         event_at: datetime | None = None,
     ) -> MemoryHit:
@@ -524,6 +536,7 @@ class Memory:
             regime:      New question regime.
             source:      New source label.
             metadata:    Shallow-merged into existing metadata dict.
+            shape:       Set ``metadata[memory_shape]`` (ephemeral / behavioral / structural).
             deadline:    New ``t_deadline`` (pass to clear with care — use storage).
             event_at:    New ``t_event_at`` event timestamp.
 
@@ -547,6 +560,7 @@ class Memory:
             regime=regime,
             source=source,
             metadata=metadata,
+            shape=shape,
             deadline=deadline,
             event_at=event_at,
         )
@@ -1154,21 +1168,95 @@ class Memory:
         )
         return report
 
-    def decay(self, dry_run: bool = False) -> dict[str, int]:
+    @overload
+    def decay(self, *, dry_run: bool = False) -> dict[str, int]: ...
+
+    @overload
+    def decay(
+        self,
+        signature: SignatureRecord | str,
+        now: datetime | None = None,
+    ) -> DecaySnapshot: ...
+
+    def decay(
+        self,
+        signature: SignatureRecord | str | None = None,
+        now: datetime | None = None,
+        *,
+        dry_run: bool = False,
+    ) -> DecaySnapshot | dict[str, int]:
         """
-        Purge memories whose live ``P_effective`` is below the delete threshold.
+        Compute live decay for one signature, or purge the store.
 
-        Uses the SAME half-life law as ``recall()`` / ``explain()``. Does not
-        rewrite ``p_magnitude`` with a separate power-law (that caused double
-        decay). ``decayed`` stays in the return dict for API compat and is
-        always 0.
+        * ``decay(signature, now=None)`` → :class:`DecaySnapshot` (read-only).
+        * ``decay(dry_run=False)`` → purge signatures with live ``P_effective``
+          below the delete threshold (same half-life law as ``recall`` / ``explain``).
 
-        Args:
-            dry_run: If True, compute what would be deleted but make no writes.
-
-        Returns:
-            Dict with keys: decayed, deleted, skipped.
+        Purge does not rewrite ``p_magnitude``. ``decayed`` in the purge return
+        dict stays 0 for API compat.
         """
+        if signature is not None:
+            return self._decay_snapshot(signature, now)
+
+        return self._purge_decay(dry_run=dry_run)
+
+    def _decay_snapshot(
+        self,
+        signature: SignatureRecord | str,
+        now: datetime | None = None,
+    ) -> DecaySnapshot:
+        """Live shape-aware decay metrics for one signature (no storage writes)."""
+        as_of = now or datetime.now(tz=timezone.utc)
+        if isinstance(signature, SignatureRecord):
+            rec = signature
+        else:
+            rec = self._storage.get(str(signature), user=self._user)
+            if rec is None:
+                raise KeyError(
+                    f"Memory '{signature}' not found for user '{self._user}'."
+                )
+
+        days_since = self._days_since(rec.last_retrieved or rec.created_at, as_of)
+        days_since_created = self._days_since(rec.created_at, as_of)
+        shape = resolve_memory_shape(
+            rec.metadata, rec.intent_tags, rec.compressed_fact
+        )
+        domain = rec.domain or infer_domain(rec.intent_tags)
+        half_life = half_life_for_signature(
+            rec.domain,
+            intent_tags=rec.intent_tags,
+            metadata=rec.metadata,
+            text=rec.compressed_fact,
+        )
+        decay = calculate_decay_factor(
+            days_since,
+            half_life,
+            days_since_created=days_since_created,
+            t_persistence=rec.t_persistence,
+        )
+        v = calculate_v(
+            rec.validation_prediction_correct,
+            rec.validation_prediction_total,
+        )
+        p_eff = calculate_p_effective(
+            rec.p_magnitude, v, decay, intent_weight=1.0, quality=0.80
+        )
+        return DecaySnapshot(
+            memory_id=rec.id,
+            shape=shape,
+            domain=domain,
+            half_life_days=half_life,
+            decay_factor=decay,
+            days_since_retrieved=days_since,
+            days_since_created=days_since_created,
+            p_magnitude=rec.p_magnitude,
+            v_coefficient=v,
+            p_effective=p_eff,
+            as_of=as_of,
+        )
+
+    def _purge_decay(self, *, dry_run: bool = False) -> dict[str, int]:
+        """Delete signatures whose live ``P_effective`` is below threshold."""
         records = self._storage.list(user=self._user, limit=10_000)
         now = datetime.now(tz=timezone.utc)
         counts = {"decayed": 0, "deleted": 0, "skipped": 0}
@@ -1382,6 +1470,9 @@ class Memory:
             pressure_proximity=press_prox,
             intent_tags=rec.intent_tags,
             domain=domain,
+            memory_shape=resolve_memory_shape(
+                rec.metadata, rec.intent_tags, rec.compressed_fact
+            ),
         )
 
     def sync(
@@ -1579,6 +1670,7 @@ class Memory:
         deadline: datetime | None = None,
         event_at: datetime | None = None,
         metadata: dict[str, Any] | None = None,
+        shape: str | None = None,
         idempotency_key: str | None = None,
     ) -> SignatureRecord:
         resolved_tags = tags or []
@@ -1606,9 +1698,36 @@ class Memory:
             decay_rate=0.9,
             t_deadline=deadline,
             t_event_at=resolved_event,
-            metadata=metadata or {},
+            metadata=self._metadata_with_shape(text, resolved_tags, metadata, shape),
             idempotency_key=idempotency_key.strip() if idempotency_key else None,
         )
+
+    @staticmethod
+    def _validate_shape(shape: str) -> str:
+        if shape not in SHAPE_HALF_LIVES:
+            allowed = ", ".join(sorted(SHAPE_HALF_LIVES))
+            raise ValueError(f"Unknown memory shape '{shape}'. Expected one of: {allowed}")
+        return shape
+
+    @classmethod
+    def _metadata_with_shape(
+        cls,
+        text: str,
+        tags: builtins.list[str],
+        metadata: dict[str, Any] | None,
+        shape: str | None,
+    ) -> dict[str, Any]:
+        """Merge explicit/inferred shape into metadata under ``memory_shape``."""
+        meta = dict(metadata or {})
+        if shape is not None:
+            meta[MEMORY_SHAPE_KEY] = cls._validate_shape(shape)
+        elif MEMORY_SHAPE_KEY not in meta:
+            inferred = infer_shape(tags, text)
+            if inferred is not None:
+                meta[MEMORY_SHAPE_KEY] = inferred
+        elif meta.get(MEMORY_SHAPE_KEY) is not None:
+            cls._validate_shape(str(meta[MEMORY_SHAPE_KEY]))
+        return meta
 
     def _build_update_fields(
         self,
@@ -1622,6 +1741,7 @@ class Memory:
         regime: str | None = None,
         source: str | None = None,
         metadata: dict[str, Any] | None = None,
+        shape: str | None = None,
         deadline: datetime | None = None,
         event_at: datetime | None = None,
         extra_fields: dict[str, Any] | None = None,
@@ -1652,8 +1772,13 @@ class Memory:
             fields["question_regime"] = regime
         if source is not None:
             fields["source"] = source
-        if metadata is not None:
-            fields["metadata"] = {**(rec.metadata or {}), **metadata}
+        if metadata is not None or shape is not None:
+            merged = {**(rec.metadata or {}), **(metadata or {})}
+            if shape is not None:
+                merged[MEMORY_SHAPE_KEY] = self._validate_shape(shape)
+            elif MEMORY_SHAPE_KEY in merged and merged[MEMORY_SHAPE_KEY] is not None:
+                self._validate_shape(str(merged[MEMORY_SHAPE_KEY]))
+            fields["metadata"] = merged
         if deadline is not None:
             fields["t_deadline"] = deadline
         if event_at is not None:
@@ -1701,6 +1826,7 @@ class Memory:
 
         source = fields.pop("source", None) if "source" in fields else None
         metadata = fields.pop("metadata", None) if "metadata" in fields else None
+        shape = fields.pop("shape", None) if "shape" in fields else None
 
         return self._build_update_fields(
             rec,
@@ -1712,6 +1838,7 @@ class Memory:
             regime=regime,
             source=source,
             metadata=metadata,
+            shape=shape,
             deadline=deadline,
             event_at=event_at,
             extra_fields=fields,

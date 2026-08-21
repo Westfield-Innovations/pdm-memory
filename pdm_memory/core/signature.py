@@ -8,6 +8,7 @@ PDM Core Dataclasses — framework-agnostic signature and result types.
 
 from __future__ import annotations
 
+import math
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -195,8 +196,29 @@ class DrawerInfo:
 
 
 # ---------------------------------------------------------------------------
-# Explain report
+# Explain / decay reports
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class DecaySnapshot:
+    """
+    Live shape-aware decay state for one signature at a point in time.
+
+    Returned by ``Memory.decay(signature, now)``. Does not mutate storage.
+    """
+
+    memory_id: str
+    shape: str | None
+    domain: str
+    half_life_days: float
+    decay_factor: float
+    days_since_retrieved: float
+    days_since_created: float
+    p_magnitude: float
+    v_coefficient: float
+    p_effective: float
+    as_of: datetime
 
 
 @dataclass
@@ -238,9 +260,16 @@ class ExplainReport:
     # Intent tags
     intent_tags: list[str]
     domain: str
+    memory_shape: str | None = None
 
     def render(self) -> str:
         """Return a human-readable text report."""
+        half_life_label = (
+            "∞"
+            if not math.isfinite(self.half_life_days)
+            else f"{self.half_life_days}d"
+        )
+        shape_label = self.memory_shape or "—"
         lines = [
             "╔══════════════════════════════════════════════════════",
             "║  PDM Memory Explain Report",
@@ -251,11 +280,12 @@ class ExplainReport:
             f"║  Source:          {self.source}",
             f"║  Tags:            {', '.join(self.intent_tags)}",
             f"║  Domain:          {self.domain}",
+            f"║  Shape:           {shape_label}",
             "╠──────────────────────────────────────────────────────",
             "║  Pressure Components:",
             f"║    p_magnitude:    {self.p_magnitude:.2f}",
             f"║    V coefficient:  {self.v_coefficient:.4f}  ({self.retrieval_count} retrievals)",
-            f"║    Decay factor:   {self.decay_factor:.4f}  ({self.days_since_retrieved:.1f}d since retrieved, T½={self.half_life_days}d)",
+            f"║    Decay factor:   {self.decay_factor:.4f}  ({self.days_since_retrieved:.1f}d since retrieved, T½={half_life_label})",
             f"║    Intent weight:  {self.intent_weight if self.intent_weight is not None else 'n/a (no query)'}",
             f"║    Quality:        {self.quality:.2f}",
             "║    ─────────────────────────────",
