@@ -1,10 +1,14 @@
 """Tests for PDM core math formulas — verifies parity with companion_api/pdm/kernel.py"""
 
+import math
+
 import pytest
 
 from pdm_memory.core.math import (
     DECAY_DELETE_THRESHOLD,
     DOMAIN_HALF_LIVES,
+    MEMORY_SHAPE_KEY,
+    SHAPE_HALF_LIVES,
     calculate_decay_factor,
     calculate_effective_spike,
     calculate_half_life_pressure,
@@ -15,6 +19,9 @@ from pdm_memory.core.math import (
     calculate_v,
     infer_domain,
     infer_regime,
+    infer_shape,
+    resolve_half_life,
+    resolve_memory_shape,
 )
 
 
@@ -72,6 +79,78 @@ class TestDecayFactor:
             30, 30, days_since_created=60, t_persistence=30
         )
         assert d == pytest.approx(0.5, abs=0.01)
+
+    def test_ephemeral_two_hours(self):
+        # T½ = 2h → at t = 2h decay_factor = 0.5
+        half_life = SHAPE_HALF_LIVES["ephemeral"]
+        assert half_life == pytest.approx(2.0 / 24.0)
+        assert calculate_decay_factor(half_life, half_life) == pytest.approx(0.5, abs=0.01)
+
+    def test_behavioral_ninety_days(self):
+        half_life = SHAPE_HALF_LIVES["behavioral"]
+        assert half_life == 90.0
+        assert calculate_decay_factor(90, half_life) == pytest.approx(0.5, abs=0.01)
+
+    def test_structural_infinite_no_decay(self):
+        half_life = SHAPE_HALF_LIVES["structural"]
+        assert math.isinf(half_life)
+        assert calculate_decay_factor(0, half_life) == 0.0
+        assert calculate_decay_factor(3650, half_life) == 0.0
+
+    def test_non_positive_half_life_no_decay(self):
+        assert calculate_decay_factor(10, 0.0) == 0.0
+        assert calculate_decay_factor(10, -1.0) == 0.0
+
+
+class TestResolveHalfLife:
+    def test_domain_fallback(self):
+        assert resolve_half_life("market_signal") == 1.0
+        assert resolve_half_life(None) == 30.0
+        assert resolve_half_life("unknown") == 30.0
+
+    def test_shape_overrides_domain(self):
+        # Domain alone would be 1 day; ephemeral shape wins (2 hours)
+        assert resolve_half_life("market_signal", shape="ephemeral") == pytest.approx(
+            2.0 / 24.0
+        )
+        assert math.isinf(resolve_half_life("insight", shape="structural"))
+        assert resolve_half_life("warning", shape="behavioral") == 90.0
+
+    def test_unknown_shape_ignored(self):
+        assert resolve_half_life("core_fact", shape="not_a_shape") == 365.0
+
+
+class TestShapeInference:
+    def test_ephemeral_from_tags(self):
+        assert infer_shape(["user", "busy", "status"]) == "ephemeral"
+
+    def test_behavioral_from_text(self):
+        assert infer_shape(text="user usually writes code in Python") == "behavioral"
+
+    def test_structural_from_text(self):
+        assert infer_shape(text="user was born in Kyiv") == "structural"
+
+    def test_no_match(self):
+        assert infer_shape(["random"]) is None
+        assert infer_shape() is None
+
+    def test_metadata_wins_over_inference(self):
+        shape = resolve_memory_shape(
+            metadata={MEMORY_SHAPE_KEY: "structural"},
+            tags=["busy"],
+            text="user is busy",
+        )
+        assert shape == "structural"
+
+    def test_unknown_metadata_falls_back_to_infer(self):
+        shape = resolve_memory_shape(
+            metadata={MEMORY_SHAPE_KEY: "bogus"},
+            tags=["habit"],
+        )
+        assert shape == "behavioral"
+
+    def test_infer_when_metadata_absent(self):
+        assert resolve_memory_shape(tags=["temporary"]) == "ephemeral"
 
 
 class TestValidationCoefficient:
