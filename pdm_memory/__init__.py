@@ -26,7 +26,12 @@ See README.md for full documentation.
 from pdm_memory.core.alignment import verify
 from pdm_memory.core.signature import DrawerInfo, MemoryHit
 from pdm_memory.memory import Memory
-from pdm_memory.models import AlignmentReport, SurfaceReport, TorsionReport
+from pdm_memory.models import (
+    AlignmentReport,
+    RelationshipChannelResolution,
+    SurfaceReport,
+    TorsionReport,
+)
 from pdm_memory.storage.factory import create_storage, register_storage
 
 __version__ = "0.2.4"
@@ -35,6 +40,7 @@ __all__ = [
     "DrawerInfo",
     "Memory",
     "MemoryHit",
+    "RelationshipChannelResolution",
     "SurfaceReport",
     "TorsionReport",
     "__version__",

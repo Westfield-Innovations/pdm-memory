@@ -97,6 +97,97 @@ class MemoryListPage:
 
 
 @dataclass(slots=True)
+class RelationshipChannelResolution:
+    """
+    Domained communication-channel vector (TKT-301).
+
+    Multidimensional only — never a single channel health percentage.
+    Populated from Companion ``GET /api/v1/integrity/profile/``.
+    """
+
+    observer_key: str
+    target_key: str
+    domain: str
+    recency_days: float
+    frequency: int
+    breadth: float
+    directionality_inbound: float
+    directionality_outbound: float
+    directionality_bilateral: float
+    information_bandwidth: float
+    computation_window_days: int = 90
+    last_computed_at: str | None = None
+    updated_at: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "observer_key": self.observer_key,
+            "target_key": self.target_key,
+            "domain": self.domain,
+            "recency_days": round(float(self.recency_days), 4),
+            "frequency": int(self.frequency),
+            "breadth": round(float(self.breadth), 4),
+            "directionality_inbound": round(float(self.directionality_inbound), 4),
+            "directionality_outbound": round(float(self.directionality_outbound), 4),
+            "directionality_bilateral": round(float(self.directionality_bilateral), 4),
+            "information_bandwidth": round(float(self.information_bandwidth), 4),
+            "computation_window_days": int(self.computation_window_days),
+            "last_computed_at": self.last_computed_at,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> RelationshipChannelResolution:
+        forbidden = {
+            "channel_score",
+            "channel_health",
+            "resolution_percent",
+            "resolution_pct",
+            "relationship_channel_score",
+        }
+        overlap = forbidden.intersection(payload.keys())
+        if overlap:
+            joined = ", ".join(sorted(overlap))
+            raise ValueError(
+                f"Collapsed channel score fields are forbidden: {joined}. "
+                "Expose RelationshipChannel vector dimensions separately."
+            )
+        return cls(
+            observer_key=str(payload.get("observer_key", "principal")),
+            target_key=str(payload.get("target_key", "operator")),
+            domain=str(payload.get("domain", "*")),
+            recency_days=float(payload.get("recency_days", 0.0) or 0.0),
+            frequency=int(payload.get("frequency", 0) or 0),
+            breadth=float(payload.get("breadth", 0.0) or 0.0),
+            directionality_inbound=float(
+                payload.get("directionality_inbound", 0.0) or 0.0
+            ),
+            directionality_outbound=float(
+                payload.get("directionality_outbound", 0.0) or 0.0
+            ),
+            directionality_bilateral=float(
+                payload.get("directionality_bilateral", 0.0) or 0.0
+            ),
+            information_bandwidth=float(
+                payload.get("information_bandwidth", 0.0) or 0.0
+            ),
+            computation_window_days=int(
+                payload.get("computation_window_days", 90) or 90
+            ),
+            last_computed_at=(
+                str(payload["last_computed_at"])
+                if payload.get("last_computed_at") is not None
+                else None
+            ),
+            updated_at=(
+                str(payload["updated_at"])
+                if payload.get("updated_at") is not None
+                else None
+            ),
+        )
+
+
+@dataclass(slots=True)
 class SurfaceReport:
     """
     Lite agent-loop snapshot: recall + torsion scan + alignment gate for one query.
