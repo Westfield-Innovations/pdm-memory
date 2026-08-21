@@ -222,6 +222,28 @@ class DecaySnapshot:
 
 
 @dataclass
+class ContraryEvidenceResult:
+    """
+    Outcome of ``Memory.apply_contrary_evidence``.
+
+    Active pressure / V on the target are adjusted; historical fact fields
+    (``compressed_fact``, ``created_at``, ``validation_prediction_correct``)
+    are left unchanged.
+    """
+
+    target_id: str
+    evidence_id: str | None
+    p_before: float
+    p_after: float
+    v_before: float
+    v_after: float
+    p_effective_after: float
+    compressed_fact: str
+    created_at: datetime | None
+    validation_prediction_correct: int
+
+
+@dataclass
 class ExplainReport:
     """
     Returned by mem.explain(memory_id).

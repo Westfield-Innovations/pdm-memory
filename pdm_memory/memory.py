@@ -38,7 +38,7 @@ import os
 from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, overload
+from typing import Any, Mapping, overload
 
 from typing_extensions import Self
 
@@ -59,6 +59,7 @@ from pdm_memory.core.math import (
 )
 from pdm_memory.core.retrieval import DEFAULT_DIVERSITY_BIAS, RetrievalEngine
 from pdm_memory.core.signature import (
+    ContraryEvidenceResult,
     DecaySnapshot,
     DrawerInfo,
     ExplainReport,
@@ -884,26 +885,200 @@ class Memory:
         if rec is None:
             logger.warning("[PDM] penalize(%s): not found", memory_id)
             return
+        self._apply_prediction_miss(rec, coupling_score=coupling_score)
+
+    def apply_contrary_evidence(
+        self,
+        target: str | SignatureRecord,
+        evidence: str | SignatureRecord | Mapping[str, Any],
+        *,
+        coupling_score: float = 0.5,
+        persist_evidence: bool = True,
+        evidence_tags: builtins.list[str] | None = None,
+        evidence_shape: str | None = None,
+    ) -> ContraryEvidenceResult:
+        """
+        Immediately lower active pressure on ``target`` when contrary evidence arrives.
+
+        Applies the same V-miss + Δp update as :meth:`penalize` without rewriting
+        the target's ``compressed_fact``, ``created_at``, or
+        ``validation_prediction_correct``. Optionally persists the evidence as a
+        new signature linked via ``metadata["contrary_to"]``.
+
+        Args:
+            target:            Target memory id or loaded ``SignatureRecord``.
+            evidence:          Contrary fact as text, record, or mapping with
+                               ``text`` / ``tags`` / ``shape`` / ``metadata``.
+            coupling_score:    Strength of the miss (0–1), same as ``penalize``.
+            persist_evidence:  If True, ``save`` the evidence as a new signature.
+            evidence_tags:     Tags for the evidence signature (overrides mapping).
+            evidence_shape:    Optional shape for the evidence signature.
+
+        Returns:
+            :class:`ContraryEvidenceResult` with before/after pressure metrics.
+
+        Raises:
+            KeyError: Target memory not found.
+            ValueError: Empty evidence text.
+        """
+        if isinstance(target, SignatureRecord):
+            rec = target
+            target_id = rec.id
+            # Refresh so we operate on stored state
+            stored = self._storage.get(target_id, user=self._user)
+            if stored is None:
+                raise KeyError(
+                    f"Memory '{target_id}' not found for user '{self._user}'."
+                )
+            rec = stored
+        else:
+            target_id = str(target)
+            rec = self._storage.get(target_id, user=self._user)
+            if rec is None:
+                raise KeyError(
+                    f"Memory '{target_id}' not found for user '{self._user}'."
+                )
+
+        fact_before = rec.compressed_fact
+        created_before = rec.created_at
+        correct_before = int(rec.validation_prediction_correct or 0)
+        p_before = float(rec.p_magnitude)
+        v_before = calculate_v(
+            rec.validation_prediction_correct,
+            rec.validation_prediction_total,
+        )
+
+        updated = self._apply_prediction_miss(rec, coupling_score=coupling_score)
+        v_after = calculate_v(
+            updated.validation_prediction_correct,
+            updated.validation_prediction_total,
+        )
+        snap = self._decay_snapshot(updated)
+        p_effective_after = snap.p_effective
+
+        evidence_id: str | None = None
+        if persist_evidence:
+            text, tags, meta, shape = self._normalize_contrary_evidence(
+                evidence,
+                evidence_tags=evidence_tags,
+                evidence_shape=evidence_shape,
+            )
+            meta = {**(meta or {}), "contrary_to": target_id}
+            evidence_id = self.save(
+                text,
+                tags=tags,
+                metadata=meta,
+                shape=shape,
+                source="contrary_evidence",
+                dedupe=False,
+            )
+
+        logger.info(
+            "[PDM] apply_contrary_evidence(target=%s) P=%.1f→%.1f V=%.4f→%.4f evidence=%s",
+            target_id[:8],
+            p_before,
+            updated.p_magnitude,
+            v_before,
+            v_after,
+            (evidence_id or "")[:8] or "—",
+        )
+        return ContraryEvidenceResult(
+            target_id=target_id,
+            evidence_id=evidence_id,
+            p_before=p_before,
+            p_after=float(updated.p_magnitude),
+            v_before=v_before,
+            v_after=v_after,
+            p_effective_after=p_effective_after,
+            compressed_fact=fact_before,
+            created_at=created_before,
+            validation_prediction_correct=correct_before,
+        )
+
+    def _apply_prediction_miss(
+        self,
+        rec: SignatureRecord,
+        *,
+        coupling_score: float = 0.5,
+    ) -> SignatureRecord:
+        """
+        Record a wrong prediction: Δp down, V total +1, correct unchanged.
+
+        Does not modify ``compressed_fact`` or ``created_at``.
+        """
         delta = self._engine.compute_reinforcement_delta(
             rec.p_magnitude, rec.retrieval_count, coupling_score
         )
         new_p = max(0.0, rec.p_magnitude - delta)
-        new_spike = calculate_effective_spike(new_p, rec.t_persistence, rec.phase_privilege)
+        new_spike = calculate_effective_spike(
+            new_p, rec.t_persistence, rec.phase_privilege
+        )
         new_total = (rec.validation_prediction_total or 0) + 1
-        # correct count stays the same — this was a wrong prediction
+        now = datetime.now(tz=timezone.utc)
         self._storage.update(
-            memory_id,
+            rec.id,
             user=self._user,
             p_magnitude=new_p,
             effective_spike=new_spike,
             retrieval_count=(rec.retrieval_count or 0) + 1,
-            last_retrieved=datetime.now(tz=timezone.utc),
+            last_retrieved=now,
             validation_prediction_total=new_total,
         )
         logger.debug(
-            "[PDM] penalize(%s) Δp=-%.2f → P=%.1f  V_total=%d V_correct=%d",
-            memory_id, delta, new_p, new_total, rec.validation_prediction_correct or 0,
+            "[PDM] prediction_miss(%s) Δp=-%.2f → P=%.1f  V_total=%d V_correct=%d",
+            rec.id,
+            delta,
+            new_p,
+            new_total,
+            rec.validation_prediction_correct or 0,
         )
+        updated = self._storage.get(rec.id, user=self._user)
+        if updated is None:
+            # Storage wrote successfully; reconstruct for callers if get races.
+            rec.p_magnitude = new_p
+            rec.effective_spike = new_spike
+            rec.retrieval_count = (rec.retrieval_count or 0) + 1
+            rec.last_retrieved = now
+            rec.validation_prediction_total = new_total
+            return rec
+        return updated
+
+    @staticmethod
+    def _normalize_contrary_evidence(
+        evidence: str | SignatureRecord | Mapping[str, Any],
+        *,
+        evidence_tags: builtins.list[str] | None = None,
+        evidence_shape: str | None = None,
+    ) -> tuple[str, builtins.list[str] | None, dict[str, Any] | None, str | None]:
+        """Normalize evidence input → (text, tags, metadata, shape)."""
+        if isinstance(evidence, SignatureRecord):
+            text = evidence.compressed_fact
+            tags = evidence_tags if evidence_tags is not None else list(evidence.intent_tags)
+            meta = dict(evidence.metadata or {})
+            shape = evidence_shape or resolve_memory_shape(
+                evidence.metadata, evidence.intent_tags, evidence.compressed_fact
+            )
+        elif isinstance(evidence, Mapping):
+            text = str(
+                evidence.get("text")
+                or evidence.get("compressed_fact")
+                or ""
+            ).strip()
+            raw_tags = evidence_tags
+            if raw_tags is None:
+                raw_tags = evidence.get("tags") or evidence.get("intent_tags")
+            tags = list(raw_tags) if raw_tags else None
+            meta = dict(evidence.get("metadata") or {})
+            shape = evidence_shape or evidence.get("shape")
+        else:
+            text = str(evidence).strip()
+            tags = evidence_tags
+            meta = {}
+            shape = evidence_shape
+
+        if not text:
+            raise ValueError("Contrary evidence text cannot be empty.")
+        return text[:500], tags, meta, shape
 
     def delete(self, memory_id: str) -> bool:
 
