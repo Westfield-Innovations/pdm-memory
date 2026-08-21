@@ -6,6 +6,7 @@ import {
   buildBlockedReceipt,
   buildCompletedReceipt,
   summarizeToolOutcome,
+  toReceiptLog,
 } from "../../openclaw/receipt.ts";
 
 test("blocked resulting_state shows no side effects", () => {
@@ -33,6 +34,35 @@ test("buildBlockedReceipt includes resulting_state", () => {
   assert.equal(receipt.tool_executed, false);
   assert.equal(receipt.resulting_state.executed, false);
   assert.equal(receipt.resulting_state.side_effects, "none");
+});
+
+test("toReceiptLog keeps a short demo-friendly line", () => {
+  const receipt = buildBlockedReceipt({
+    timestamp: "2026-08-20T07:56:42.546Z",
+    proposed_action:
+      'write path=config.py content≈DB_HOST = "127.0.0.1"\nDB_NAME = "app"',
+    gate_status: "TORSION",
+    governing_rules: ["never create a file named config.py"],
+    rules_source: "/tmp/rules.json",
+    explanation:
+      "This intent is dangerous for system integrity: write path=config.py contradicts Goal Anchor 'never create a file named config.py'.",
+    tool_executed: false,
+    pdm_version: "0.2.4",
+    openclaw_version: "2026.7.1-2",
+    tool_name: "write",
+  });
+
+  const line = toReceiptLog(receipt);
+  assert.equal(line.time, "2026-08-20T07:56:42.546Z");
+  assert.equal(line.status, "TORSION");
+  assert.equal(line.tool, "write");
+  assert.equal(line.executed, false);
+  assert.equal(line.action, "write path=config.py");
+  assert.deepEqual(line.rules, ["never create a file named config.py"]);
+  assert.ok(String(line.why).length <= 100);
+  assert.equal(line.pdm_version, undefined);
+  assert.equal(line.tool_result, undefined);
+  assert.equal(line.resulting_state, undefined);
 });
 
 test("summarizeToolOutcome captures exec stdout/stderr/exit code", () => {

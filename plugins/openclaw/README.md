@@ -11,7 +11,7 @@ Nothing in OpenClaw's own plugin catalog checks a proposed action against a stat
 - 🛡️ **Goal-Anchor Alignment.** Same gate as `pdm-memory`: **ALIGNED**, **CONFLICT**, or **TORSION**.
 - 📝 **Plain-English rules.** Add `never hardcode localhost` — no code, no PDM store required.
 - 🔒 **Local rules file.** `~/.openclaw/pdm-guard-rules.json` — your data stays on your machine.
-- 🧾 **Receipts, not screenshots.** Every gate decision logs a JSON receipt with `resulting_state` to the OpenClaw gateway log.
+- 🧾 **Receipts, not screenshots.** Every gate decision logs a short JSON receipt to the OpenClaw gateway log.
 - ⚡ **Five minutes.** Install plugin → add one rule → watch a violating action stop before it runs.
 
 📖 **GAA background:** [Guarded Agents — GAA & Torsion](https://azus.ai/support)
@@ -126,10 +126,14 @@ Action blocked by PDM guard (TORSION): …
 ### 4. Confirm the receipt
 
 ```bash
-grep '\[PDM GUARD\] RECEIPT:' /tmp/openclaw/openclaw-$(date +%Y-%m-%d).log | tail -1
+tail -1 /tmp/openclaw/pdm-guard-receipts.jsonl
 ```
 
-A blocked receipt includes `"tool_executed": false` and `"resulting_state": { "executed": false, "side_effects": "none", … }`.
+Clean one-liner (not the OpenClaw gateway envelope). Blocked example:
+
+```json
+{"time":"2026-08-21T08:33:18.388Z","status":"TORSION","tool":"write","action":"write path=config.py","rules":["never create a file named config.py"],"executed":false,"why":"…"}
+```
 
 ---
 
@@ -151,6 +155,7 @@ A blocked receipt includes `"tool_executed": false` and `"resulting_state": { "e
 | `PDM_GUARD_PYTHON` | Overrides `pythonBin` |
 | `PDM_GUARD_RULES_FILE` | Overrides `rulesFile` |
 | `PDM_GUARD_GOALS` | Pipe-separated fallback rules (`rule one\|rule two`) |
+| `PDM_GUARD_RECEIPT_LOG` | Clean receipt JSONL path (default `/tmp/openclaw/pdm-guard-receipts.jsonl`) |
 
 Plugin config is read from `api.pluginConfig` at `register()` time — typed hooks do not populate `ctx.pluginConfig`.
 
@@ -208,39 +213,39 @@ Keep the normal coding profile in `openclaw.json`. Do **not** set `tools.allow` 
 | `verify()` process fails/times out/bad output | Fail-open — tool proceeds (`gate_status: SKIPPED_VERIFY_ERROR`) |
 | `verify()` → not safe | Block with reason shown to user |
 
-Intent strings prefer rich tool payload fields (`command`, `input`, `content`, `text`, `patch`, `script`) so `exec` / write calls carry enough context for `verify()`.
+Intent strings are built by `intent.ts`: tool name, then `path=` (basename) / `command=` first; `content≈` is a short preview only. The label is `path=`, not `file=` — the word `file` false-triggers rules like "never create a file named …".
 
 ### Receipts
 
-Source: OpenClaw gateway log at `/tmp/openclaw/openclaw-YYYY-MM-DD.log`
+**Use the clean JSONL file** (not the OpenClaw gateway envelope around `console.log`):
 
-Format: `[PDM GUARD] RECEIPT: {…}`
+```bash
+tail -1 /tmp/openclaw/pdm-guard-receipts.jsonl
+```
 
-Each receipt includes:
+Override path with `PDM_GUARD_RECEIPT_LOG` if needed.
 
-- `proposed_action`, `gate_status`, `governing_rules`
-- `tool_executed` — whether the host actually ran the tool
-- `resulting_state` — side-effect proof
-- `pdm_version`, `openclaw_version`, `timestamp`
+Each line is one compact object:
 
-| Outcome | When logged | `resulting_state` |
-|---------|-------------|-------------------|
-| **Blocked** | `before_tool_call` | `executed: false`, `side_effects: "none"` |
-| **Permitted / skipped** | `after_tool_call` | Real tool outcome (stdout, stderr, exit code when available) |
+| Field | Meaning |
+|-------|---------|
+| `time` | ISO timestamp of the gate decision |
+| `status` | `ALIGNED` / `CONFLICT` / `TORSION` / skip codes |
+| `tool` | Tool name |
+| `action` | Short intent (`write path=config.py`, …) |
+| `rules` | Active guard rules |
+| `executed` | Whether the host ran the tool |
+| `why` | Short explanation |
 
-Example block receipt:
+| Outcome | When logged |
+|---------|-------------|
+| **Blocked** | `before_tool_call` (`executed: false`) |
+| **Permitted / skipped** | `after_tool_call` (`executed: true`) |
+
+Example:
 
 ```json
-{
-  "gate_status": "TORSION",
-  "tool_executed": false,
-  "resulting_state": {
-    "executed": false,
-    "side_effects": "none",
-    "tool_name": "exec",
-    "detail": "tool call stopped at before_tool_call; host did not execute"
-  }
-}
+{"time":"2026-08-21T08:33:18.388Z","status":"TORSION","tool":"write","action":"write path=config.py","rules":["never create a file named config.py"],"executed":false,"why":"…contradicts Goal Anchor…"}
 ```
 
 ---
@@ -279,6 +284,7 @@ node --test plugins/tests/openclaw/*.test.mjs
 | `pdm-guard.js` | Runtime bundle loaded by OpenClaw |
 | `verify_bridge.py` | Reads `{intent, goals}` on stdin, calls `pdm_memory.verify()`, writes the report JSON to stdout |
 | `rules-store.ts` | Local rules file read/write with dedup |
+| `intent.ts` | Short deterministic intent strings (`file=` / `command=` first, tiny `content≈`) |
 | `receipt.ts` | Receipt helpers (`resulting_state`, block/complete builders) |
 | `openclaw.plugin.json` | Manifest (`activation.onCapabilities: ["hook", "tool"]`) |
 | `plugins/tests/openclaw/` | Node test suite |
