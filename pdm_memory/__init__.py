@@ -24,6 +24,7 @@ See README.md for full documentation.
 """
 
 from pdm_memory.core.alignment import verify
+from pdm_memory.core.math import MEMORY_SHAPE_KEY, SHAPE_HALF_LIVES
 from pdm_memory.core.signature import (
     ContraryEvidenceResult,
     DecaySnapshot,
@@ -45,9 +46,11 @@ __all__ = [
     "ContraryEvidenceResult",
     "DecaySnapshot",
     "DrawerInfo",
+    "MEMORY_SHAPE_KEY",
     "Memory",
     "MemoryHit",
     "RelationshipChannelResolution",
+    "SHAPE_HALF_LIVES",
     "SurfaceReport",
     "TorsionReport",
     "__version__",

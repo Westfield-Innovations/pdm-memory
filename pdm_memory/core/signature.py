@@ -205,7 +205,7 @@ class DecaySnapshot:
     """
     Live shape-aware decay state for one signature at a point in time.
 
-    Returned by ``Memory.decay(signature, now)``. Does not mutate storage.
+    Returned by ``Memory.decay_at(signature, now)``. Does not mutate storage.
     """
 
     memory_id: str

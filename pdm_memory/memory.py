@@ -38,7 +38,7 @@ import os
 from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, overload
+from typing import Any, Mapping
 
 from typing_extensions import Self
 
@@ -953,7 +953,7 @@ class Memory:
             updated.validation_prediction_correct,
             updated.validation_prediction_total,
         )
-        snap = self._decay_snapshot(updated)
+        snap = self.decay_at(updated)
         p_effective_after = snap.p_effective
 
         evidence_id: str | None = None
@@ -1343,44 +1343,17 @@ class Memory:
         )
         return report
 
-    @overload
-    def decay(self, *, dry_run: bool = False) -> dict[str, int]: ...
-
-    @overload
-    def decay(
-        self,
-        signature: SignatureRecord | str,
-        now: datetime | None = None,
-    ) -> DecaySnapshot: ...
-
-    def decay(
-        self,
-        signature: SignatureRecord | str | None = None,
-        now: datetime | None = None,
-        *,
-        dry_run: bool = False,
-    ) -> DecaySnapshot | dict[str, int]:
-        """
-        Compute live decay for one signature, or purge the store.
-
-        * ``decay(signature, now=None)`` → :class:`DecaySnapshot` (read-only).
-        * ``decay(dry_run=False)`` → purge signatures with live ``P_effective``
-          below the delete threshold (same half-life law as ``recall`` / ``explain``).
-
-        Purge does not rewrite ``p_magnitude``. ``decayed`` in the purge return
-        dict stays 0 for API compat.
-        """
-        if signature is not None:
-            return self._decay_snapshot(signature, now)
-
-        return self._purge_decay(dry_run=dry_run)
-
-    def _decay_snapshot(
+    def decay_at(
         self,
         signature: SignatureRecord | str,
         now: datetime | None = None,
     ) -> DecaySnapshot:
-        """Live shape-aware decay metrics for one signature (no storage writes)."""
+        """
+        Live shape-aware decay metrics for one signature (read-only).
+
+        Does not mutate storage. Uses the same half-life law as ``recall`` /
+        ``explain``. For store-wide purge, use :meth:`decay`.
+        """
         as_of = now or datetime.now(tz=timezone.utc)
         if isinstance(signature, SignatureRecord):
             rec = signature
@@ -1430,8 +1403,22 @@ class Memory:
             as_of=as_of,
         )
 
-    def _purge_decay(self, *, dry_run: bool = False) -> dict[str, int]:
-        """Delete signatures whose live ``P_effective`` is below threshold."""
+    def decay(self, dry_run: bool = False) -> dict[str, int]:
+        """
+        Purge memories whose live ``P_effective`` is below the delete threshold.
+
+        Uses the same half-life law as ``recall()`` / ``explain()``. Does not
+        rewrite ``p_magnitude``. ``decayed`` stays in the return dict for API
+        compat and is always 0.
+
+        For a single-memory live snapshot, use :meth:`decay_at`.
+
+        Args:
+            dry_run: If True, compute what would be deleted but make no writes.
+
+        Returns:
+            Dict with keys: decayed, deleted, skipped.
+        """
         records = self._storage.list(user=self._user, limit=10_000)
         now = datetime.now(tz=timezone.utc)
         counts = {"decayed": 0, "deleted": 0, "skipped": 0}

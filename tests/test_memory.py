@@ -481,6 +481,40 @@ class TestShapeAwareScoring:
         assert report.p_effective > 0
         assert report.memory_shape == "structural"
 
+    def test_ephemeral_fades_faster_than_structural(self, mem):
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(tz=timezone.utc)
+        age = timedelta(hours=4)
+
+        ephemeral_id = mem.save(
+            "User is busy with meetings",
+            tags=["status", "calendar", "availability"],
+            p_magnitude=80,
+            t_persistence=0,
+            shape="ephemeral",
+        )
+        structural_id = mem.save(
+            "User was born in Kyiv",
+            tags=["identity", "bio", "origin"],
+            p_magnitude=80,
+            t_persistence=0,
+            shape="structural",
+        )
+        past = now - age
+        mem._storage.update(
+            ephemeral_id, user="test_user", last_retrieved=past, created_at=past
+        )
+        mem._storage.update(
+            structural_id, user="test_user", last_retrieved=past, created_at=past
+        )
+
+        ephemeral = mem.decay_at(ephemeral_id, now=now)
+        structural = mem.decay_at(structural_id, now=now)
+        assert ephemeral.decay_factor > structural.decay_factor
+        assert structural.decay_factor == pytest.approx(0.0)
+        assert ephemeral.p_effective < structural.p_effective
+
 
 class TestSaveShapeAndDecaySnapshot:
     def test_save_shape_persists_in_metadata(self, mem):
@@ -513,7 +547,7 @@ class TestSaveShapeAndDecaySnapshot:
         rec = mem._storage.get(mid, user="test_user")
         assert rec.metadata[MEMORY_SHAPE_KEY] == "behavioral"
 
-    def test_decay_signature_returns_snapshot(self, mem):
+    def test_decay_at_returns_snapshot(self, mem):
         import math
         from datetime import datetime, timedelta, timezone
 
@@ -528,7 +562,7 @@ class TestSaveShapeAndDecaySnapshot:
         past = datetime.now(tz=timezone.utc) - timedelta(days=1000)
         mem._storage.update(mid, user="test_user", last_retrieved=past, created_at=past)
 
-        snap = mem.decay(mid, now=datetime.now(tz=timezone.utc))
+        snap = mem.decay_at(mid, now=datetime.now(tz=timezone.utc))
         assert isinstance(snap, DecaySnapshot)
         assert snap.memory_id == mid
         assert snap.shape == "structural"
