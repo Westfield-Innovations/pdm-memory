@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import builtins
 import logging
+import math
 import os
 from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime, timezone
@@ -948,7 +949,9 @@ class Memory:
             rec.validation_prediction_total,
         )
 
-        updated = self._apply_prediction_miss(rec, coupling_score=coupling_score)
+        updated = self._apply_prediction_miss(
+            rec, coupling_score=coupling_score, touch=False
+        )
         v_after = calculate_v(
             updated.validation_prediction_correct,
             updated.validation_prediction_total,
@@ -1000,11 +1003,17 @@ class Memory:
         rec: SignatureRecord,
         *,
         coupling_score: float = 0.5,
+        touch: bool = True,
     ) -> SignatureRecord:
         """
         Record a wrong prediction: Δp down, V total +1, correct unchanged.
 
         Does not modify ``compressed_fact`` or ``created_at``.
+
+        Args:
+            touch: When True (default, ``penalize``), bump ``last_retrieved``.
+                   When False (``apply_contrary_evidence``), leave the decay
+                   clock alone so live ``P_effective`` does not rebound.
         """
         delta = self._engine.compute_reinforcement_delta(
             rec.p_magnitude, rec.retrieval_count, coupling_score
@@ -1014,32 +1023,33 @@ class Memory:
             new_p, rec.t_persistence, rec.phase_privilege
         )
         new_total = (rec.validation_prediction_total or 0) + 1
-        now = datetime.now(tz=timezone.utc)
-        self._storage.update(
-            rec.id,
-            user=self._user,
-            p_magnitude=new_p,
-            effective_spike=new_spike,
-            retrieval_count=(rec.retrieval_count or 0) + 1,
-            last_retrieved=now,
-            validation_prediction_total=new_total,
-        )
+        fields: dict[str, Any] = {
+            "p_magnitude": new_p,
+            "effective_spike": new_spike,
+            "validation_prediction_total": new_total,
+        }
+        if touch:
+            now = datetime.now(tz=timezone.utc)
+            fields["retrieval_count"] = (rec.retrieval_count or 0) + 1
+            fields["last_retrieved"] = now
+        self._storage.update(rec.id, user=self._user, **fields)
         logger.debug(
-            "[PDM] prediction_miss(%s) Δp=-%.2f → P=%.1f  V_total=%d V_correct=%d",
+            "[PDM] prediction_miss(%s) Δp=-%.2f → P=%.1f  V_total=%d V_correct=%d touch=%s",
             rec.id,
             delta,
             new_p,
             new_total,
             rec.validation_prediction_correct or 0,
+            touch,
         )
         updated = self._storage.get(rec.id, user=self._user)
         if updated is None:
-            # Storage wrote successfully; reconstruct for callers if get races.
             rec.p_magnitude = new_p
             rec.effective_spike = new_spike
-            rec.retrieval_count = (rec.retrieval_count or 0) + 1
-            rec.last_retrieved = now
             rec.validation_prediction_total = new_total
+            if touch:
+                rec.retrieval_count = (rec.retrieval_count or 0) + 1
+                rec.last_retrieved = fields["last_retrieved"]
             return rec
         return updated
 
@@ -1356,13 +1366,14 @@ class Memory:
         """
         as_of = now or datetime.now(tz=timezone.utc)
         if isinstance(signature, SignatureRecord):
-            rec = signature
+            memory_id = signature.id
         else:
-            rec = self._storage.get(str(signature), user=self._user)
-            if rec is None:
-                raise KeyError(
-                    f"Memory '{signature}' not found for user '{self._user}'."
-                )
+            memory_id = str(signature)
+        rec = self._storage.get(memory_id, user=self._user)
+        if rec is None:
+            raise KeyError(
+                f"Memory '{memory_id}' not found for user '{self._user}'."
+            )
 
         days_since = self._days_since(rec.last_retrieved or rec.created_at, as_of)
         days_since_created = self._days_since(rec.created_at, as_of)
@@ -1473,6 +1484,8 @@ class Memory:
             return 0.0
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
         return max(0.0, (now - dt).total_seconds() / 86400.0)
 
     def _record_to_hit(self, rec: SignatureRecord) -> MemoryHit:
@@ -1837,7 +1850,12 @@ class Memory:
     ) -> SignatureRecord:
         resolved_tags = tags or []
         domain = infer_domain(resolved_tags)
-        eff_spike = calculate_effective_spike(p_magnitude, t_persistence, phase_privilege)
+        meta = self._metadata_with_shape(text, resolved_tags, metadata, shape)
+        resolved_shape = resolve_memory_shape(meta, resolved_tags, text)
+        # Shape half-life must not sit behind a longer grace window (e.g. default
+        # t_persistence=30 would block ephemeral 2h decay for a month).
+        resolved_t = self._clamp_persistence_to_shape(t_persistence, resolved_shape)
+        eff_spike = calculate_effective_spike(p_magnitude, resolved_t, phase_privilege)
 
         # Companion parity: a future deadline without event_at still needs an
         # event timestamp for temporal-window recall.
@@ -1850,7 +1868,7 @@ class Memory:
             compressed_fact=text,
             source=source,
             p_magnitude=p_magnitude,
-            t_persistence=t_persistence,
+            t_persistence=resolved_t,
             phase_privilege=phase_privilege,
             effective_spike=eff_spike,
             intent_tags=resolved_tags,
@@ -1860,7 +1878,7 @@ class Memory:
             decay_rate=0.9,
             t_deadline=deadline,
             t_event_at=resolved_event,
-            metadata=self._metadata_with_shape(text, resolved_tags, metadata, shape),
+            metadata=meta,
             idempotency_key=idempotency_key.strip() if idempotency_key else None,
         )
 
@@ -1870,6 +1888,24 @@ class Memory:
             allowed = ", ".join(sorted(SHAPE_HALF_LIVES))
             raise ValueError(f"Unknown memory shape '{shape}'. Expected one of: {allowed}")
         return shape
+
+    @classmethod
+    def _clamp_persistence_to_shape(
+        cls,
+        t_persistence: float,
+        shape: str | None,
+    ) -> float:
+        """Keep shape half-lives usable despite the default 30-day grace window."""
+        if not shape:
+            return t_persistence
+        half_life = SHAPE_HALF_LIVES.get(shape)
+        if half_life is None or not math.isfinite(half_life):
+            return t_persistence
+        if shape == "ephemeral":
+            # Status-like memories must start decaying immediately; a grace equal
+            # to T½ would push the first half-life out to ~4 hours.
+            return 0.0
+        return min(float(t_persistence), float(half_life))
 
     @classmethod
     def _metadata_with_shape(
@@ -1941,6 +1977,15 @@ class Memory:
             elif MEMORY_SHAPE_KEY in merged and merged[MEMORY_SHAPE_KEY] is not None:
                 self._validate_shape(str(merged[MEMORY_SHAPE_KEY]))
             fields["metadata"] = merged
+            resolved_shape = resolve_memory_shape(
+                merged,
+                tags if tags is not None else rec.intent_tags,
+                text if text is not None else rec.compressed_fact,
+            )
+            current_t = fields.get("t_persistence", rec.t_persistence)
+            clamped_t = self._clamp_persistence_to_shape(current_t, resolved_shape)
+            if clamped_t != current_t:
+                fields["t_persistence"] = clamped_t
         if deadline is not None:
             fields["t_deadline"] = deadline
         if event_at is not None:
