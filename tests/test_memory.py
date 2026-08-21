@@ -440,6 +440,46 @@ class TestMemoryDecay:
         assert after == before
 
 
+class TestShapeAwareScoring:
+    def test_explain_uses_ephemeral_half_life(self, mem):
+        from datetime import datetime, timedelta, timezone
+
+        from pdm_memory.core.math import MEMORY_SHAPE_KEY, SHAPE_HALF_LIVES
+
+        mid = mem.save(
+            "User is busy right now",
+            tags=["status", "calendar"],
+            p_magnitude=80,
+            t_persistence=0,
+            metadata={MEMORY_SHAPE_KEY: "ephemeral"},
+        )
+        past = datetime.now(tz=timezone.utc) - timedelta(
+            days=SHAPE_HALF_LIVES["ephemeral"]
+        )
+        mem._storage.update(mid, user="test_user", last_retrieved=past, created_at=past)
+        report = mem.explain(mid)
+        assert report.half_life_days == pytest.approx(2.0 / 24.0)
+        assert report.decay_factor == pytest.approx(0.5, abs=0.05)
+
+    def test_explain_structural_never_decays(self, mem):
+        from datetime import datetime, timedelta, timezone
+
+        from pdm_memory.core.math import MEMORY_SHAPE_KEY
+
+        mid = mem.save(
+            "User was born in Kyiv",
+            tags=["identity", "bio"],
+            p_magnitude=80,
+            t_persistence=0,
+            metadata={MEMORY_SHAPE_KEY: "structural"},
+        )
+        past = datetime.now(tz=timezone.utc) - timedelta(days=3650)
+        mem._storage.update(mid, user="test_user", last_retrieved=past, created_at=past)
+        report = mem.explain(mid)
+        assert report.decay_factor == pytest.approx(0.0)
+        assert report.p_effective > 0
+
+
 class TestMemoryExplain:
     def test_explain_returns_report(self, mem):
         mid = mem.save(

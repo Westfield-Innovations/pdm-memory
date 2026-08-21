@@ -42,9 +42,9 @@ from pdm_memory.core.math import (
     calculate_p_effective,
     calculate_temporal_geometry,
     calculate_v,
+    half_life_for_signature,
     infer_domain,
     infer_regime,
-    resolve_half_life,
 )
 from pdm_memory.core.signature import MemoryHit, SignatureRecord
 from pdm_memory.models import AlignmentReport, TorsionReport
@@ -358,10 +358,14 @@ class RetrievalEngine:
         effective_regime = regime or (infer_regime(query_tags) if query_tags else None)
 
         for rec in records:
-            # Live pressure: ONE law — domain half-life × (1 - decay_factor).
+            # Live pressure: ONE law — shape/domain half-life × (1 - decay_factor).
             # Do NOT mutate p_magnitude here (legacy incremental power-law removed).
-            domain_key = rec.domain or infer_domain(rec.intent_tags)
-            half_life = resolve_half_life(domain_key)
+            half_life = half_life_for_signature(
+                rec.domain,
+                intent_tags=rec.intent_tags,
+                metadata=rec.metadata,
+                text=rec.compressed_fact,
+            )
             days_since_touch = self._days_since(rec.last_retrieved or rec.created_at, now)
             days_since_created = self._days_since(rec.created_at, now)
             decay = calculate_decay_factor(

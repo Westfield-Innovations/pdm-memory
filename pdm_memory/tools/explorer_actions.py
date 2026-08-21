@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from datetime import datetime, timezone
 from typing import Any
@@ -15,8 +16,9 @@ from pdm_memory.core.math import (
     calculate_decay_factor,
     calculate_p_effective,
     calculate_v,
+    half_life_for_signature,
     infer_domain,
-    resolve_half_life,
+    resolve_memory_shape,
 )
 from pdm_memory.core.signature import SignatureRecord
 
@@ -48,8 +50,12 @@ def live_p_effective(
     extra_days: float = 0.0,
 ) -> float:
     """Live P_effective with optional forward projection in days."""
-    domain = rec.domain or infer_domain(rec.intent_tags)
-    half_life = resolve_half_life(domain)
+    half_life = half_life_for_signature(
+        rec.domain,
+        intent_tags=rec.intent_tags,
+        metadata=rec.metadata,
+        text=rec.compressed_fact,
+    )
     days_since_touch = _days_since(rec.last_retrieved or rec.created_at, now) + extra_days
     days_since_created = _days_since(rec.created_at, now) + extra_days
     decay = calculate_decay_factor(
@@ -71,6 +77,13 @@ def record_to_node(
 ) -> dict[str, Any]:
     """Serialize a signature for the Explorer graph."""
     domain = rec.domain or infer_domain(rec.intent_tags)
+    shape = resolve_memory_shape(rec.metadata, rec.intent_tags, rec.compressed_fact)
+    half_life = half_life_for_signature(
+        rec.domain,
+        intent_tags=rec.intent_tags,
+        metadata=rec.metadata,
+        text=rec.compressed_fact,
+    )
     p_eff = live_p_effective(rec, now, extra_days=extra_days)
     return {
         "id": rec.id,
@@ -81,10 +94,11 @@ def record_to_node(
         "torsion_status": torsion_status,
         "drawer": rec.drawer_domain,
         "domain": domain,
+        "memory_shape": shape,
         "source": rec.source,
         "retrieval_count": rec.retrieval_count,
         "t_persistence": float(rec.t_persistence),
-        "half_life": resolve_half_life(domain),
+        "half_life": None if not math.isfinite(half_life) else float(half_life),
         "days_since_touch": round(
             _days_since(rec.last_retrieved or rec.created_at, now), 2
         ),

@@ -467,3 +467,19 @@ def resolve_memory_shape(
         if isinstance(raw, str) and raw in SHAPE_HALF_LIVES:
             return raw
     return infer_shape(tags, text)
+
+
+def half_life_for_signature(
+    domain: str | None = None,
+    *,
+    intent_tags: list[str] | None = None,
+    metadata: Mapping[str, Any] | None = None,
+    text: str = "",
+) -> float:
+    """
+    Half-life days for a stored signature: shape overrides domain when present.
+    """
+    tags = list(intent_tags or [])
+    shape = resolve_memory_shape(metadata, tags, text)
+    domain_key = domain or infer_domain(tags)
+    return resolve_half_life(domain_key, shape=shape)

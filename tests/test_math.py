@@ -22,6 +22,7 @@ from pdm_memory.core.math import (
     infer_shape,
     resolve_half_life,
     resolve_memory_shape,
+    half_life_for_signature,
 )
 
 
@@ -151,6 +152,32 @@ class TestShapeInference:
 
     def test_infer_when_metadata_absent(self):
         assert resolve_memory_shape(tags=["temporary"]) == "ephemeral"
+
+
+class TestHalfLifeForSignature:
+    def test_domain_only(self):
+        assert half_life_for_signature("market_signal") == 1.0
+
+    def test_metadata_shape_overrides_domain(self):
+        hl = half_life_for_signature(
+            "market_signal",
+            metadata={MEMORY_SHAPE_KEY: "ephemeral"},
+        )
+        assert hl == pytest.approx(2.0 / 24.0)
+
+    def test_inferred_structural_from_text(self):
+        hl = half_life_for_signature(
+            "insight",
+            text="user was born in Kyiv",
+        )
+        assert math.isinf(hl)
+
+    def test_inferred_behavioral_from_tags(self):
+        hl = half_life_for_signature(
+            "warning",
+            intent_tags=["habit", "python"],
+        )
+        assert hl == 90.0
 
 
 class TestValidationCoefficient:

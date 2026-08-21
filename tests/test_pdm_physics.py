@@ -19,8 +19,7 @@ from pdm_memory.core.math import (
     calculate_intent_weight,
     calculate_p_effective,
     calculate_v,
-    infer_domain,
-    resolve_half_life,
+    half_life_for_signature,
 )
 from pdm_memory.core.retrieval import RetrievalEngine
 
@@ -52,8 +51,12 @@ def _live_p_effective(rec, *, now: datetime | None = None, query: str | None = N
 
     days_since = max(0.0, (now - anchor).total_seconds() / 86400.0)
     days_since_created = max(0.0, (now - created).total_seconds() / 86400.0)
-    domain = rec.domain or infer_domain(rec.intent_tags)
-    half_life = resolve_half_life(domain)
+    half_life = half_life_for_signature(
+        rec.domain,
+        intent_tags=rec.intent_tags,
+        metadata=rec.metadata,
+        text=rec.compressed_fact,
+    )
     decay = calculate_decay_factor(
         days_since,
         half_life,

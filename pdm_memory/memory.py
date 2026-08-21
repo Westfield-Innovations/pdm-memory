@@ -50,8 +50,8 @@ from pdm_memory.core.math import (
     calculate_intent_weight,
     calculate_p_effective,
     calculate_v,
+    half_life_for_signature,
     infer_domain,
-    resolve_half_life,
 )
 from pdm_memory.core.retrieval import DEFAULT_DIVERSITY_BIAS, RetrievalEngine
 from pdm_memory.core.signature import (
@@ -1177,8 +1177,12 @@ class Memory:
         for rec in records:
             days_since_touch = self._days_since(rec.last_retrieved or rec.created_at, now)
             days_since_created = self._days_since(rec.created_at, now)
-            domain = rec.domain or infer_domain(rec.intent_tags)
-            half_life = resolve_half_life(domain)
+            half_life = half_life_for_signature(
+                rec.domain,
+                intent_tags=rec.intent_tags,
+                metadata=rec.metadata,
+                text=rec.compressed_fact,
+            )
             decay = calculate_decay_factor(
                 days_since_touch,
                 half_life,
@@ -1226,8 +1230,12 @@ class Memory:
         now = datetime.now(tz=timezone.utc)
         days_since = self._days_since(rec.last_retrieved or rec.created_at, now)
         days_since_created = self._days_since(rec.created_at, now)
-        domain = rec.domain or infer_domain(rec.intent_tags)
-        half_life = resolve_half_life(domain)
+        half_life = half_life_for_signature(
+            rec.domain,
+            intent_tags=rec.intent_tags,
+            metadata=rec.metadata,
+            text=rec.compressed_fact,
+        )
         decay = calculate_decay_factor(
             days_since,
             half_life,
@@ -1315,7 +1323,12 @@ class Memory:
         days_since_created = self._days_since(rec.created_at, now)
 
         domain = rec.domain or infer_domain(rec.intent_tags)
-        half_life = resolve_half_life(domain)
+        half_life = half_life_for_signature(
+            rec.domain,
+            intent_tags=rec.intent_tags,
+            metadata=rec.metadata,
+            text=rec.compressed_fact,
+        )
         decay = calculate_decay_factor(
             days_since,
             half_life,
