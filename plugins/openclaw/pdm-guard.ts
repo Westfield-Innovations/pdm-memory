@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
+import { buildIntentText } from "./intent";
 import {
   buildBlockedReceipt,
   buildCompletedReceipt,
@@ -108,31 +109,6 @@ interface VerifyResponse {
   is_safe_to_act: boolean;
   explanation: string;
   conflicting_goals: string[];
-}
-
-function buildIntentText(toolName: string, params: Record<string, unknown>): string {
-  const summarize = (value: unknown, maxLen = 500): string => {
-    try {
-      if (typeof value === "string") return value.slice(0, maxLen);
-      return JSON.stringify(value).slice(0, maxLen);
-    } catch {
-      return String(value).slice(0, maxLen);
-    }
-  };
-
-  const richFields = ["command", "input", "content", "text", "patch", "script"];
-  for (const field of richFields) {
-    const value = params[field];
-    if (typeof value === "string" && value.trim()) {
-      return `${toolName} (${field}=${summarize(value, 1200)})`;
-    }
-  }
-
-  const paramSummary = Object.entries(params)
-    .slice(0, 8)
-    .map(([k, v]) => `${k}=${summarize(v, 240)}`)
-    .join(", ");
-  return paramSummary ? `${toolName} (${paramSummary})` : toolName;
 }
 
 function resolveRulesFilePath(cfg: Partial<PluginConfig>): string {
@@ -241,13 +217,13 @@ async function callVerifyFunction(
   });
 }
 
-function formatRulesText(filePath: string, file: GuardRulesFile): string {
+function formatRulesText(_filePath: string, file: GuardRulesFile): string {
   const goals = goalTextsFromFile(file);
   if (!goals.length) {
-    return `No guard rules in ${filePath}.\nAdd one: /pdm-guard add never hardcode localhost`;
+    return "No guard rules.\nAdd one: /pdm-guard add <rule>";
   }
   const lines = goals.map((text, i) => `${i + 1}. ${text}`);
-  return `Guard rules (${filePath}):\n${lines.join("\n")}`;
+  return `Guard rules:\n${lines.join("\n")}`;
 }
 
 function guardRuleToolResult(details: Record<string, unknown>): ToolExecuteResult {

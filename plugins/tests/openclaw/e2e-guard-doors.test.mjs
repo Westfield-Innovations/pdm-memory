@@ -72,7 +72,7 @@ test("openclaw e2e: rules file add/remove/list", async () => {
 });
 
 test("openclaw e2e: block localhost / permit unrelated rule (direct verify() call)", async () => {
-  const intent = "exec (command=curl http://localhost:8080/api/health)";
+  const intent = "exec command=curl http://localhost:8080/api/health";
 
   const withLocalhost = await verifyIntent(intent, ["never hardcode localhost"]);
   assert.equal(withLocalhost.allowed, false);

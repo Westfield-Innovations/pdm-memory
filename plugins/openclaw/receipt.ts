@@ -1,12 +1,30 @@
+import { appendFileSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+
 /**
  * Receipt helpers for PDM Guard — one complete record per gate decision.
  *
  * Blocked tools log immediately (no after_tool_call). Allowed/skipped tools
  * defer resulting_state until after_tool_call observes the real outcome.
+ *
+ * Demo-friendly lines go to /tmp/openclaw/pdm-guard-receipts.jsonl (one JSON
+ * object per line). Gateway console.log is only a short breadcrumb — OpenClaw
+ * wraps console output in a large envelope that is awkward to show on camera.
  */
 
 export const OPENCLAW_VERSION = "2026.7.1-2";
 export const PDM_VERSION = "0.2.4";
+
+/** Clean JSONL receipt log (not the OpenClaw gateway envelope). */
+export const DEFAULT_RECEIPT_LOG = join("/tmp", "openclaw", "pdm-guard-receipts.jsonl");
+
+/** Fallback if /tmp is unavailable — same dir as rules. */
+export const FALLBACK_RECEIPT_LOG = join(
+  homedir(),
+  ".openclaw",
+  "pdm-guard-receipts.jsonl",
+);
 
 export interface Receipt {
   timestamp: string;
@@ -56,9 +74,41 @@ export interface AfterToolCallEvent {
 }
 
 const MAX_TEXT = 2000;
+const LOG_ACTION_MAX = 72;
+const LOG_WHY_MAX = 100;
 
 function clip(text: string, maxLen = MAX_TEXT): string {
   return text.length <= maxLen ? text : `${text.slice(0, maxLen - 1)}…`;
+}
+
+/** Prefer `write path=config.py` / `exec command=curl…` over full intent. */
+export function compactAction(proposedAction: string): string {
+  const pathMatch = proposedAction.match(/^(\S+)\s+path=(\S+)/);
+  if (pathMatch) {
+    return clip(`${pathMatch[1]} path=${pathMatch[2]}`, LOG_ACTION_MAX);
+  }
+  const fileMatch = proposedAction.match(/^(\S+)\s+file=(\S+)/);
+  if (fileMatch) {
+    return clip(`${fileMatch[1]} path=${fileMatch[2]}`, LOG_ACTION_MAX);
+  }
+  const cmdMatch = proposedAction.match(/^(\S+)\s+command=(.+)$/s);
+  if (cmdMatch) {
+    return clip(`${cmdMatch[1]} command=${cmdMatch[2].trim()}`, LOG_ACTION_MAX);
+  }
+  return clip(proposedAction, LOG_ACTION_MAX);
+}
+
+/** Compact fields for the clean receipt JSONL / demos. */
+export function toReceiptLog(receipt: Receipt): Record<string, unknown> {
+  return {
+    time: receipt.timestamp,
+    status: receipt.gate_status,
+    tool: receipt.resulting_state.tool_name,
+    action: compactAction(receipt.proposed_action),
+    rules: receipt.governing_rules,
+    executed: receipt.tool_executed,
+    why: clip(receipt.explanation, LOG_WHY_MAX),
+  };
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -227,6 +277,53 @@ export function buildCompletedReceipt(
   };
 }
 
+function resolveReceiptLogPath(): string {
+  const fromEnv = process.env.PDM_GUARD_RECEIPT_LOG?.trim();
+  if (fromEnv) {
+    if (fromEnv.startsWith("~/")) {
+      return join(homedir(), fromEnv.slice(2));
+    }
+    return fromEnv;
+  }
+  return DEFAULT_RECEIPT_LOG;
+}
+
+/** Create the receipt log (and parent dir) if missing — call on plugin register. */
+export function ensureReceiptLog(path = resolveReceiptLogPath()): string {
+  mkdirSync(dirname(path), { recursive: true });
+  appendFileSync(path, "", "utf8");
+  return path;
+}
+
+function appendReceiptLine(file: string, line: string): void {
+  mkdirSync(dirname(file), { recursive: true });
+  appendFileSync(file, line, "utf8");
+}
+
+/**
+ * Append one clean JSON object to the receipt JSONL file.
+ * Gateway console gets a short breadcrumb only (OpenClaw envelopes console.log).
+ */
 export function logReceipt(receipt: Receipt): void {
-  console.log(`[PDM GUARD] RECEIPT: ${JSON.stringify(receipt)}`);
+  const row = toReceiptLog(receipt);
+  const line = `${JSON.stringify(row)}\n`;
+  const primary = resolveReceiptLogPath();
+
+  try {
+    appendReceiptLine(primary, line);
+  } catch (err) {
+    console.log(`[PDM GUARD] receipt log write failed (${primary}): ${err}`);
+    if (primary !== FALLBACK_RECEIPT_LOG) {
+      try {
+        appendReceiptLine(FALLBACK_RECEIPT_LOG, line);
+        console.log(`[PDM GUARD] receipt log fell back to ${FALLBACK_RECEIPT_LOG}`);
+      } catch (err2) {
+        console.log(`[PDM GUARD] receipt log fallback failed (${FALLBACK_RECEIPT_LOG}): ${err2}`);
+      }
+    }
+  }
+
+  console.log(
+    `[PDM GUARD] ${row.status} ${row.tool} executed=${row.executed} · ${row.action}`,
+  );
 }

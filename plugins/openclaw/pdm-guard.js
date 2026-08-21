@@ -1,15 +1,112 @@
 // pdm-guard.ts
 import { spawn } from "node:child_process";
-import { dirname as dirname2, join as join2 } from "node:path";
+import { dirname as dirname3, join as join3 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
+// intent.ts
+var PATH_KEYS = ["path", "file", "filename", "file_path", "filepath", "target"];
+var COMMAND_KEYS = ["command", "cmd"];
+var CONTENT_KEYS = ["content", "text", "patch", "script", "input"];
+var CONTENT_PREVIEW_MAX = 120;
+var COMMAND_MAX = 800;
+var INTENT_MAX = 1e3;
+function asNonEmptyString(value) {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  return trimmed ? trimmed : "";
+}
+function basename(path) {
+  const normalized = path.replace(/\\/g, "/");
+  const parts = normalized.split("/").filter(Boolean);
+  return parts[parts.length - 1] || path;
+}
+function firstString(params, keys) {
+  for (const key of keys) {
+    const value = asNonEmptyString(params[key]);
+    if (value) return value;
+  }
+  return "";
+}
+function clip(value, maxLen) {
+  if (value.length <= maxLen) return value;
+  return `${value.slice(0, Math.max(0, maxLen - 1))}\u2026`;
+}
+function buildIntentText(toolName, params = {}) {
+  const tool = asNonEmptyString(toolName) || "unknown_tool";
+  const parts = [tool];
+  const path = firstString(params, PATH_KEYS);
+  if (path) {
+    parts.push(`path=${basename(path)}`);
+  }
+  const command = firstString(params, COMMAND_KEYS);
+  if (command) {
+    parts.push(`command=${clip(command, COMMAND_MAX)}`);
+  } else {
+    const content = firstString(params, CONTENT_KEYS);
+    if (content) {
+      parts.push(`content\u2248${clip(content, CONTENT_PREVIEW_MAX)}`);
+    }
+  }
+  if (parts.length === 1) {
+    const leftovers = Object.entries(params).filter(([, v]) => v !== void 0 && v !== null && v !== "").slice(0, 6).map(([k, v]) => {
+      try {
+        const raw = typeof v === "string" ? v : JSON.stringify(v);
+        return `${k}=${clip(raw, 80)}`;
+      } catch {
+        return `${k}=${clip(String(v), 80)}`;
+      }
+    });
+    if (leftovers.length) {
+      parts.push(...leftovers);
+    }
+  }
+  return clip(parts.join(" "), INTENT_MAX);
+}
+
 // receipt.ts
+import { appendFileSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 var OPENCLAW_VERSION = "2026.7.1-2";
 var PDM_VERSION = "0.2.4";
+var DEFAULT_RECEIPT_LOG = join("/tmp", "openclaw", "pdm-guard-receipts.jsonl");
+var FALLBACK_RECEIPT_LOG = join(
+  homedir(),
+  ".openclaw",
+  "pdm-guard-receipts.jsonl"
+);
 var MAX_TEXT = 2e3;
-function clip(text, maxLen = MAX_TEXT) {
+var LOG_ACTION_MAX = 72;
+var LOG_WHY_MAX = 100;
+function clip2(text, maxLen = MAX_TEXT) {
   return text.length <= maxLen ? text : `${text.slice(0, maxLen - 1)}\u2026`;
+}
+function compactAction(proposedAction) {
+  const pathMatch = proposedAction.match(/^(\S+)\s+path=(\S+)/);
+  if (pathMatch) {
+    return clip2(`${pathMatch[1]} path=${pathMatch[2]}`, LOG_ACTION_MAX);
+  }
+  const fileMatch = proposedAction.match(/^(\S+)\s+file=(\S+)/);
+  if (fileMatch) {
+    return clip2(`${fileMatch[1]} path=${fileMatch[2]}`, LOG_ACTION_MAX);
+  }
+  const cmdMatch = proposedAction.match(/^(\S+)\s+command=(.+)$/s);
+  if (cmdMatch) {
+    return clip2(`${cmdMatch[1]} command=${cmdMatch[2].trim()}`, LOG_ACTION_MAX);
+  }
+  return clip2(proposedAction, LOG_ACTION_MAX);
+}
+function toReceiptLog(receipt) {
+  return {
+    time: receipt.timestamp,
+    status: receipt.gate_status,
+    tool: receipt.resulting_state.tool_name,
+    action: compactAction(receipt.proposed_action),
+    rules: receipt.governing_rules,
+    executed: receipt.tool_executed,
+    why: clip2(receipt.explanation, LOG_WHY_MAX)
+  };
 }
 function asRecord(value) {
   if (value == null || typeof value !== "object" || Array.isArray(value)) {
@@ -45,7 +142,7 @@ function summarizeToolOutcome(toolName, result, error) {
         exit_code: null,
         stdout: null,
         stderr: null,
-        error: clip(error),
+        error: clip2(error),
         detail: "tool reported error after gate allowed execution"
       },
       toolResult: null
@@ -64,9 +161,9 @@ function summarizeToolOutcome(toolName, result, error) {
           side_effects: "observed",
           tool_name: toolName,
           exit_code: exitCode,
-          stdout: stdout != null ? clip(stdout) : null,
-          stderr: stderr != null ? clip(stderr) : null,
-          error: nestedError != null ? clip(nestedError) : null,
+          stdout: stdout != null ? clip2(stdout) : null,
+          stderr: stderr != null ? clip2(stderr) : null,
+          error: nestedError != null ? clip2(nestedError) : null,
           detail: "exec side-effect observed"
         },
         toolResult: result
@@ -88,7 +185,7 @@ function summarizeToolOutcome(toolName, result, error) {
       toolResult: null
     };
   }
-  const serialized = typeof result === "string" ? clip(result) : clip(JSON.stringify(result));
+  const serialized = typeof result === "string" ? clip2(result) : clip2(JSON.stringify(result));
   return {
     state: {
       executed: true,
@@ -152,24 +249,57 @@ function buildCompletedReceipt(pending, event) {
     duration_ms: event.durationMs ?? null
   };
 }
+function resolveReceiptLogPath() {
+  const fromEnv = process.env.PDM_GUARD_RECEIPT_LOG?.trim();
+  if (fromEnv) {
+    if (fromEnv.startsWith("~/")) {
+      return join(homedir(), fromEnv.slice(2));
+    }
+    return fromEnv;
+  }
+  return DEFAULT_RECEIPT_LOG;
+}
+function appendReceiptLine(file, line) {
+  mkdirSync(dirname(file), { recursive: true });
+  appendFileSync(file, line, "utf8");
+}
 function logReceipt(receipt) {
-  console.log(`[PDM GUARD] RECEIPT: ${JSON.stringify(receipt)}`);
+  const row = toReceiptLog(receipt);
+  const line = `${JSON.stringify(row)}
+`;
+  const primary = resolveReceiptLogPath();
+  try {
+    appendReceiptLine(primary, line);
+  } catch (err) {
+    console.log(`[PDM GUARD] receipt log write failed (${primary}): ${err}`);
+    if (primary !== FALLBACK_RECEIPT_LOG) {
+      try {
+        appendReceiptLine(FALLBACK_RECEIPT_LOG, line);
+        console.log(`[PDM GUARD] receipt log fell back to ${FALLBACK_RECEIPT_LOG}`);
+      } catch (err2) {
+        console.log(`[PDM GUARD] receipt log fallback failed (${FALLBACK_RECEIPT_LOG}): ${err2}`);
+      }
+    }
+  }
+  console.log(
+    `[PDM GUARD] ${row.status} ${row.tool} executed=${row.executed} \xB7 ${row.action}`
+  );
 }
 
 // rules-store.ts
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { homedir as homedir2 } from "node:os";
+import { dirname as dirname2, join as join2 } from "node:path";
 var RULES_FILE_VERSION = 1;
 var GUARD_RULE_MAX_LEN = 500;
-var DEFAULT_RULES_FILE = join(homedir(), ".openclaw", "pdm-guard-rules.json");
+var DEFAULT_RULES_FILE = join2(homedir2(), ".openclaw", "pdm-guard-rules.json");
 var cachedPath = null;
 var cachedMtimeMs = -1;
 var cachedFile = null;
 function expandHome(path) {
-  if (path === "~") return homedir();
-  if (path.startsWith("~/")) return join(homedir(), path.slice(2));
+  if (path === "~") return homedir2();
+  if (path.startsWith("~/")) return join2(homedir2(), path.slice(2));
   return path;
 }
 function normalizeGuardRule(rule) {
@@ -188,7 +318,7 @@ function findRuleIndex(rules, normalized) {
   return rules.findIndex((entry) => normalizeGuardRule(entry.text) === normalized);
 }
 async function ensureParentDir(filePath) {
-  await mkdir(dirname(filePath), { recursive: true });
+  await mkdir(dirname2(filePath), { recursive: true });
 }
 async function writeRulesFileAtomic(filePath, file) {
   await ensureParentDir(filePath);
@@ -305,27 +435,8 @@ async function listGuardRules(filePath) {
 // pdm-guard.ts
 var DEFAULT_PYTHON_BIN = "python3";
 var GUARD_RULE_TOOL = "pdm_guard_rule";
-var PLUGIN_DIR = dirname2(fileURLToPath(import.meta.url));
-var VERIFY_BRIDGE_SCRIPT = join2(PLUGIN_DIR, "verify_bridge.py");
-function buildIntentText(toolName, params) {
-  const summarize = (value, maxLen = 500) => {
-    try {
-      if (typeof value === "string") return value.slice(0, maxLen);
-      return JSON.stringify(value).slice(0, maxLen);
-    } catch {
-      return String(value).slice(0, maxLen);
-    }
-  };
-  const richFields = ["command", "input", "content", "text", "patch", "script"];
-  for (const field of richFields) {
-    const value = params[field];
-    if (typeof value === "string" && value.trim()) {
-      return `${toolName} (${field}=${summarize(value, 1200)})`;
-    }
-  }
-  const paramSummary = Object.entries(params).slice(0, 8).map(([k, v]) => `${k}=${summarize(v, 240)}`).join(", ");
-  return paramSummary ? `${toolName} (${paramSummary})` : toolName;
-}
+var PLUGIN_DIR = dirname3(fileURLToPath(import.meta.url));
+var VERIFY_BRIDGE_SCRIPT = join3(PLUGIN_DIR, "verify_bridge.py");
 function resolveRulesFilePath(cfg) {
   const fromCfg = cfg.rulesFile?.trim();
   if (fromCfg) return expandHome(fromCfg);
@@ -410,14 +521,13 @@ async function callVerifyFunction(pythonBin, scriptPath, intent, goals, timeoutM
     child.stdin?.end();
   });
 }
-function formatRulesText(filePath, file) {
+function formatRulesText(_filePath, file) {
   const goals = goalTextsFromFile(file);
   if (!goals.length) {
-    return `No guard rules in ${filePath}.
-Add one: /pdm-guard add never hardcode localhost`;
+    return "No guard rules.\nAdd one: /pdm-guard add <rule>";
   }
   const lines = goals.map((text, i) => `${i + 1}. ${text}`);
-  return `Guard rules (${filePath}):
+  return `Guard rules:
 ${lines.join("\n")}`;
 }
 function guardRuleToolResult(details) {
