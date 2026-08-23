@@ -11,7 +11,7 @@ Quick start (local mode):
     from pdm_memory import Memory
 
     mem = Memory(store="./my_app.db")
-    mem.save("User prefers metric units", source="chat", tags=["units", "formatting"])
+    mem.save("User prefers metric units", source="manual", tags=["units", "formatting"])
     hits = mem.recall("how should I format the response?", k=5)
 
     for h in hits:
@@ -217,7 +217,7 @@ class Memory:
     def save(
         self,
         text: str,
-        source: str = "chat",
+        source: str = "manual",
         tags: builtins.list[str] | None = None,
         p_magnitude: float = 50.0,
         t_persistence: float = 30.0,
@@ -241,7 +241,8 @@ class Memory:
 
         Args:
             text:           The memory content (max 500 chars recommended).
-            source:         Origin label: "chat", "manual", "csv", etc.
+            source:         Origin label: "manual", "azus_chat", "csv", etc.
+                            Use ``azus_chat`` only for Companion chat extract.
             tags:           Intent tags (3+ recommended for best retrieval).
             p_magnitude:    Initial pressure / importance (0–100).
             t_persistence:  Days this memory stays relevant before decaying.
@@ -1835,7 +1836,7 @@ class Memory:
         self,
         text: str,
         *,
-        source: str = "chat",
+        source: str = "manual",
         tags: builtins.list[str] | None = None,
         p_magnitude: float = 50.0,
         t_persistence: float = 30.0,

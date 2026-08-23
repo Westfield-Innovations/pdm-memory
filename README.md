@@ -60,7 +60,7 @@ mem = Memory(store="./my_app_memory.db")
 
 # Write: PDM assigns pressure and stores a signature.
 # Optional shape: ephemeral (2h) / behavioral (90d) / structural (∞).
-mem.save("User prefers metric units and short answers", source="chat",
+mem.save("User prefers metric units and short answers", source="manual",
          tags=["units", "formatting", "preferences"], p_magnitude=85,
          shape="behavioral")
 

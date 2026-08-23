@@ -128,7 +128,7 @@ def main() -> None:
             tags=["ui", "theme", "preferences"],
             drawer="preferences",
             p_magnitude=55,
-            source="chat",
+            source="manual",
         )
 
         section("2. Dangerous intent → expect TORSION")

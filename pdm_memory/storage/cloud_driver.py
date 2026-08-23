@@ -49,16 +49,18 @@ _API_INTENT_TAGS_MIN = 3
 _API_SOURCES = frozenset(
     {
         "azus_chat",
+        "companion_app",
         "junior_clipboard",
         "slack",
         "manual",
         "docvault",
         "operator_accumulation",
         "autonomous_web",
+        "resonance_mesh",
         "contrary_evidence",
     }
 )
-_API_DEFAULT_SOURCE = "azus_chat"
+_API_DEFAULT_SOURCE = "manual"
 # companion_api.pdm.signature_mutations.PATCHABLE_FIELDS — only these may appear
 # in PATCH / batch-update. Client-derived fields not on the allowlist (e.g.
 # effective_spike) are stripped; the API recomputes them server-side.
@@ -809,7 +811,8 @@ class CloudDriver(BaseStorage):
         """Map SDK source to a Companion SOURCE_CHOICES value."""
         if source and source in _API_SOURCES:
             return source
-        # SDK legacy default "chat" and any unknown label → azus_chat
+        # SDK legacy "chat" / unknown labels → manual (not azus_chat —
+        # that label is only for real Companion chat provenance).
         return _API_DEFAULT_SOURCE
 
     @classmethod
@@ -839,7 +842,7 @@ class CloudDriver(BaseStorage):
         on our side.
 
         Validates Companion invariants (tags count, p_magnitude range) and
-        maps SDK source labels (e.g. chat) to azus_chat when needed.
+        maps unknown SDK source labels (e.g. chat) to manual when needed.
         """
         cls._validate_ingest_record(sig)
 
@@ -943,7 +946,7 @@ class CloudDriver(BaseStorage):
         kwargs: dict[str, Any] = {
             "user": str(data.get("user", "default")),
             "compressed_fact": data.get("compressed_fact", ""),
-            "source": data.get("source", "chat"),
+            "source": data.get("source", "manual"),
             "p_magnitude": float(data.get("p_magnitude", 50.0)),
             "t_persistence": float(data.get("t_persistence", 30.0)),
             "phase_privilege": float(data.get("phase_privilege", 1.0)),

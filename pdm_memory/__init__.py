@@ -15,7 +15,7 @@ The public surface of the SDK:
     from pdm_memory import Memory
 
     mem = Memory(store="./my_app.db")
-    mem.save("User prefers metric units", source="chat")
+    mem.save("User prefers metric units", source="manual")
     hits = mem.recall("how should I format this?", k=5)
 
     from pdm_memory.integrations import wrap_openai, wrap_anthropic

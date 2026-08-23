@@ -34,7 +34,7 @@ class SignatureRecord:
 
     # Content
     compressed_fact: str = ""          # The memory text (≤ 500 chars)
-    source: str = "chat"               # Where it came from: chat, manual, csv, …
+    source: str = "manual"             # Where it came from: manual, azus_chat, csv, …
 
     # PDM pressure fields
     p_magnitude: float = 50.0         # Importance (0–100)
