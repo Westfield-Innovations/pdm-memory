@@ -55,7 +55,7 @@ _API_SOURCES = frozenset(
         "docvault",
         "operator_accumulation",
         "autonomous_web",
-        "companion_app",
+        "contrary_evidence",
     }
 )
 _API_DEFAULT_SOURCE = "azus_chat"
@@ -81,6 +81,7 @@ _API_PATCHABLE_FIELDS = frozenset(
         "is_complete",
         "validation_prediction_total",
         "validation_prediction_correct",
+        "metadata",
     }
 )
 _API_PATCH_DATETIME_FIELDS = frozenset(
