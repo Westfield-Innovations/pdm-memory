@@ -50,6 +50,8 @@ __all__ = [
     "SourceEventRecord",
     "SupportsEvents",
     "apply_event_migrations",
+    "apply_event_migrations_postgres",
+    "apply_event_migrations_sqlite",
     "compute_content_hash",
 ]
 
@@ -144,8 +146,15 @@ class SourceEventRecord:
     capture_authority_state: str = "unknown"
     compliance_state: str = "unknown"
 
+    # Whether the caller told us when this happened, as opposed to us filling
+    # the column in. Not persisted — it only decides what goes into the hash.
+    occurred_at_known: bool = field(
+        init=False, repr=False, compare=False, default=False
+    )
+
     def __post_init__(self) -> None:
         now = _now()
+        self.occurred_at_known = self.occurred_at is not None
         if self.occurred_at is None:
             self.occurred_at = now
         if self.observed_at is None:
@@ -154,11 +163,20 @@ class SourceEventRecord:
             self.ingested_at = now
 
     def ensure_content_hash(self, *, payload: str = "") -> str:
-        """Fill ``content_hash`` from the canonical contract if it is empty."""
+        """
+        Fill ``content_hash`` from the canonical contract if it is empty.
+
+        A defaulted ``occurred_at`` is held out of the hash. The column still
+        gets a value, because a row needs one, but our own clock must never
+        decide identity: ingesting one chat message twice would otherwise
+        produce two events a millisecond apart, and AC1 would fail on the most
+        ordinary path there is — the caller who does not know, or care, exactly
+        when the thing happened.
+        """
         if not self.content_hash:
             self.content_hash = compute_content_hash(
                 event_type=self.event_type,
-                occurred_at=self.occurred_at,
+                occurred_at=self.occurred_at if self.occurred_at_known else None,
                 source_system=self.source_system,
                 raw_reference=self.raw_reference,
                 payload=payload,
@@ -503,7 +521,7 @@ TRIGGERS_EVENTS_SQLITE = (
 # ---------------------------------------------------------------------------
 
 
-def apply_event_migrations(conn: Any) -> None:
+def apply_event_migrations_sqlite(conn: Any) -> None:
     """
     Create the evidence tables on a new or existing SQLite database.
 
@@ -520,7 +538,11 @@ def apply_event_migrations(conn: Any) -> None:
 
     conn.executescript(SIGNATURE_EVENT_INDEXES_SQLITE)
     conn.executescript(TRIGGERS_EVENTS_SQLITE)
-    logger.debug("[PDM-Events] Evidence tables ready")
+    logger.debug("[PDM-Events] Evidence tables ready (sqlite)")
+
+
+# The SQLite path is the default one the name refers to.
+apply_event_migrations = apply_event_migrations_sqlite
 
 
 # ---------------------------------------------------------------------------
@@ -635,3 +657,154 @@ def mention_insert_row(mention: EntityMentionRecord) -> tuple[Any, ...]:
         _iso(mention.resolved_at),
         mention.confidence,
     )
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL dialect
+# ---------------------------------------------------------------------------
+#
+# ``user`` is a reserved word here and must be quoted in every occurrence. The
+# stock schema already keeps two strings for exactly this reason; a single
+# shared DDL does not survive contact with both databases.
+
+SCHEMA_EVENTS_POSTGRES = """
+CREATE TABLE IF NOT EXISTS pdm_source_events (
+    id                       TEXT PRIMARY KEY,
+    "user"                   TEXT NOT NULL DEFAULT 'default',
+    event_type               TEXT NOT NULL,
+    occurred_at              TEXT NOT NULL,
+    observed_at              TEXT NOT NULL,
+    ingested_at              TEXT NOT NULL,
+    source_system            TEXT NOT NULL DEFAULT 'chat',
+    provenance               TEXT NOT NULL DEFAULT '{}',
+    raw_reference            TEXT NOT NULL DEFAULT '',
+    content_hash             TEXT NOT NULL,
+    capture_authority_state  TEXT NOT NULL DEFAULT 'unknown',
+    compliance_state         TEXT NOT NULL DEFAULT 'unknown'
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pdm_events_user_hash
+    ON pdm_source_events ("user", content_hash);
+CREATE INDEX IF NOT EXISTS idx_pdm_events_user_occurred
+    ON pdm_source_events ("user", occurred_at DESC);
+
+CREATE TABLE IF NOT EXISTS pdm_entities (
+    id                     TEXT PRIMARY KEY,
+    "user"                 TEXT NOT NULL DEFAULT 'default',
+    entity_type            TEXT NOT NULL DEFAULT 'person',
+    canonical_name         TEXT NOT NULL,
+    canonical_norm         TEXT NOT NULL DEFAULT '',
+    disambiguator          TEXT NOT NULL DEFAULT '',
+    origin_field_id        TEXT NOT NULL DEFAULT '',
+    aliases                TEXT NOT NULL DEFAULT '[]',
+    current_state_version  INTEGER NOT NULL DEFAULT 1,
+    created_at             TEXT NOT NULL,
+    dissolved_at           TEXT,
+    merged_into            TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_pdm_entities_user_name
+    ON pdm_entities ("user", canonical_norm);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pdm_entities_identity
+    ON pdm_entities ("user", canonical_norm, disambiguator);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pdm_entities_origin
+    ON pdm_entities ("user", canonical_norm, origin_field_id);
+
+CREATE TABLE IF NOT EXISTS pdm_entity_mentions (
+    id               TEXT PRIMARY KEY,
+    "user"           TEXT NOT NULL DEFAULT 'default',
+    surface_form     TEXT NOT NULL,
+    surface_norm     TEXT NOT NULL DEFAULT '',
+    source_event_id  TEXT NOT NULL DEFAULT '',
+    signature_id     TEXT NOT NULL DEFAULT '',
+    field_id         TEXT NOT NULL DEFAULT '',
+    observed_at      TEXT NOT NULL,
+    entity_id        TEXT,
+    resolution       TEXT NOT NULL DEFAULT 'unresolved',
+    resolved_at      TEXT,
+    confidence       DOUBLE PRECISION
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pdm_mentions_idem
+    ON pdm_entity_mentions ("user", source_event_id, signature_id, surface_form);
+CREATE INDEX IF NOT EXISTS idx_pdm_mentions_lookup
+    ON pdm_entity_mentions ("user", surface_norm, field_id);
+CREATE INDEX IF NOT EXISTS idx_pdm_mentions_entity
+    ON pdm_entity_mentions ("user", entity_id);
+"""
+
+SIGNATURE_EVENT_INDEXES_POSTGRES = """
+CREATE INDEX IF NOT EXISTS idx_pdm_sig_source_event
+    ON pdm_signatures (source_event_id);
+CREATE INDEX IF NOT EXISTS idx_pdm_sig_entity
+    ON pdm_signatures (primary_entity_id);
+"""
+
+
+def _postgres_immutability_guard(table: str, columns: Sequence[str]) -> list[str]:
+    """
+    Same carve-out as the SQLite guard, in plpgsql.
+
+    Returned as whole statements rather than one blob: the Postgres driver
+    executes schema DDL by splitting on ";", which would cut a function body
+    in half at its first internal statement.
+    """
+    condition = "\n           OR ".join(
+        f'NEW."{col}" IS DISTINCT FROM OLD."{col}"' for col in columns
+    )
+    function_name = f"{table}_immutable"
+    return [
+        f"""
+CREATE OR REPLACE FUNCTION {function_name}() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION '{table} is append-only: rows cannot be deleted';
+    END IF;
+    IF {condition} THEN
+        RAISE EXCEPTION '{table} is append-only: the recorded event cannot be rewritten';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+""".strip(),
+        f"DROP TRIGGER IF EXISTS trg_{function_name} ON {table}",
+        f"""
+CREATE TRIGGER trg_{function_name}
+BEFORE UPDATE OR DELETE ON {table}
+FOR EACH ROW EXECUTE FUNCTION {function_name}()
+""".strip(),
+    ]
+
+
+TRIGGERS_EVENTS_POSTGRES: tuple[str, ...] = tuple(
+    _postgres_immutability_guard("pdm_source_events", _EVENT_FROZEN_COLUMNS)
+    + _postgres_immutability_guard("pdm_entity_mentions", _MENTION_FROZEN_COLUMNS)
+)
+
+
+def apply_event_migrations_postgres(conn: Any) -> None:
+    """
+    Create the evidence tables on a new or existing PostgreSQL database.
+
+    Same order as the SQLite path — tables, columns, indexes, triggers last —
+    and the same reason: a trigger installed before its ALTER TABLE aborts the
+    migration that installs it.
+    """
+    for statement in SCHEMA_EVENTS_POSTGRES.split(";"):
+        if statement.strip():
+            conn.execute(statement)
+
+    for column, decl in SIGNATURE_EVENT_COLUMNS:
+        conn.execute(
+            f"ALTER TABLE pdm_signatures ADD COLUMN IF NOT EXISTS {column} {decl}"
+        )
+
+    for statement in SIGNATURE_EVENT_INDEXES_POSTGRES.split(";"):
+        if statement.strip():
+            conn.execute(statement)
+
+    # Whole statements — never split; see _postgres_immutability_guard.
+    for statement in TRIGGERS_EVENTS_POSTGRES:
+        conn.execute(statement)
+
+    logger.debug("[PDM-Events] Evidence tables ready (postgres)")

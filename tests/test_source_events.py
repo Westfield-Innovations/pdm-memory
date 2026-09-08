@@ -556,3 +556,41 @@ class TestDisambiguatorCollisions:
             for n in range(6)
         }
         assert len(ids) == 6
+
+
+class TestDefaultedOccurredAt:
+    def test_our_clock_does_not_decide_identity(self, driver):
+        """
+        Regression. A caller who does not supply occurred_at gets one filled
+        in — and if that invented moment entered the hash, ingesting the same
+        message twice would make two events a millisecond apart. AC1 would
+        fail on the most ordinary path there is.
+        """
+        payload = "Moved the Orion release review to Friday."
+        first = driver.save_source_event(
+            SourceEventRecord(raw_reference="chat:1"), payload=payload
+        )
+        second = driver.save_source_event(
+            SourceEventRecord(raw_reference="chat:1"), payload=payload
+        )
+        assert first == second
+
+    def test_a_supplied_occurred_at_still_separates_events(self, driver):
+        """The fix must not blunt the hash for callers who do know."""
+        monday = driver.save_source_event(
+            SourceEventRecord(raw_reference="chat:1", occurred_at=OCCURRED),
+            payload="standup",
+        )
+        tuesday = driver.save_source_event(
+            SourceEventRecord(
+                raw_reference="chat:1",
+                occurred_at=datetime(2026, 9, 8, 10, 0, tzinfo=timezone.utc),
+            ),
+            payload="standup",
+        )
+        assert monday != tuesday
+
+    def test_the_column_is_populated_either_way(self, driver):
+        """Held out of the hash, not left empty in the row."""
+        event_id = driver.save_source_event(SourceEventRecord(raw_reference="chat:2"))
+        assert driver.get_source_event(event_id).occurred_at is not None
