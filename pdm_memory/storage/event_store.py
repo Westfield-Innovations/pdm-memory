@@ -80,6 +80,24 @@ class EventStoreMixin:
     def _run(self, query: str, params: tuple[Any, ...] = ()) -> Any:
         return self._conn().execute(self._sql(query), params)
 
+    def _rollback_if_idle(self) -> None:
+        """
+        Release a failed implicit transaction before reading again.
+
+        A constraint violation leaves the driver's implicit transaction open,
+        and with it the write lock. Reading the winning row without clearing
+        that first parks the lock on this connection for good, and every other
+        writer queues behind a thread that has already given up — the failure
+        looks like ``database is locked`` several threads away from its cause.
+
+        Only when no explicit ``transaction()`` is in progress. Inside one the
+        caller owns the transaction, and a constraint violation there rolls
+        back the statement rather than the whole block, so there is nothing to
+        clear and a rollback would discard work that is not ours.
+        """
+        if getattr(getattr(self, "_local", None), "txn_depth", 0) == 0:
+            self._conn().rollback()
+
     def supports_events(self) -> bool:
         return True
 
@@ -116,6 +134,7 @@ class EventStoreMixin:
         except self._EVENT_INTEGRITY_ERRORS:
             # Another writer won the race on the unique hash index. Their row
             # is as good as ours — the hash says so.
+            self._rollback_if_idle()
             duplicate = self.find_event_by_hash(event.content_hash, user=event.user)
             if duplicate is None:
                 raise
@@ -189,16 +208,41 @@ class EventStoreMixin:
         if existing is not None:
             return existing["id"]
 
-        self._run(
-            """
-            INSERT INTO pdm_entity_mentions (
-                id, {user}, surface_form, surface_norm, source_event_id,
-                signature_id, field_id, observed_at, entity_id, resolution,
-                resolved_at, confidence
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            mention_insert_row(mention),
-        )
+        try:
+            self._run(
+                """
+                INSERT INTO pdm_entity_mentions (
+                    id, {user}, surface_form, surface_norm, source_event_id,
+                    signature_id, field_id, observed_at, entity_id, resolution,
+                    resolved_at, confidence
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                mention_insert_row(mention),
+            )
+        except self._EVENT_INTEGRITY_ERRORS:
+            # The read above and this write are two statements, so a second
+            # writer can slip between them. The unique index is what actually
+            # holds the line; this turns its objection into the same answer the
+            # fast path gives — the id of the mention already recording this.
+            self._rollback_if_idle()
+            duplicate = self._run(
+                """
+                SELECT * FROM pdm_entity_mentions
+                WHERE {user} = ? AND source_event_id = ? AND signature_id = ?
+                  AND surface_form = ?
+                LIMIT 1
+                """,
+                (
+                    mention.user,
+                    mention.source_event_id,
+                    mention.signature_id,
+                    mention.surface_form,
+                ),
+            ).fetchone()
+            if duplicate is None:
+                raise
+            return duplicate["id"]
+
         self._commit_if_idle(self._conn())
         return mention.id
 

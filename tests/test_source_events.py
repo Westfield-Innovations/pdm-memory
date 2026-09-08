@@ -594,3 +594,76 @@ class TestDefaultedOccurredAt:
         """Held out of the hash, not left empty in the row."""
         event_id = driver.save_source_event(SourceEventRecord(raw_reference="chat:2"))
         assert driver.get_source_event(event_id).occurred_at is not None
+
+
+class TestConcurrentIdempotency:
+    """
+    The Python check in record_mention reads, then writes — two statements a
+    second writer can slip between. Single-threaded tests pass either way,
+    which is exactly why they are not enough: they would keep passing if the
+    unique index were dropped tomorrow. These put real threads on it, so the
+    index is the thing under test.
+    """
+
+    def test_concurrent_identical_mentions_collapse_to_one(self, driver):
+        import threading
+
+        event_id = driver.save_source_event(make_event())
+        results: list[str] = []
+        errors: list[Exception] = []
+        start = threading.Barrier(8)
+
+        def record() -> None:
+            try:
+                start.wait()
+                results.append(
+                    driver.record_mention(
+                        EntityMentionRecord(
+                            surface_form="Alex",
+                            source_event_id=event_id,
+                            field_id="work",
+                        )
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - the point is to see it
+                errors.append(exc)
+
+        threads = [threading.Thread(target=record) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors, f"record_mention raised under contention: {errors}"
+        assert len(set(results)) == 1, "eight racing writers produced more than one mention"
+        count = driver._conn().execute(
+            "SELECT COUNT(*) FROM pdm_entity_mentions"
+        ).fetchone()[0]
+        assert count == 1
+
+    def test_concurrent_identical_events_collapse_to_one(self, driver):
+        import threading
+
+        results: list[str] = []
+        errors: list[Exception] = []
+        start = threading.Barrier(8)
+
+        def record() -> None:
+            try:
+                start.wait()
+                results.append(
+                    driver.save_source_event(
+                        make_event(raw_reference="chat:race"), payload="same message"
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=record) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors, f"save_source_event raised under contention: {errors}"
+        assert len(set(results)) == 1
