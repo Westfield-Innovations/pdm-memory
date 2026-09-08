@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "vectors": [
+    {
+      "name": "chat_message_with_payload",
+      "input": {
+        "event_type": "chat_message",
+        "occurred_at": "2026-09-07T10:00:00Z",
+        "source_system": "azus_chat",
+        "raw_reference": "chat:123:msg:456",
+        "payload": "Moved the Orion release review to Friday."
+      },
+      "canonical_document": {
+        "v": 1,
+        "event_type": "chat_message",
+        "occurred_at": "2026-09-07T10:00:00.000000Z",
+        "source_system": "azus_chat",
+        "raw_reference": "chat:123:msg:456",
+        "payload": "Moved the Orion release review to Friday."
+      },
+      "canonical_json": "{\"event_type\":\"chat_message\",\"occurred_at\":\"2026-09-07T10:00:00.000000Z\",\"payload\":\"Moved the Orion release review to Friday.\",\"raw_reference\":\"chat:123:msg:456\",\"source_system\":\"azus_chat\",\"v\":1}",
+      "content_hash": "d7af4c81decdd2482e2383d5f2b4e89486790b9c9fbb164aa25638bacde68df8"
+    },
+    {
+      "name": "pointer_only_no_payload",
+      "input": {
+        "event_type": "email",
+        "occurred_at": "2026-09-07T10:00:00+00:00",
+        "source_system": "gmail",
+        "raw_reference": "gmail:thread:abc",
+        "payload": ""
+      },
+      "canonical_document": {
+        "v": 1,
+        "event_type": "email",
+        "occurred_at": "2026-09-07T10:00:00.000000Z",
+        "source_system": "gmail",
+        "raw_reference": "gmail:thread:abc",
+        "payload": ""
+      },
+      "canonical_json": "{\"event_type\":\"email\",\"occurred_at\":\"2026-09-07T10:00:00.000000Z\",\"payload\":\"\",\"raw_reference\":\"gmail:thread:abc\",\"source_system\":\"gmail\",\"v\":1}",
+      "content_hash": "bb0e4dc5277c5de281d5e8afc78119e332b9e78fb303915395f02ad2a560bc2e"
+    },
+    {
+      "name": "offset_timezone_normalises_to_utc",
+      "input": {
+        "event_type": "calendar_entry",
+        "occurred_at": "2026-09-07T13:00:00+03:00",
+        "source_system": "gcal",
+        "raw_reference": "gcal:evt:9",
+        "payload": ""
+      },
+      "canonical_document": {
+        "v": 1,
+        "event_type": "calendar_entry",
+        "occurred_at": "2026-09-07T10:00:00.000000Z",
+        "source_system": "gcal",
+        "raw_reference": "gcal:evt:9",
+        "payload": ""
+      },
+      "canonical_json": "{\"event_type\":\"calendar_entry\",\"occurred_at\":\"2026-09-07T10:00:00.000000Z\",\"payload\":\"\",\"raw_reference\":\"gcal:evt:9\",\"source_system\":\"gcal\",\"v\":1}",
+      "content_hash": "24ad6c0c9da3797faf779cc2d0555577465a0ce15e18ad14b59bbff6bf914224"
+    },
+    {
+      "name": "unicode_payload_not_escaped",
+      "input": {
+        "event_type": "chat_message",
+        "occurred_at": "2026-09-07T10:00:00.123456Z",
+        "source_system": "azus_chat",
+        "raw_reference": "",
+        "payload": "Зустріч з Алексом — переніс на п'ятницю 🙂"
+      },
+      "canonical_document": {
+        "v": 1,
+        "event_type": "chat_message",
+        "occurred_at": "2026-09-07T10:00:00.123456Z",
+        "source_system": "azus_chat",
+        "raw_reference": "",
+        "payload": "Зустріч з Алексом — переніс на п'ятницю 🙂"
+      },
+      "canonical_json": "{\"event_type\":\"chat_message\",\"occurred_at\":\"2026-09-07T10:00:00.123456Z\",\"payload\":\"Зустріч з Алексом — переніс на п'ятницю 🙂\",\"raw_reference\":\"\",\"source_system\":\"azus_chat\",\"v\":1}",
+      "content_hash": "d1214118017b6dc10224c39f539f708cbf8bb41328b2a2d29079589d75701722"
+    },
+    {
+      "name": "whitespace_is_stripped",
+      "input": {
+        "event_type": "  chat_message  ",
+        "occurred_at": "2026-09-07T10:00:00Z",
+        "source_system": " azus_chat ",
+        "raw_reference": " chat:123:msg:456 ",
+        "payload": "Moved the Orion release review to Friday."
+      },
+      "canonical_document": {
+        "v": 1,
+        "event_type": "chat_message",
+        "occurred_at": "2026-09-07T10:00:00.000000Z",
+        "source_system": "azus_chat",
+        "raw_reference": "chat:123:msg:456",
+        "payload": "Moved the Orion release review to Friday."
+      },
+      "canonical_json": "{\"event_type\":\"chat_message\",\"occurred_at\":\"2026-09-07T10:00:00.000000Z\",\"payload\":\"Moved the Orion release review to Friday.\",\"raw_reference\":\"chat:123:msg:456\",\"source_system\":\"azus_chat\",\"v\":1}",
+      "content_hash": "d7af4c81decdd2482e2383d5f2b4e89486790b9c9fbb164aa25638bacde68df8"
+    }
+  ]
+}
