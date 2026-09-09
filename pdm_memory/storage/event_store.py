@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from pdm_memory.core.signature import SignatureRecord
+from pdm_memory.storage.event_hash import normalize_instant
 from pdm_memory.storage.events import (
     RESOLUTION_METHODS,
     REVISABLE_RESOLUTIONS,
@@ -53,7 +54,11 @@ class EventStoreMixin:
 
     * ``_EVENT_PLACEHOLDER`` — ``"?"`` or ``"%s"``
     * ``_EVENT_USER_COLUMN`` — ``"user"`` or ``'"user"'`` (reserved in Postgres)
-    * ``_EVENT_INTEGRITY_ERRORS`` — exception classes a unique violation raises
+
+    Every write that can collide goes through ``ON CONFLICT DO NOTHING``
+    followed by a read of the winner, so no dialect needs to name the exception
+    a unique violation raises, and a losing writer never parks a failed
+    transaction on its connection.
 
     and inherit ``_conn()``, ``_commit_if_idle()`` and ``transaction()`` from
     the driver they are mixed into.
@@ -61,7 +66,6 @@ class EventStoreMixin:
 
     _EVENT_PLACEHOLDER: str = "?"
     _EVENT_USER_COLUMN: str = "user"
-    _EVENT_INTEGRITY_ERRORS: tuple[type[Exception], ...] = ()
 
     # ------------------------------------------------------------------
     # Dialect plumbing
@@ -80,24 +84,6 @@ class EventStoreMixin:
     def _run(self, query: str, params: tuple[Any, ...] = ()) -> Any:
         return self._conn().execute(self._sql(query), params)
 
-    def _rollback_if_idle(self) -> None:
-        """
-        Release a failed implicit transaction before reading again.
-
-        A constraint violation leaves the driver's implicit transaction open,
-        and with it the write lock. Reading the winning row without clearing
-        that first parks the lock on this connection for good, and every other
-        writer queues behind a thread that has already given up — the failure
-        looks like ``database is locked`` several threads away from its cause.
-
-        Only when no explicit ``transaction()`` is in progress. Inside one the
-        caller owns the transaction, and a constraint violation there rolls
-        back the statement rather than the whole block, so there is nothing to
-        clear and a rollback would discard work that is not ours.
-        """
-        if getattr(getattr(self, "_local", None), "txn_depth", 0) == 0:
-            self._conn().rollback()
-
     def supports_events(self) -> bool:
         return True
 
@@ -115,33 +101,33 @@ class EventStoreMixin:
         """
         event.ensure_content_hash(payload=payload)
 
-        existing = self.find_event_by_hash(event.content_hash, user=event.user)
-        if existing is not None:
-            logger.debug("[PDM-Events] Reusing event %s for hash", existing.id)
-            return existing.id
-
-        try:
-            self._run(
-                """
-                INSERT INTO pdm_source_events (
-                    id, {user}, event_type, occurred_at, observed_at, ingested_at,
-                    source_system, provenance, raw_reference, content_hash,
-                    capture_authority_state, compliance_state
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                event_insert_row(event),
-            )
-        except self._EVENT_INTEGRITY_ERRORS:
-            # Another writer won the race on the unique hash index. Their row
-            # is as good as ours — the hash says so.
-            self._rollback_if_idle()
-            duplicate = self.find_event_by_hash(event.content_hash, user=event.user)
-            if duplicate is None:
-                raise
-            return duplicate.id
-
+        self._run(
+            """
+            INSERT INTO pdm_source_events (
+                id, {user}, event_type, occurred_at, observed_at, ingested_at,
+                source_system, provenance, raw_reference, content_hash,
+                capture_authority_state, compliance_state
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT DO NOTHING
+            """,
+            event_insert_row(event),
+        )
         self._commit_if_idle(self._conn())
-        return event.id
+
+        # Whoever holds the hash owns the event — us, or the writer who got
+        # there first. Letting the unique index arbitrate in a single statement
+        # is what removes the race: the read-then-write version could lose
+        # between its two statements, and its failed INSERT left the write lock
+        # parked on a connection that had already given up.
+        stored = self.find_event_by_hash(event.content_hash, user=event.user)
+        if stored is None:
+            raise RuntimeError(
+                f"source event {event.content_hash[:12]} vanished immediately "
+                "after insert"
+            )
+        if stored.id != event.id:
+            logger.debug("[PDM-Events] Reusing event %s for hash", stored.id)
+        return stored.id
 
     def get_source_event(self, event_id: str) -> SourceEventRecord | None:
         row = self._run(
@@ -191,9 +177,22 @@ class EventStoreMixin:
 
         Idempotent on ``(user, source_event_id, signature_id, surface_form)``.
         """
-        existing = self._run(
+        self._run(
             """
-            SELECT * FROM pdm_entity_mentions
+            INSERT INTO pdm_entity_mentions (
+                id, {user}, surface_form, surface_norm, source_event_id,
+                signature_id, field_id, observed_at, entity_id, resolution,
+                resolved_at, confidence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT DO NOTHING
+            """,
+            mention_insert_row(mention),
+        )
+        self._commit_if_idle(self._conn())
+
+        stored = self._run(
+            """
+            SELECT id FROM pdm_entity_mentions
             WHERE {user} = ? AND source_event_id = ? AND signature_id = ?
               AND surface_form = ?
             LIMIT 1
@@ -205,46 +204,9 @@ class EventStoreMixin:
                 mention.surface_form,
             ),
         ).fetchone()
-        if existing is not None:
-            return existing["id"]
-
-        try:
-            self._run(
-                """
-                INSERT INTO pdm_entity_mentions (
-                    id, {user}, surface_form, surface_norm, source_event_id,
-                    signature_id, field_id, observed_at, entity_id, resolution,
-                    resolved_at, confidence
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                mention_insert_row(mention),
-            )
-        except self._EVENT_INTEGRITY_ERRORS:
-            # The read above and this write are two statements, so a second
-            # writer can slip between them. The unique index is what actually
-            # holds the line; this turns its objection into the same answer the
-            # fast path gives — the id of the mention already recording this.
-            self._rollback_if_idle()
-            duplicate = self._run(
-                """
-                SELECT * FROM pdm_entity_mentions
-                WHERE {user} = ? AND source_event_id = ? AND signature_id = ?
-                  AND surface_form = ?
-                LIMIT 1
-                """,
-                (
-                    mention.user,
-                    mention.source_event_id,
-                    mention.signature_id,
-                    mention.surface_form,
-                ),
-            ).fetchone()
-            if duplicate is None:
-                raise
-            return duplicate["id"]
-
-        self._commit_if_idle(self._conn())
-        return mention.id
+        if stored is None:
+            raise RuntimeError("mention vanished immediately after insert")
+        return stored["id"]
 
     def get_mention(self, mention_id: str) -> EntityMentionRecord | None:
         row = self._run(
@@ -360,19 +322,23 @@ class EventStoreMixin:
         if row is not None:
             return self._follow_merge(entity_from_row(row)).id
 
-        # The name is new to this field. Whether it is new outright decides
-        # only whether the row needs a disambiguator to sit beside its sibling.
-        taken = self._run(
-            "SELECT COUNT(*) AS n FROM pdm_entities "
-            "WHERE {user} = ? AND canonical_norm = ?",
-            (user, norm),
-        ).fetchone()["n"]
+        # One query for what the disambiguator choice needs: which spellings a
+        # sibling already holds. The previous version asked COUNT(*) and then
+        # probed up to twelve candidates one statement at a time.
+        siblings = {
+            r["disambiguator"]
+            for r in self._run(
+                "SELECT disambiguator FROM pdm_entities "
+                "WHERE {user} = ? AND canonical_norm = ?",
+                (user, norm),
+            ).fetchall()
+        }
 
         entity = EntityRecord(
             user=user,
             entity_type=entity_type,
             canonical_name=" ".join((surface_form or "").split()),
-            disambiguator=self._free_disambiguator(user, norm, field_id, taken),
+            disambiguator=self._free_disambiguator(field_id, siblings),
             origin_field_id=field_id,
         )
         self._run(
@@ -382,45 +348,58 @@ class EventStoreMixin:
                 disambiguator, origin_field_id, aliases, current_state_version,
                 created_at, dissolved_at, merged_into
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT DO NOTHING
             """,
             entity_insert_row(entity),
         )
         self._commit_if_idle(self._conn())
-        if taken:
+
+        # Read back rather than trust our own id. Two threads naming the same
+        # person in the same field both compute the same identity triple, so
+        # the unique index picks one and the other must adopt it — the same
+        # arbitration used for events and mentions, and for the same reason:
+        # a losing INSERT that raises leaves the write lock parked behind a
+        # thread that has already given up.
+        winner = self._run(
+            "SELECT * FROM pdm_entities "
+            "WHERE {user} = ? AND canonical_norm = ? AND origin_field_id = ? LIMIT 1",
+            (user, norm, field_id),
+        ).fetchone()
+        if winner is None:
+            raise RuntimeError(
+                f"entity {entity.canonical_name!r} vanished immediately after insert"
+            )
+        if siblings:
             logger.info(
                 "[PDM-Events] %r in field %r is a second identity, not a merge",
                 entity.canonical_name,
                 field_id,
             )
-        return entity.id
+        return self._follow_merge(entity_from_row(winner)).id
 
-    def _free_disambiguator(
-        self, user: str, norm: str, field_id: str, taken: int
-    ) -> str:
+    def _free_disambiguator(self, field_id: str, siblings: set[str]) -> str:
         """
-        Pick a disambiguator no sibling is already using.
+        Pick a disambiguator no sibling of this name already holds.
 
         The first identity for a name takes the empty one, so the common case
-        stays unmarked, as D6 intends. Later ones take their field. The
-        fallbacks matter for an ordering the obvious version gets wrong: an
-        entity created with no field, after one created with a field, would
-        claim the empty disambiguator a sibling already holds and fail the
-        unique index.
+        stays unmarked. Later ones take their field. The numbered fallbacks
+        matter for an ordering the obvious version gets wrong: an entity
+        created with no field, after one created with a field, would claim the
+        empty disambiguator a sibling already holds.
+
+        Takes the sibling set rather than querying, so choosing costs no round
+        trips — and so the unique index, not this function, is what finally
+        decides under contention.
         """
         candidates: list[str] = []
-        if taken == 0:
+        if not siblings:
             candidates.append("")
         stem = field_id or "alt"
         candidates.append(stem)
         candidates.extend(f"{stem}-{n}" for n in range(2, 12))
 
         for candidate in candidates:
-            clash = self._run(
-                "SELECT 1 AS hit FROM pdm_entities "
-                "WHERE {user} = ? AND canonical_norm = ? AND disambiguator = ? LIMIT 1",
-                (user, norm, candidate),
-            ).fetchone()
-            if clash is None:
+            if candidate not in siblings:
                 return candidate
         return uuid.uuid4().hex[:8]
 
@@ -465,21 +444,41 @@ class EventStoreMixin:
             raise ValueError(
                 f"method must be one of {sorted(RESOLUTION_METHODS)}, got {method!r}"
             )
-        if self.get_entity(keep_id) is None:
+
+        keep = self.get_entity(keep_id)
+        if keep is None:
             raise KeyError(f"entity {keep_id!r} not found")
-        if self.get_entity(merge_id) is None:
+        merged = self.get_entity(merge_id)
+        if merged is None:
             raise KeyError(f"entity {merge_id!r} not found")
 
+        # Merging into a row that has itself been merged away leaves every
+        # mention pointing at a retired identity, and a mutual merge retires
+        # both — after which the name has no live identity at all and the
+        # pointers run in a circle. The survivor has to still be alive.
+        if keep.dissolved_at is not None:
+            raise ValueError(
+                f"entity {keep_id!r} was dissolved into "
+                f"{keep.merged_into or 'nothing'} and cannot receive a merge; "
+                "merge into the surviving identity instead"
+            )
+        if merged.dissolved_at is not None:
+            raise ValueError(f"entity {merge_id!r} is already merged away")
+
         with self.transaction():
+            # Only the pointer moves. The resolution grade records *who*
+            # decided a mention belonged to someone — a person, an alias table,
+            # a model — and a merge is not a re-decision of that. Overwriting
+            # it downgraded confirmed answers to whatever the merge was called
+            # with, and resolve_mention then treated them as revisable again.
             self._run(
-                "UPDATE pdm_entity_mentions SET entity_id = ?, resolution = ? "
-                "WHERE entity_id = ?",
-                (keep_id, method, merge_id),
+                "UPDATE pdm_entity_mentions SET entity_id = ? WHERE entity_id = ?",
+                (keep_id, merge_id),
             )
             self._run(
                 "UPDATE pdm_signatures SET primary_entity_id = ? "
-                "WHERE primary_entity_id = ?",
-                (keep_id, merge_id),
+                "WHERE primary_entity_id = ? AND {user} = ?",
+                (keep_id, merge_id, merged.user),
             )
             self._run(
                 """
@@ -488,7 +487,7 @@ class EventStoreMixin:
                        current_state_version = current_state_version + 1
                  WHERE id = ?
                 """,
-                (_now().isoformat(), keep_id, merge_id),
+                (normalize_instant(_now()), keep_id, merge_id),
             )
 
     # ------------------------------------------------------------------
@@ -502,31 +501,51 @@ class EventStoreMixin:
         source_event_id: str | None = None,
         primary_entity_id: str | None = None,
         user: str = "default",
-    ) -> None:
+        overwrite: bool = False,
+    ) -> bool:
         """
         Point a signature at the event it came from and the entity it is about.
+
+        First writer wins. ``Memory.save`` deduplicates on text, so a fact
+        repeated across two messages hands back the signature the first one
+        produced — and an unconditional UPDATE then moved its provenance to the
+        second event, leaving the first with nothing it could show for itself.
+        Rewriting where a fact came from is precisely what an evidence layer
+        must not do, so a signature that already carries provenance keeps it.
+
+        Returns whether this call claimed the provenance. ``False`` means the
+        signature was already accounted for by an earlier event — worth
+        surfacing rather than swallowing, because the caller usually wants to
+        know its fact was not new.
+
+        ``overwrite=True`` is for repair paths that have established the
+        existing link is wrong; ordinary ingest never passes it.
 
         Deliberately raw SQL rather than ``update()``: the inherited path
         filters through ``UPDATABLE_COLUMNS``, a whitelist in a frozen module
         that predates these two columns and would reject them.
         """
-        assignments: list[str] = []
-        values: list[Any] = []
-        if source_event_id is not None:
-            assignments.append("source_event_id = ?")
-            values.append(source_event_id)
-        if primary_entity_id is not None:
-            assignments.append("primary_entity_id = ?")
-            values.append(primary_entity_id)
-        if not assignments:
-            return
+        claimed = True
 
-        self._run(
-            f"UPDATE pdm_signatures SET {', '.join(assignments)} "
-            f"WHERE id = ? AND {{user}} = ?",
-            (*values, signature_id, user),
-        )
+        if source_event_id is not None:
+            guard = "" if overwrite else " AND source_event_id IS NULL"
+            cursor = self._run(
+                "UPDATE pdm_signatures SET source_event_id = ? "
+                f"WHERE id = ? AND {{user}} = ?{guard}",
+                (source_event_id, signature_id, user),
+            )
+            claimed = bool(getattr(cursor, "rowcount", 1))
+
+        if primary_entity_id is not None:
+            guard = "" if overwrite else " AND primary_entity_id IS NULL"
+            self._run(
+                "UPDATE pdm_signatures SET primary_entity_id = ? "
+                f"WHERE id = ? AND {{user}} = ?{guard}",
+                (primary_entity_id, signature_id, user),
+            )
+
         self._commit_if_idle(self._conn())
+        return claimed
 
     def signatures_for_event(
         self, event_id: str, user: str = "default"

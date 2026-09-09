@@ -61,7 +61,6 @@ class _FakePostgresHost(EventStoreMixin):
 
     _EVENT_PLACEHOLDER = "%s"
     _EVENT_USER_COLUMN = '"user"'
-    _EVENT_INTEGRITY_ERRORS = ()
 
     def __init__(self):
         self.recorder = _Recorder()
@@ -165,7 +164,11 @@ class TestDialectParity:
         assert "?" not in sql
 
     def test_generated_insert_quotes_user(self, pg_host):
-        pg_host.save_source_event(SourceEventRecord(event_type="chat_message"))
+        # The recorder has no storage, so the read-back that now follows every
+        # insert finds nothing and the method refuses to invent an id. The SQL
+        # is recorded before that point, which is what this test is about.
+        with pytest.raises(RuntimeError, match="vanished"):
+            pg_host.save_source_event(SourceEventRecord(event_type="chat_message"))
         insert = next(
             s for s in pg_host.recorder.statements if "INSERT INTO pdm_source_events" in s
         )
@@ -173,17 +176,24 @@ class TestDialectParity:
         assert "?" not in insert
         assert insert.count("%s") == 12
 
-    def test_count_query_uses_an_alias_not_a_positional(self, pg_host):
+    def test_entity_creation_never_reads_a_row_positionally(self, pg_host):
         """
-        psycopg's dict_row has no row[0]. Every aggregate the mixin reads back
-        is aliased so the same code works on sqlite3.Row and on a dict.
+        psycopg's dict_row has no ``row[0]``, so every column the mixin reads
+        back is named. Sibling disambiguators now come from one SELECT rather
+        than an aggregate plus up to twelve probes.
         """
         pg_host.recorder.statements.clear()
-        try:
+        with pytest.raises(RuntimeError, match="vanished"):
             pg_host.resolve_or_create_entity(user="u", surface_form="Alex", field_id="w")
-        except TypeError:
-            pass  # the empty cursor cannot satisfy the whole flow; SQL is what matters
-        assert any("COUNT(*) AS n" in s for s in pg_host.recorder.statements)
+
+        sql = pg_host.recorder.statements
+        assert any("SELECT disambiguator FROM pdm_entities" in s for s in sql)
+        assert all("SELECT COUNT" not in s for s in sql), (
+            "the probe-per-candidate version is gone; nothing here needs an aggregate"
+        )
+        assert any("ON CONFLICT DO NOTHING" in s for s in sql), (
+            "the unique index, not a prior read, is what arbitrates a race"
+        )
 
 
 # ---------------------------------------------------------------------------
