@@ -713,3 +713,52 @@ class TestMappersStayInStepWithTheRecords:
                 f"{table}: DDL has {len(columns)} columns, "
                 f"the insert tuple carries {len(builder(record))}"
             )
+
+
+class TestTheParserDoesNotDependOnThePythonVersion:
+    """
+    CI caught what my local runs could not: raising on an unparseable string
+    made the failure loud but left it version-dependent. `fromisoformat`
+    widened its grammar in 3.11, so seven fractional digits raise on 3.10 and
+    parse on 3.12 — the same timestamp accepted by a Companion and refused by
+    an SDK. The parser is now our own, and the grammar is the same everywhere.
+    """
+
+    def test_normalisation_never_calls_fromisoformat(self):
+        import inspect
+
+        from pdm_memory.storage import event_hash
+
+        source = inspect.getsource(event_hash._parse_iso)
+        assert "fromisoformat" not in source, (
+            "the accepted grammar would move with the runtime again"
+        )
+
+    @pytest.mark.parametrize(
+        ("spelling", "expected"),
+        [
+            ("2026-09-07T10:00:00.1234567Z", "2026-09-07T10:00:00.123456Z"),
+            ("2026-09-07T10:00:00.1Z", "2026-09-07T10:00:00.100000Z"),
+            ("20260907T100000Z", "2026-09-07T10:00:00.000000Z"),
+            ("2026-09-07T10:00:00,123Z", "2026-09-07T10:00:00.123000Z"),
+            ("2026-09-07T13:00:00+03:00", "2026-09-07T10:00:00.000000Z"),
+            ("2026-09-07T13:00:00+0300", "2026-09-07T10:00:00.000000Z"),
+            ("2026-09-07T05:00:00-05", "2026-09-07T10:00:00.000000Z"),
+            ("2026-09-07 10:00:00", "2026-09-07T10:00:00.000000Z"),
+            ("2026-09-07", "2026-09-07T00:00:00.000000Z"),
+        ],
+    )
+    def test_one_grammar_on_every_runtime(self, spelling, expected):
+        from pdm_memory.storage.event_hash import normalize_instant
+
+        assert normalize_instant(spelling) == expected
+
+    @pytest.mark.parametrize(
+        "spelling",
+        ["2026-13-45T99:99:99Z", "07/09/2026 10:00", "yesterday", "2026-09-07T10"],
+    )
+    def test_what_is_not_a_timestamp_is_still_refused(self, spelling):
+        from pdm_memory.storage.event_hash import normalize_instant
+
+        with pytest.raises(ValueError, match="ISO-8601"):
+            normalize_instant(spelling)

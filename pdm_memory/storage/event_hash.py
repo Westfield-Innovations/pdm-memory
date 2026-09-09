@@ -36,7 +36,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 # Bump only for a deliberate, coordinated change of the canonical form. The
@@ -99,12 +100,61 @@ def normalize_instant(value: datetime | str | None) -> str:
     return aware.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 
+# Parsed here rather than by ``datetime.fromisoformat``, whose accepted
+# grammar widened in 3.11: seven fractional digits and the basic ``20260907T``
+# form raise on 3.10 and parse on 3.12. Leaning on it made the same timestamp
+# hashable on one runtime and rejected on another — the version dependence this
+# module exists to remove, only louder than before. One grammar, every runtime.
+_ISO_PATTERN = re.compile(
+    r"""^
+    (?P<year>\d{4}) -? (?P<month>\d{2}) -? (?P<day>\d{2})
+    (?:
+        [T ]
+        (?P<hour>\d{2}) :? (?P<minute>\d{2})
+        (?: :? (?P<second>\d{2}) )?
+        (?: [.,] (?P<fraction>\d+) )?
+        (?P<offset> Z | z | [+-]\d{2} :? \d{2} | [+-]\d{2} )?
+    )?
+    $""",
+    re.VERBOSE,
+)
+
+
 def _parse_iso(raw: str) -> datetime | None:
-    """Parse ISO-8601, accepting the ``Z`` suffix that ``fromisoformat`` rejects."""
-    candidate = raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw
+    """Parse ISO-8601 identically on every supported Python."""
+    match = _ISO_PATTERN.match(raw)
+    if match is None:
+        return None
+    part = match.groupdict()
+
+    # Six digits, whatever the input carried. Fewer are padded, more are
+    # truncated — the same rounding a microsecond-resolution column applies,
+    # applied before the hash instead of after it.
+    fraction = (part["fraction"] or "").ljust(6, "0")[:6]
+
+    offset = part["offset"]
+    if offset in (None, "Z", "z"):
+        tzinfo = timezone.utc
+    else:
+        sign = -1 if offset[0] == "-" else 1
+        digits = offset[1:].replace(":", "")
+        hours = int(digits[:2])
+        minutes = int(digits[2:4]) if len(digits) > 2 else 0
+        tzinfo = timezone(sign * timedelta(hours=hours, minutes=minutes))
+
     try:
-        return datetime.fromisoformat(candidate)
+        return datetime(
+            int(part["year"]),
+            int(part["month"]),
+            int(part["day"]),
+            int(part["hour"] or 0),
+            int(part["minute"] or 0),
+            int(part["second"] or 0),
+            int(fraction),
+            tzinfo=tzinfo,
+        )
     except ValueError:
+        # Shaped like a date, impossible as one: 2026-13-45T99:99:99Z.
         return None
 
 
