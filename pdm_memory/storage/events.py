@@ -45,6 +45,7 @@ __all__ = [
     "CONTENT_HASH_VERSION",
     "RESOLUTION_METHODS",
     "AppendOnlyViolation",
+    "IntegrityReport",
     "EntityMentionRecord",
     "EntityRecord",
     "SourceEventRecord",
@@ -54,6 +55,55 @@ __all__ = [
     "apply_event_migrations_sqlite",
     "compute_content_hash",
 ]
+
+
+@dataclass
+class IntegrityReport:
+    """
+    Rows whose pointers lead nowhere.
+
+    ``PRAGMA foreign_keys`` is a per-connection setting, so a client writing
+    raw SQL past both drivers can leave a signature pointing at an event that
+    was never recorded. Refusing such a write would mean a trigger on
+    ``pdm_signatures`` — a rule on the table every caller writes to, paid for
+    on every insert by people who never touch this layer. Finding the damage
+    afterwards costs one query per relation and risks nothing, so that is what
+    this does. It reports; it never repairs.
+    """
+
+    signatures_without_event: list[str] = field(default_factory=list)
+    signatures_without_entity: list[str] = field(default_factory=list)
+    mentions_without_event: list[str] = field(default_factory=list)
+    mentions_without_entity: list[str] = field(default_factory=list)
+
+    @property
+    def total(self) -> int:
+        return (
+            len(self.signatures_without_event)
+            + len(self.signatures_without_entity)
+            + len(self.mentions_without_event)
+            + len(self.mentions_without_entity)
+        )
+
+    @property
+    def ok(self) -> bool:
+        return self.total == 0
+
+    def render(self) -> str:
+        if self.ok:
+            return "Evidence layer: every reference resolves."
+        lines = [f"Evidence layer: {self.total} references lead nowhere."]
+        for label, ids in (
+            ("signatures with a missing source event", self.signatures_without_event),
+            ("signatures with a missing entity", self.signatures_without_entity),
+            ("mentions with a missing source event", self.mentions_without_event),
+            ("mentions with a missing entity", self.mentions_without_entity),
+        ):
+            if ids:
+                shown = ", ".join(ids[:5])
+                more = f" (+{len(ids) - 5} more)" if len(ids) > 5 else ""
+                lines.append(f"  {len(ids)} {label}: {shown}{more}")
+        return "\n".join(lines)
 
 
 class AppendOnlyViolation(RuntimeError):
@@ -98,12 +148,23 @@ REVISABLE_RESOLUTIONS: frozenset[str] = frozenset(
 )
 
 
-def _now() -> datetime:
+def utc_now() -> datetime:
+    """The single clock. Duplicated in three modules before this."""
     return datetime.now(tz=timezone.utc)
 
 
-def _iso(value: datetime | None) -> str | None:
-    return value.isoformat() if value else None
+
+def iso_utc(value: datetime | None) -> str | None:
+    """
+    One spelling for every timestamp column in the store.
+
+    These columns are TEXT, so ordering is string ordering: a row written with
+    the caller's ``+03:00`` sorts before one written as ``Z`` even when it
+    happened later. Everything goes through the same UTC normaliser the hash
+    uses, and ``ORDER BY observed_at`` means what it reads like.
+    """
+    return normalize_instant(value) if value else None
+
 
 
 # ---------------------------------------------------------------------------
@@ -152,9 +213,19 @@ class SourceEventRecord:
         init=False, repr=False, compare=False, default=False
     )
 
+    # Set by ``save_source_event``: whether the store already held this event.
+    # Transient like the flag above — it describes the last write, not the row.
+    # Carried here so a caller learns the outcome from the write it already
+    # made, instead of asking first and paying a round trip per row to find
+    # out what the write was about to tell it.
+    was_deduplicated: bool = field(
+        init=False, repr=False, compare=False, default=False
+    )
+
     def __post_init__(self) -> None:
-        now = _now()
+        now = utc_now()
         self.occurred_at_known = self.occurred_at is not None
+        self.was_deduplicated = False
         if self.occurred_at is None:
             self.occurred_at = now
         if self.observed_at is None:
@@ -224,7 +295,7 @@ class EntityRecord:
 
     def __post_init__(self) -> None:
         if self.created_at is None:
-            self.created_at = _now()
+            self.created_at = utc_now()
 
 
 @dataclass
@@ -253,7 +324,7 @@ class EntityMentionRecord:
 
     def __post_init__(self) -> None:
         if self.observed_at is None:
-            self.observed_at = _now()
+            self.observed_at = utc_now()
         if self.resolution not in RESOLUTION_METHODS:
             raise ValueError(
                 f"resolution must be one of {sorted(RESOLUTION_METHODS)}, "
@@ -335,17 +406,58 @@ class SupportsEvents(Protocol):
         source_event_id: str | None = None,
         primary_entity_id: str | None = None,
         user: str = "default",
-    ) -> None: ...
+    ) -> bool: ...
 
     def signatures_for_event(
         self, event_id: str, user: str = "default"
     ) -> list[Any]: ...
 
+    def signatures_for_entity(
+        self, entity_id: str, user: str = "default"
+    ) -> list[Any]: ...
+
+    def iter_source_events(self, user: str = "default", batch: int = 500) -> Any: ...
+
+    def iter_mentions(self, user: str = "default", batch: int = 500) -> Any: ...
+
+    def list_entities(
+        self, user: str = "default", include_dissolved: bool = False
+    ) -> list[EntityRecord]: ...
+
+    def get_mention(self, mention_id: str) -> EntityMentionRecord | None: ...
+
+    def check_integrity(self, user: str = "default") -> IntegrityReport: ...
+
+    def mentions_for_entity(
+        self, entity_id: str, user: str = "default"
+    ) -> list[EntityMentionRecord]: ...
+
+    def unresolved_mentions(
+        self, user: str = "default", limit: int = 100
+    ) -> list[EntityMentionRecord]: ...
+
 
 def storage_supports_events(storage: Any) -> bool:
-    """True when *storage* can carry events. Never raises on a plain driver."""
-    checker = getattr(storage, "supports_events", None)
-    return bool(checker()) if callable(checker) else False
+    """
+    True when *storage* can carry events — structurally and in fact.
+
+    Two questions, and both have to be yes. ``isinstance`` against the Protocol
+    is what makes the ``@runtime_checkable`` above more than decoration: it
+    catches a driver that answers the capability question while missing methods
+    the caller will reach for, which is how a half-implemented backend used to
+    accept an ingest and then die partway through it. ``supports_events()`` is
+    the driver's own answer about the backend behind it — a cloud driver can
+    have every method and still be pointed at a deployment that serves none of
+    the routes.
+
+    Never raises on a plain driver.
+    """
+    if not isinstance(storage, SupportsEvents):
+        return False
+    try:
+        return bool(storage.supports_events())
+    except Exception:  # pragma: no cover - a driver that cannot answer is a no
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -636,8 +748,8 @@ def entity_insert_row(entity: EntityRecord) -> tuple[Any, ...]:
         entity.origin_field_id,
         json.dumps(entity.aliases),
         entity.current_state_version,
-        _iso(entity.created_at),
-        _iso(entity.dissolved_at),
+        iso_utc(entity.created_at),
+        iso_utc(entity.dissolved_at),
         entity.merged_into,
     )
 
@@ -651,10 +763,10 @@ def mention_insert_row(mention: EntityMentionRecord) -> tuple[Any, ...]:
         mention.source_event_id,
         mention.signature_id,
         mention.field_id,
-        _iso(mention.observed_at),
+        iso_utc(mention.observed_at),
         mention.entity_id,
         mention.resolution,
-        _iso(mention.resolved_at),
+        iso_utc(mention.resolved_at),
         mention.confidence,
     )
 
@@ -767,11 +879,22 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 """.strip(),
-        f"DROP TRIGGER IF EXISTS trg_{function_name} ON {table}",
+        # No DROP. The previous version dropped and recreated on every driver
+        # __init__, which takes an ACCESS EXCLUSIVE lock on the table at each
+        # process start and races two workers booting together into
+        # DuplicateObject. Postgres has no CREATE TRIGGER IF NOT EXISTS, so the
+        # DO block swallows the duplicate instead — idempotent, and it touches
+        # nothing when the trigger is already in place.
         f"""
-CREATE TRIGGER trg_{function_name}
-BEFORE UPDATE OR DELETE ON {table}
-FOR EACH ROW EXECUTE FUNCTION {function_name}()
+DO $do$
+BEGIN
+    CREATE TRIGGER trg_{function_name}
+    BEFORE UPDATE OR DELETE ON {table}
+    FOR EACH ROW EXECUTE FUNCTION {function_name}();
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END;
+$do$;
 """.strip(),
     ]
 

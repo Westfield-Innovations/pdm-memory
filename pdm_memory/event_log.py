@@ -37,6 +37,7 @@ from typing import Any
 from pdm_memory.core.signature import SignatureRecord
 from pdm_memory.storage.events import (
     EntityMentionRecord,
+    IntegrityReport,
     EntityRecord,
     SourceEventRecord,
     storage_supports_events,
@@ -141,8 +142,10 @@ class EventLog:
         Re-ingesting the same payload reuses the event and re-records nothing:
         the event dedupes on its hash, the mention on its own key.
 
-        Returns ``{"source_event_id", "signature_ids", "entity_ids",
-        "deduplicated"}``.
+        Returns ``{"source_event_id", "signature_ids", "signatures_reused",
+        "entity_ids", "deduplicated"}``. ``signatures_reused`` counts facts
+        that were already on file under an earlier event — their provenance
+        stays with the message that first carried them.
         """
         seen_before = (
             self._storage.find_event_by_hash(
@@ -154,6 +157,7 @@ class EventLog:
 
         signature_ids: list[str] = []
         entity_ids: dict[str, str] = {}
+        reused = 0
 
         for fact in facts:
             spec = dict(fact)
@@ -173,16 +177,24 @@ class EventLog:
                 )
                 entity_ids[about] = entity_id
 
-            self._storage.link_signature(
+            # Memory.save deduplicates on text, so this id may belong to a
+            # signature an earlier event already produced. link_signature says
+            # which happened; the count goes back to the caller rather than
+            # being swallowed, because "your fact was already on file, under a
+            # different message" is exactly what they need to know.
+            claimed = self._storage.link_signature(
                 memory_id,
                 source_event_id=event_id,
                 primary_entity_id=entity_id,
                 user=self._user,
             )
+            if not claimed:
+                reused += 1
 
         return {
             "source_event_id": event_id,
             "signature_ids": signature_ids,
+            "signatures_reused": reused,
             "entity_ids": entity_ids,
             "deduplicated": seen_before,
         }
@@ -241,6 +253,15 @@ class EventLog:
     def pending(self, limit: int = 100) -> list[EntityMentionRecord]:
         """Mentions with no identity yet — the queue behind the prompt."""
         return self._storage.unresolved_mentions(user=self._user, limit=limit)
+
+    def check_integrity(self) -> "IntegrityReport":
+        """
+        Report references that lead nowhere. Reads only; repairs nothing.
+
+        Worth running after anything that wrote to the store outside the SDK —
+        a restored backup, a manual fix, a migration from another tool.
+        """
+        return self._storage.check_integrity(user=self._user)
 
     def entities(self, include_dissolved: bool = False) -> list[EntityRecord]:
         return self._storage.list_entities(

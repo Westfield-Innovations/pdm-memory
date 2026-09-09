@@ -35,7 +35,6 @@ class EventfulSQLiteDriver(EventStoreMixin, SQLiteDriver):
 
     _EVENT_PLACEHOLDER = "?"
     _EVENT_USER_COLUMN = "user"
-    _EVENT_INTEGRITY_ERRORS = (sqlite3.IntegrityError,)
 
     def __init__(self, db_path: str = "./pdm_memory.db", store_raw: bool = True) -> None:
         super().__init__(db_path=db_path, store_raw=store_raw)

@@ -15,13 +15,17 @@ stops working across sync and AC1 fails without raising anything.
 
 from __future__ import annotations
 
+import json
 import logging
+from collections.abc import Iterator
 from typing import Any
 
 from pdm_memory.storage.cloud_driver import CloudDriver
 from pdm_memory.storage.errors import CloudNotFoundError, CloudStorageError
 from pdm_memory.storage.events import (
     AppendOnlyViolation,
+    IntegrityReport,
+    iso_utc,
     EntityMentionRecord,
     EntityRecord,
     SourceEventRecord,
@@ -38,20 +42,54 @@ MENTIONS_PATH = "/api/v1/pdm/entity-mentions"
 
 
 def _iso(value: Any) -> str | None:
-    return value.isoformat() if hasattr(value, "isoformat") else value
+    """The wire uses the same UTC spelling as the store — see events.iso_utc."""
+    return iso_utc(value) if hasattr(value, "isoformat") else value
+
+
+def _rows(payload: Any) -> list[dict[str, Any]]:
+    """Unwrap a list response, paginated or bare."""
+    if isinstance(payload, dict):
+        return payload.get("results") or payload.get("items") or []
+    return payload or []
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Companion may send JSON columns as text; the row mappers decode, so do we."""
+    if isinstance(value, str):
+        try:
+            return json.loads(value or "{}")
+        except json.JSONDecodeError:
+            return {}
+    return value or {}
+
+
+def _as_list(value: Any) -> list[Any]:
+    if isinstance(value, str):
+        try:
+            return json.loads(value or "[]")
+        except json.JSONDecodeError:
+            return []
+    return value or []
 
 
 class EventfulCloudDriver(CloudDriver):
     """``CloudDriver`` plus the source-event routes."""
 
+    # Companion does not serve the routes below yet — SourceEvent, the nested
+    # ingest contract and the entity routes are the Django half of TKT-101,
+    # which has not landed. Claiming the capability before then is a promise
+    # the backend cannot keep: EventLog would accept the driver and a single
+    # ingest would write an event, a signature, a mention and an entity into
+    # 404s. Flip this to True in the same change that ships those routes.
+    EVENTS_AVAILABLE: bool = False
+
     def supports_events(self) -> bool:
         """
-        True, but over HTTP.
-
-        The distinction matters to callers deciding whether to batch: every
-        method here is a round trip, where the local drivers are a statement.
+        Whether the Companion deployment behind this driver serves the event
+        routes. False until the server half exists — the honest answer, and the
+        one that keeps a partial remote write from happening at all.
         """
-        return True
+        return self.EVENTS_AVAILABLE
 
     # ------------------------------------------------------------------
     # Source events
@@ -76,7 +114,8 @@ class EventfulCloudDriver(CloudDriver):
                 "predates the TKT-101 contract.",
                 path=INGEST_PATH,
             )
-        if resp.get("deduplicated"):
+        event.was_deduplicated = bool(resp.get("deduplicated"))
+        if event.was_deduplicated:
             logger.debug("[PDM-Events] Companion deduplicated event %s", event_id)
         event.id = event_id
         return event_id
@@ -219,7 +258,7 @@ class EventfulCloudDriver(CloudDriver):
             observed_at=_parse_dt(data.get("observed_at")),
             ingested_at=_parse_dt(data.get("ingested_at")),
             source_system=data.get("source_system", "chat"),
-            provenance=data.get("provenance") or {},
+            provenance=_as_dict(data.get("provenance")),
             raw_reference=data.get("raw_reference") or "",
             content_hash=data.get("content_hash", ""),
             capture_authority_state=data.get("capture_authority_state", "unknown"),
@@ -237,7 +276,7 @@ class EventfulCloudDriver(CloudDriver):
             canonical_name=data.get("canonical_name", ""),
             disambiguator=data.get("disambiguator", ""),
             origin_field_id=data.get("origin_field_id", ""),
-            aliases=data.get("aliases") or [],
+            aliases=_as_list(data.get("aliases")),
             current_state_version=data.get("current_state_version", 1),
             created_at=_parse_dt(data.get("created_at")),
             dissolved_at=_parse_dt(data.get("dissolved_at")),
@@ -254,7 +293,153 @@ class EventfulCloudDriver(CloudDriver):
             "signature_id": mention.signature_id,
             "field_id": mention.field_id,
             "observed_at": _iso(mention.observed_at),
+            "resolved_at": _iso(mention.resolved_at),
             "entity_id": mention.entity_id,
             "resolution": mention.resolution,
             "confidence": mention.confidence,
         }
+
+    # ------------------------------------------------------------------
+    # Reads — completing the interface the mixin defines
+    # ------------------------------------------------------------------
+
+    def list_source_events(
+        self, user: str = "default", limit: int = 100
+    ) -> list[SourceEventRecord]:
+        resp = self._get(EVENTS_PATH, params={"user": user, "limit": limit})
+        return [self.event_from_payload(row) for row in _rows(resp.json())]
+
+    def iter_source_events(
+        self, user: str = "default", batch: int = 500
+    ) -> Iterator[SourceEventRecord]:
+        """
+        Page through every event, oldest first, following the cursor the API
+        returns. One page per round trip beats one row per round trip, and the
+        cursor is what keeps a sync from re-reading the newest page forever.
+        """
+        cursor: str | None = None
+        while True:
+            params: dict[str, Any] = {"user": user, "limit": batch, "order": "occurred_at"}
+            if cursor:
+                params["after"] = cursor
+            payload = self._get(EVENTS_PATH, params=params).json()
+            rows = _rows(payload)
+            if not rows:
+                return
+            for row in rows:
+                yield self.event_from_payload(row)
+            cursor = payload.get("next") if isinstance(payload, dict) else None
+            if not cursor or len(rows) < batch:
+                return
+
+    def iter_mentions(
+        self, user: str = "default", batch: int = 500
+    ) -> Iterator[EntityMentionRecord]:
+        """Every mention, resolved or not — see the mixin's note on why both."""
+        cursor: str | None = None
+        while True:
+            params: dict[str, Any] = {"user": user, "limit": batch, "order": "observed_at"}
+            if cursor:
+                params["after"] = cursor
+            payload = self._get(MENTIONS_PATH, params=params).json()
+            rows = _rows(payload)
+            if not rows:
+                return
+            for row in rows:
+                yield self.mention_from_payload(row)
+            cursor = payload.get("next") if isinstance(payload, dict) else None
+            if not cursor or len(rows) < batch:
+                return
+
+    def check_integrity(self, user: str = "default") -> IntegrityReport:
+        """
+        Always clean, and not because nobody looked.
+
+        The local check exists because SQLite enforces foreign keys per
+        connection, so a client writing raw SQL past the driver can leave a
+        pointer dangling. Companion stores these rows in PostgreSQL behind real
+        foreign key constraints, which no client can write around — a dangling
+        reference cannot be created there in the first place.
+
+        Reporting clean without a round trip is the honest answer, not a stub.
+        If that ever stops being true it will be because someone dropped a
+        constraint, and this method is not where that would be discovered.
+        """
+        return IntegrityReport()
+
+    def get_mention(self, mention_id: str) -> EntityMentionRecord | None:
+        try:
+            resp = self._get(f"{MENTIONS_PATH}/{mention_id}")
+        except CloudNotFoundError:
+            return None
+        return self.mention_from_payload(resp.json())
+
+    def mentions_for_entity(
+        self, entity_id: str, user: str = "default"
+    ) -> list[EntityMentionRecord]:
+        resp = self._get(MENTIONS_PATH, params={"user": user, "entity_id": entity_id})
+        return [self.mention_from_payload(row) for row in _rows(resp.json())]
+
+    def unresolved_mentions(
+        self, user: str = "default", limit: int = 100
+    ) -> list[EntityMentionRecord]:
+        resp = self._get(
+            MENTIONS_PATH, params={"user": user, "resolution": "unresolved", "limit": limit}
+        )
+        return [self.mention_from_payload(row) for row in _rows(resp.json())]
+
+    def resolve_mention(
+        self,
+        mention_id: str,
+        *,
+        entity_id: str,
+        method: str,
+        confidence: float | None = None,
+    ) -> None:
+        self._patch(
+            f"{MENTIONS_PATH}/{mention_id}",
+            {"entity_id": entity_id, "resolution": method, "confidence": confidence},
+        )
+
+    def list_entities(
+        self, user: str = "default", include_dissolved: bool = False
+    ) -> list[EntityRecord]:
+        resp = self._get(
+            ENTITIES_PATH,
+            params={"user": user, "include_dissolved": str(include_dissolved).lower()},
+        )
+        return [self.entity_from_payload(row) for row in _rows(resp.json())]
+
+    def signatures_for_event(self, event_id: str, user: str = "default") -> list:
+        from pdm_memory.storage.schema import mapping_to_record
+
+        resp = self._get(
+            "/api/v1/pdm/signatures", params={"user": user, "source_event_id": event_id}
+        )
+        return [mapping_to_record(row) for row in _rows(resp.json())]
+
+    def signatures_for_entity(self, entity_id: str, user: str = "default") -> list:
+        from pdm_memory.storage.schema import mapping_to_record
+
+        resp = self._get(
+            "/api/v1/pdm/signatures", params={"user": user, "primary_entity_id": entity_id}
+        )
+        return [mapping_to_record(row) for row in _rows(resp.json())]
+
+    @staticmethod
+    def mention_from_payload(data: dict[str, Any]) -> EntityMentionRecord:
+        from pdm_memory.storage.events import _parse_dt
+
+        return EntityMentionRecord(
+            id=data.get("id", ""),
+            user=str(data.get("user", "default")),
+            surface_form=data.get("surface_form", ""),
+            source_event_id=data.get("source_event_id") or "",
+            signature_id=data.get("signature_id") or "",
+            field_id=data.get("field_id") or "",
+            observed_at=_parse_dt(data.get("observed_at")),
+            entity_id=data.get("entity_id"),
+            resolution=data.get("resolution") or "unresolved",
+            resolved_at=_parse_dt(data.get("resolved_at")),
+            confidence=data.get("confidence"),
+        )
