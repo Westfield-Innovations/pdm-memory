@@ -98,11 +98,15 @@ REVISABLE_RESOLUTIONS: frozenset[str] = frozenset(
 )
 
 
-def _now() -> datetime:
+def utc_now() -> datetime:
+    """The single clock. Duplicated in three modules before this."""
     return datetime.now(tz=timezone.utc)
 
 
-def _iso(value: datetime | None) -> str | None:
+_now = utc_now
+
+
+def iso_utc(value: datetime | None) -> str | None:
     """
     One spelling for every timestamp column in the store.
 
@@ -112,6 +116,9 @@ def _iso(value: datetime | None) -> str | None:
     uses, and ``ORDER BY observed_at`` means what it reads like.
     """
     return normalize_instant(value) if value else None
+
+
+_iso = iso_utc  # internal alias, kept short at the call sites below
 
 
 # ---------------------------------------------------------------------------
@@ -353,17 +360,56 @@ class SupportsEvents(Protocol):
         source_event_id: str | None = None,
         primary_entity_id: str | None = None,
         user: str = "default",
-    ) -> None: ...
+    ) -> bool: ...
 
     def signatures_for_event(
         self, event_id: str, user: str = "default"
     ) -> list[Any]: ...
 
+    def signatures_for_entity(
+        self, entity_id: str, user: str = "default"
+    ) -> list[Any]: ...
+
+    def iter_source_events(self, user: str = "default", batch: int = 500) -> Any: ...
+
+    def iter_mentions(self, user: str = "default", batch: int = 500) -> Any: ...
+
+    def list_entities(
+        self, user: str = "default", include_dissolved: bool = False
+    ) -> list[EntityRecord]: ...
+
+    def get_mention(self, mention_id: str) -> EntityMentionRecord | None: ...
+
+    def mentions_for_entity(
+        self, entity_id: str, user: str = "default"
+    ) -> list[EntityMentionRecord]: ...
+
+    def unresolved_mentions(
+        self, user: str = "default", limit: int = 100
+    ) -> list[EntityMentionRecord]: ...
+
 
 def storage_supports_events(storage: Any) -> bool:
-    """True when *storage* can carry events. Never raises on a plain driver."""
-    checker = getattr(storage, "supports_events", None)
-    return bool(checker()) if callable(checker) else False
+    """
+    True when *storage* can carry events — structurally and in fact.
+
+    Two questions, and both have to be yes. ``isinstance`` against the Protocol
+    is what makes the ``@runtime_checkable`` above more than decoration: it
+    catches a driver that answers the capability question while missing methods
+    the caller will reach for, which is how a half-implemented backend used to
+    accept an ingest and then die partway through it. ``supports_events()`` is
+    the driver's own answer about the backend behind it — a cloud driver can
+    have every method and still be pointed at a deployment that serves none of
+    the routes.
+
+    Never raises on a plain driver.
+    """
+    if not isinstance(storage, SupportsEvents):
+        return False
+    try:
+        return bool(storage.supports_events())
+    except Exception:  # pragma: no cover - a driver that cannot answer is a no
+        return False
 
 
 # ---------------------------------------------------------------------------

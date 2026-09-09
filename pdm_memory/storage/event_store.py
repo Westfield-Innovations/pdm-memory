@@ -16,7 +16,6 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Iterator
-from datetime import datetime, timezone
 from typing import Any
 
 from pdm_memory.core.signature import SignatureRecord
@@ -35,16 +34,13 @@ from pdm_memory.storage.events import (
     mention_from_row,
     mention_insert_row,
     normalize_surface,
+    utc_now,
 )
 from pdm_memory.storage.schema import mapping_to_record
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["EventStoreMixin"]
-
-
-def _now() -> datetime:
-    return datetime.now(tz=timezone.utc)
 
 
 class EventStoreMixin:
@@ -84,6 +80,32 @@ class EventStoreMixin:
 
     def _run(self, query: str, params: tuple[Any, ...] = ()) -> Any:
         return self._conn().execute(self._sql(query), params)
+
+    def _write(self, query: str, params: tuple[Any, ...] = ()) -> Any:
+        """
+        Run a statement that can fail, and never leave the failure behind.
+
+        A statement that raises — a foreign key refused, a lock timed out —
+        leaves the driver's implicit transaction open, and with it the write
+        lock. Every other writer then queues behind a connection that has
+        already given up, and the symptom surfaces as ``database is locked``
+        several threads from its cause.
+
+        try/finally rather than a list of exception classes to catch: the
+        transaction has to be released whatever went wrong, and an
+        ``OperationalError`` parks it exactly as thoroughly as an integrity
+        violation. Inside an explicit ``transaction()`` the caller owns the
+        block and this stays out of the way.
+        """
+        try:
+            return self._conn().execute(self._sql(query), params)
+        except Exception:
+            if getattr(getattr(self, "_local", None), "txn_depth", 0) == 0:
+                try:
+                    self._conn().rollback()
+                except Exception:  # pragma: no cover - rollback of a dead conn
+                    logger.debug("[PDM-Events] rollback after failed write failed")
+            raise
 
     def supports_events(self) -> bool:
         return True
@@ -328,7 +350,7 @@ class EventStoreMixin:
                SET entity_id = ?, resolution = ?, resolved_at = ?, confidence = ?
              WHERE id = ?
             """,
-            (entity_id, method, normalize_instant(_now()), confidence, mention_id),
+            (entity_id, method, normalize_instant(utc_now()), confidence, mention_id),
         )
         self._commit_if_idle(self._conn())
 
@@ -563,7 +585,7 @@ class EventStoreMixin:
                        current_state_version = current_state_version + 1
                  WHERE id = ?
                 """,
-                (normalize_instant(_now()), keep_id, merge_id),
+                (normalize_instant(utc_now()), keep_id, merge_id),
             )
 
     # ------------------------------------------------------------------
@@ -605,7 +627,7 @@ class EventStoreMixin:
 
         if source_event_id is not None:
             guard = "" if overwrite else " AND source_event_id IS NULL"
-            cursor = self._run(
+            cursor = self._write(
                 "UPDATE pdm_signatures SET source_event_id = ? "
                 f"WHERE id = ? AND {{user}} = ?{guard}",
                 (source_event_id, signature_id, user),
@@ -614,7 +636,7 @@ class EventStoreMixin:
 
         if primary_entity_id is not None:
             guard = "" if overwrite else " AND primary_entity_id IS NULL"
-            self._run(
+            self._write(
                 "UPDATE pdm_signatures SET primary_entity_id = ? "
                 f"WHERE id = ? AND {{user}} = ?{guard}",
                 (primary_entity_id, signature_id, user),

@@ -444,3 +444,56 @@ class TestPostgresTriggerInstallIsCheap:
         ]
         assert repoints, "merge no longer repoints mentions?"
         assert "{user}" in body.split("UPDATE pdm_entity_mentions")[1][:200]
+
+
+class TestAFailedWriteReleasesTheLock:
+    """
+    Finding 3, second half — the one the first pass missed. link_signature can
+    violate a foreign key, and a failed statement leaves SQLite's implicit
+    transaction open with the write lock still held. Every other writer then
+    queues behind a connection that has already raised.
+
+    The review asked for try/finally rather than an except clause per error
+    class, and it was right: `database is locked` parks the transaction just
+    as thoroughly as a constraint violation does.
+    """
+
+    def test_a_foreign_key_violation_does_not_park_the_transaction(self, driver):
+        import sqlite3
+
+        from pdm_memory.core.signature import SignatureRecord
+
+        sig = SignatureRecord(compressed_fact="x", intent_tags=["a", "b", "c"])
+        driver.save(sig)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            driver.link_signature(sig.id, source_event_id="no-such-event")
+
+        assert not driver._conn().in_transaction, (
+            "the failed write is still holding the write lock"
+        )
+
+    def test_another_writer_is_not_blocked_by_the_failure(self, driver, tmp_path):
+        from pdm_memory.core.signature import SignatureRecord
+
+        sig = SignatureRecord(compressed_fact="x", intent_tags=["a", "b", "c"])
+        driver.save(sig)
+        with pytest.raises(Exception):
+            driver.link_signature(sig.id, source_event_id="no-such-event")
+
+        errors: list[str] = []
+
+        def write() -> None:
+            try:
+                other = EventfulSQLiteDriver(db_path=driver.db_path)
+                other.save(
+                    SignatureRecord(compressed_fact="y", intent_tags=["a", "b", "c"])
+                )
+                other.close()
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{type(exc).__name__}: {exc}")
+
+        thread = threading.Thread(target=write)
+        thread.start()
+        thread.join(timeout=10)
+        assert not errors, errors

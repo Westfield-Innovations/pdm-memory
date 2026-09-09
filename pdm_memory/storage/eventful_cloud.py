@@ -24,6 +24,7 @@ from pdm_memory.storage.cloud_driver import CloudDriver
 from pdm_memory.storage.errors import CloudNotFoundError, CloudStorageError
 from pdm_memory.storage.events import (
     AppendOnlyViolation,
+    iso_utc,
     EntityMentionRecord,
     EntityRecord,
     SourceEventRecord,
@@ -40,7 +41,8 @@ MENTIONS_PATH = "/api/v1/pdm/entity-mentions"
 
 
 def _iso(value: Any) -> str | None:
-    return value.isoformat() if hasattr(value, "isoformat") else value
+    """The wire uses the same UTC spelling as the store — see events.iso_utc."""
+    return iso_utc(value) if hasattr(value, "isoformat") else value
 
 
 def _rows(payload: Any) -> list[dict[str, Any]]:
