@@ -6,13 +6,18 @@ than inside it, and takes the same two arguments for the same reason: it works
 against ``BaseStorage``, not against a particular driver.
 
 Order is not incidental. Events go first, then entities, then the mentions that
-point at both, then the signature links. A mention pushed before its event
-would reference a row that does not exist yet, and on the local side that is a
-foreign-key error rather than a warning.
+point at both. A mention pushed before its event references a row that does not
+exist yet, and on the local side that is a foreign-key error rather than a
+warning.
 
-Conflict resolution barely arises here, which is the point of an append-only
-layer: an event that exists on both sides is the *same* event, because the
-hash says so. There is nothing to reconcile — only something to skip.
+Identity does not survive the trip by id. An event is the same event on both
+sides because its hash says so, and an entity is the same identity because its
+name and field say so — but each side stores them under its own primary keys.
+So every pass builds a translation table as it goes and rewrites the pointers
+it carries. Skipping that step is how a mention ends up attached to nothing.
+
+Conflict resolution barely arises: an event present on both sides *is* the same
+event. There is nothing to reconcile, only something to skip.
 """
 
 from __future__ import annotations
@@ -27,6 +32,8 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["EventSync", "EventSyncReport"]
 
+DEFAULT_PAGE_SIZE = 500
+
 
 @dataclass
 class EventSyncReport:
@@ -35,7 +42,9 @@ class EventSyncReport:
     events_pulled: int = 0
     events_deduplicated: int = 0
     entities_pushed: int = 0
+    entities_pulled: int = 0
     mentions_pushed: int = 0
+    mentions_pulled: int = 0
     errors: int = 0
     unsupported: list[str] = field(default_factory=list)
 
@@ -44,7 +53,8 @@ class EventSyncReport:
             f"EventSyncReport(direction={self.direction}, "
             f"events={self.events_pushed}/{self.events_pulled}, "
             f"deduplicated={self.events_deduplicated}, "
-            f"entities={self.entities_pushed}, mentions={self.mentions_pushed}, "
+            f"entities={self.entities_pushed}/{self.entities_pulled}, "
+            f"mentions={self.mentions_pushed}/{self.mentions_pulled}, "
             f"errors={self.errors})"
         )
 
@@ -52,21 +62,17 @@ class EventSyncReport:
 class EventSync:
     """Move source events, entities and mentions between two stores."""
 
-    def __init__(self, local, cloud) -> None:
+    def __init__(self, local, cloud, *, page_size: int = DEFAULT_PAGE_SIZE) -> None:
         self._local = local
         self._cloud = cloud
+        self._page_size = max(1, page_size)
 
-    def sync(
-        self,
-        user: str = "default",
-        direction: str = "push",
-        limit: int = 1000,
-    ) -> EventSyncReport:
+    def sync(self, user: str = "default", direction: str = "push") -> EventSyncReport:
         """
         Args:
-            user:      Whose evidence to move.
+            user:      Whose evidence to move. Rows land under this user on the
+                       far side regardless of what the payload claims.
             direction: ``"push"``, ``"pull"``, or ``"bidirectional"``.
-            limit:     Cap on rows read per side.
 
         A store that cannot carry events is reported, not raised on: a mixed
         fleet is the normal state during a rollout, and the caller wants the
@@ -86,114 +92,151 @@ class EventSync:
             return report
 
         if direction in ("push", "bidirectional"):
-            self._push(user, limit, report)
+            self._transfer(self._local, self._cloud, user, report, pulling=False)
         if direction in ("pull", "bidirectional"):
-            self._pull(user, limit, report)
+            self._transfer(self._cloud, self._local, user, report, pulling=True)
 
         logger.info("[PDM-EventSync] %s", report)
         return report
 
     # ------------------------------------------------------------------
-    # Private
+    # One direction, both ways round
     # ------------------------------------------------------------------
 
-    def _push(self, user: str, limit: int, report: EventSyncReport) -> None:
-        try:
-            events = self._local.list_source_events(user=user, limit=limit)
-        except Exception as exc:
-            logger.error("[PDM-EventSync] cannot read local events: %s", exc)
-            report.errors += 1
-            return
+    def _transfer(self, source, target, user: str, report: EventSyncReport, *, pulling: bool):
+        """
+        Push and pull differ only in which store is read. Writing this once
+        keeps the id translation identical in both directions, which is where
+        the two hand-written copies had drifted apart — the pull side moved
+        events alone and left every entity and mention behind.
+        """
+        events = self._transfer_events(source, target, user, report, pulling=pulling)
+        entities = self._transfer_entities(source, target, user, report, pulling=pulling)
+        self._transfer_mentions(
+            source, target, user, report, events, entities, pulling=pulling
+        )
 
-        # id here → id there. An event's identity is its hash, so the two sides
-        # may legitimately hold it under different primary keys.
+    def _transfer_events(
+        self, source, target, user: str, report: EventSyncReport, *, pulling: bool
+    ) -> dict[str, str]:
+        """Returns source id → target id for everything that crossed."""
         remapped: dict[str, str] = {}
+        try:
+            events = source.iter_source_events(user=user, batch=self._page_size)
+        except Exception as exc:
+            logger.error("[PDM-EventSync] cannot read events: %s", exc)
+            report.errors += 1
+            return remapped
 
         for event in events:
             try:
-                existing = self._cloud.find_event_by_hash(event.content_hash, user=user)
-                if existing is not None:
-                    remapped[event.id] = existing.id
+                source_id = event.id
+                # Stamp the requested user rather than trust the payload. The
+                # cloud driver defaults a missing user to "default", so a pull
+                # for alice used to store under default and then deduplicate
+                # under alice — every pull writing another copy.
+                event.user = user
+
+                stored_id = target.save_source_event(event)
+                remapped[source_id] = stored_id
+
+                # No question asked before the write. save_source_event is
+                # idempotent on the hash and reports on the record whether the
+                # far side already held the event, so the write itself answers
+                # what the ask-then-write version spent a second round trip per
+                # row to find out.
+                if event.was_deduplicated:
                     report.events_deduplicated += 1
-                    continue
-                local_id = event.id
-                remapped[local_id] = self._cloud.save_source_event(event)
-                report.events_pushed += 1
+                elif pulling:
+                    report.events_pulled += 1
+                else:
+                    report.events_pushed += 1
             except CloudStorageError as exc:
-                logger.warning("[PDM-EventSync] push event %s: %s", event.id, exc)
+                logger.warning("[PDM-EventSync] event %s: %s", event.id, exc)
                 report.errors += 1
             except Exception as exc:
-                logger.warning("[PDM-EventSync] push event %s: %s", event.id, exc)
+                logger.warning("[PDM-EventSync] event %s: %s", event.id, exc)
                 report.errors += 1
+        return remapped
 
-        self._push_entities(user, limit, report)
-        self._push_mentions(user, limit, remapped, report)
-
-    def _push_entities(self, user: str, limit: int, report: EventSyncReport) -> None:
+    def _transfer_entities(
+        self, source, target, user: str, report: EventSyncReport, *, pulling: bool
+    ) -> dict[str, str]:
+        remapped: dict[str, str] = {}
         try:
-            entities = self._local.list_entities(user=user)
+            entities = source.list_entities(user=user)
         except Exception as exc:
-            logger.warning("[PDM-EventSync] cannot read local entities: %s", exc)
+            logger.warning("[PDM-EventSync] cannot read entities: %s", exc)
             report.errors += 1
-            return
+            return remapped
 
-        for entity in entities[:limit]:
+        for entity in entities:
             try:
-                self._cloud.resolve_or_create_entity(
+                # Resolution is by name and field on both sides, so asking the
+                # target to resolve returns its own id for the same identity —
+                # which is exactly the translation the mentions will need.
+                remapped[entity.id] = target.resolve_or_create_entity(
                     user=user,
                     surface_form=entity.canonical_name,
                     field_id=entity.origin_field_id,
                     entity_type=entity.entity_type,
                 )
-                report.entities_pushed += 1
+                if pulling:
+                    report.entities_pulled += 1
+                else:
+                    report.entities_pushed += 1
             except Exception as exc:
                 logger.warning(
-                    "[PDM-EventSync] push entity %s: %s", entity.canonical_name, exc
+                    "[PDM-EventSync] entity %s: %s", entity.canonical_name, exc
                 )
                 report.errors += 1
+        return remapped
 
-    def _push_mentions(
+    def _transfer_mentions(
         self,
+        source,
+        target,
         user: str,
-        limit: int,
-        remapped: dict[str, str],
         report: EventSyncReport,
+        events: dict[str, str],
+        entities: dict[str, str],
+        *,
+        pulling: bool,
     ) -> None:
         try:
-            mentions = self._local.unresolved_mentions(user=user, limit=limit)
+            mentions = source.iter_mentions(user=user, batch=self._page_size)
         except Exception as exc:
-            logger.warning("[PDM-EventSync] cannot read local mentions: %s", exc)
+            logger.warning("[PDM-EventSync] cannot read mentions: %s", exc)
             report.errors += 1
             return
 
         for mention in mentions:
             try:
-                # Point the mention at the event id the far side actually uses.
-                mention.source_event_id = remapped.get(
+                mention.user = user
+                mention.source_event_id = events.get(
                     mention.source_event_id, mention.source_event_id
                 )
-                self._cloud.record_mention(mention)
-                report.mentions_pushed += 1
-            except Exception as exc:
-                logger.warning("[PDM-EventSync] push mention %s: %s", mention.id, exc)
-                report.errors += 1
+                resolved_to = (
+                    entities.get(mention.entity_id) if mention.entity_id else None
+                )
+                mention.entity_id = resolved_to
+                mention_id = target.record_mention(mention)
 
-    def _pull(self, user: str, limit: int, report: EventSyncReport) -> None:
-        try:
-            events = self._cloud.list_source_events(user=user, limit=limit)
-        except Exception as exc:
-            logger.error("[PDM-EventSync] cannot read cloud events: %s", exc)
-            report.errors += 1
-            return
-
-        for event in events:
-            try:
-                before = self._local.find_event_by_hash(event.content_hash, user=user)
-                self._local.save_source_event(event)
-                if before is None:
-                    report.events_pulled += 1
+                # The grade travels with the attribution. Downgrading a
+                # person's confirmed answer to an automatic one because it
+                # crossed a wire would lose the only thing that distinguishes
+                # them.
+                if resolved_to is not None:
+                    target.resolve_mention(
+                        mention_id,
+                        entity_id=resolved_to,
+                        method=mention.resolution,
+                        confidence=mention.confidence,
+                    )
+                if pulling:
+                    report.mentions_pulled += 1
                 else:
-                    report.events_deduplicated += 1
+                    report.mentions_pushed += 1
             except Exception as exc:
-                logger.warning("[PDM-EventSync] pull event %s: %s", event.id, exc)
+                logger.warning("[PDM-EventSync] mention %s: %s", mention.id, exc)
                 report.errors += 1

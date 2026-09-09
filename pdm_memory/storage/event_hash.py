@@ -79,10 +79,17 @@ def normalize_instant(value: datetime | str | None) -> str:
             return ""
         parsed = _parse_iso(raw)
         if parsed is None:
-            # Unparseable strings pass through verbatim. Hashing something the
-            # caller controls beats guessing at its meaning; both sides do the
-            # same thing with it, which is all the contract requires.
-            return raw
+            # Refused, not passed through. `fromisoformat` accepts a different
+            # set of spellings on 3.10 than on 3.11+, so a string one runtime
+            # cannot parse and another can would hash two ways — an SDK and a
+            # Companion on different versions would each record the same event,
+            # which is the silent duplication this module exists to prevent.
+            # Better to fail at the call site, loudly, once.
+            raise ValueError(
+                f"occurred_at must be ISO-8601; {raw!r} cannot be parsed. "
+                "A timestamp the hash cannot normalise is a timestamp that "
+                "hashes differently on another Python version."
+            )
         value = parsed
 
     if not isinstance(value, datetime):

@@ -103,7 +103,15 @@ def _now() -> datetime:
 
 
 def _iso(value: datetime | None) -> str | None:
-    return value.isoformat() if value else None
+    """
+    One spelling for every timestamp column in the store.
+
+    These columns are TEXT, so ordering is string ordering: a row written with
+    the caller's ``+03:00`` sorts before one written as ``Z`` even when it
+    happened later. Everything goes through the same UTC normaliser the hash
+    uses, and ``ORDER BY observed_at`` means what it reads like.
+    """
+    return normalize_instant(value) if value else None
 
 
 # ---------------------------------------------------------------------------
@@ -152,9 +160,19 @@ class SourceEventRecord:
         init=False, repr=False, compare=False, default=False
     )
 
+    # Set by ``save_source_event``: whether the store already held this event.
+    # Transient like the flag above — it describes the last write, not the row.
+    # Carried here so a caller learns the outcome from the write it already
+    # made, instead of asking first and paying a round trip per row to find
+    # out what the write was about to tell it.
+    was_deduplicated: bool = field(
+        init=False, repr=False, compare=False, default=False
+    )
+
     def __post_init__(self) -> None:
         now = _now()
         self.occurred_at_known = self.occurred_at is not None
+        self.was_deduplicated = False
         if self.occurred_at is None:
             self.occurred_at = now
         if self.observed_at is None:
@@ -767,11 +785,22 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 """.strip(),
-        f"DROP TRIGGER IF EXISTS trg_{function_name} ON {table}",
+        # No DROP. The previous version dropped and recreated on every driver
+        # __init__, which takes an ACCESS EXCLUSIVE lock on the table at each
+        # process start and races two workers booting together into
+        # DuplicateObject. Postgres has no CREATE TRIGGER IF NOT EXISTS, so the
+        # DO block swallows the duplicate instead — idempotent, and it touches
+        # nothing when the trigger is already in place.
         f"""
-CREATE TRIGGER trg_{function_name}
-BEFORE UPDATE OR DELETE ON {table}
-FOR EACH ROW EXECUTE FUNCTION {function_name}()
+DO $do$
+BEGIN
+    CREATE TRIGGER trg_{function_name}
+    BEFORE UPDATE OR DELETE ON {table}
+    FOR EACH ROW EXECUTE FUNCTION {function_name}();
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END;
+$do$;
 """.strip(),
     ]
 

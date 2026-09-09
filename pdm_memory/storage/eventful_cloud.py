@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Iterator
 from typing import Any
 
 from pdm_memory.storage.cloud_driver import CloudDriver
@@ -110,7 +111,8 @@ class EventfulCloudDriver(CloudDriver):
                 "predates the TKT-101 contract.",
                 path=INGEST_PATH,
             )
-        if resp.get("deduplicated"):
+        event.was_deduplicated = bool(resp.get("deduplicated"))
+        if event.was_deduplicated:
             logger.debug("[PDM-Events] Companion deduplicated event %s", event_id)
         event.id = event_id
         return event_id
@@ -303,6 +305,48 @@ class EventfulCloudDriver(CloudDriver):
     ) -> list[SourceEventRecord]:
         resp = self._get(EVENTS_PATH, params={"user": user, "limit": limit})
         return [self.event_from_payload(row) for row in _rows(resp.json())]
+
+    def iter_source_events(
+        self, user: str = "default", batch: int = 500
+    ) -> Iterator[SourceEventRecord]:
+        """
+        Page through every event, oldest first, following the cursor the API
+        returns. One page per round trip beats one row per round trip, and the
+        cursor is what keeps a sync from re-reading the newest page forever.
+        """
+        cursor: str | None = None
+        while True:
+            params: dict[str, Any] = {"user": user, "limit": batch, "order": "occurred_at"}
+            if cursor:
+                params["after"] = cursor
+            payload = self._get(EVENTS_PATH, params=params).json()
+            rows = _rows(payload)
+            if not rows:
+                return
+            for row in rows:
+                yield self.event_from_payload(row)
+            cursor = payload.get("next") if isinstance(payload, dict) else None
+            if not cursor or len(rows) < batch:
+                return
+
+    def iter_mentions(
+        self, user: str = "default", batch: int = 500
+    ) -> Iterator[EntityMentionRecord]:
+        """Every mention, resolved or not — see the mixin's note on why both."""
+        cursor: str | None = None
+        while True:
+            params: dict[str, Any] = {"user": user, "limit": batch, "order": "observed_at"}
+            if cursor:
+                params["after"] = cursor
+            payload = self._get(MENTIONS_PATH, params=params).json()
+            rows = _rows(payload)
+            if not rows:
+                return
+            for row in rows:
+                yield self.mention_from_payload(row)
+            cursor = payload.get("next") if isinstance(payload, dict) else None
+            if not cursor or len(rows) < batch:
+                return
 
     def get_mention(self, mention_id: str) -> EntityMentionRecord | None:
         try:

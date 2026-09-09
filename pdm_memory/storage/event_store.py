@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from typing import Any
 
@@ -101,7 +102,7 @@ class EventStoreMixin:
         """
         event.ensure_content_hash(payload=payload)
 
-        self._run(
+        cursor = self._run(
             """
             INSERT INTO pdm_source_events (
                 id, {user}, event_type, occurred_at, observed_at, ingested_at,
@@ -112,6 +113,7 @@ class EventStoreMixin:
             """,
             event_insert_row(event),
         )
+        inserted = bool(getattr(cursor, "rowcount", 1))
         self._commit_if_idle(self._conn())
 
         # Whoever holds the hash owns the event — us, or the writer who got
@@ -125,7 +127,8 @@ class EventStoreMixin:
                 f"source event {event.content_hash[:12]} vanished immediately "
                 "after insert"
             )
-        if stored.id != event.id:
+        event.was_deduplicated = stored.id != event.id or not inserted
+        if event.was_deduplicated:
             logger.debug("[PDM-Events] Reusing event %s for hash", stored.id)
         return stored.id
 
@@ -154,6 +157,75 @@ class EventStoreMixin:
             (user, limit),
         ).fetchall()
         return [event_from_row(row) for row in rows]
+
+    def iter_source_events(
+        self, user: str = "default", batch: int = 500
+    ) -> Iterator[SourceEventRecord]:
+        """
+        Every event for *user*, oldest first, in stable pages.
+
+        Separate from ``list_source_events`` because the two want opposite
+        things. A screen wants the newest handful; a sync wants all of them,
+        exactly once. Paging by ``(occurred_at, id)`` rather than OFFSET keeps
+        the walk correct while rows are being appended underneath it — and a
+        LIMIT with no cursor, which is what this replaces, re-read the same
+        newest page forever and never carried the older rows across at all.
+        """
+        cursor: tuple[str, str] | None = None
+        while True:
+            if cursor is None:
+                rows = self._run(
+                    "SELECT * FROM pdm_source_events WHERE {user} = ? "
+                    "ORDER BY occurred_at ASC, id ASC LIMIT ?",
+                    (user, batch),
+                ).fetchall()
+            else:
+                rows = self._run(
+                    "SELECT * FROM pdm_source_events WHERE {user} = ? "
+                    "AND (occurred_at > ? OR (occurred_at = ? AND id > ?)) "
+                    "ORDER BY occurred_at ASC, id ASC LIMIT ?",
+                    (user, cursor[0], cursor[0], cursor[1], batch),
+                ).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                yield event_from_row(row)
+            cursor = (rows[-1]["occurred_at"], rows[-1]["id"])
+            if len(rows) < batch:
+                return
+
+    def iter_mentions(
+        self, user: str = "default", batch: int = 500
+    ) -> Iterator[EntityMentionRecord]:
+        """
+        Every mention for *user*, oldest first.
+
+        All of them, not only the unresolved ones: ``EventLog.mention()``
+        resolves on the spot, so a sync that read the unresolved queue moved
+        nothing an ordinary caller had produced.
+        """
+        cursor: tuple[str, str] | None = None
+        while True:
+            if cursor is None:
+                rows = self._run(
+                    "SELECT * FROM pdm_entity_mentions WHERE {user} = ? "
+                    "ORDER BY observed_at ASC, id ASC LIMIT ?",
+                    (user, batch),
+                ).fetchall()
+            else:
+                rows = self._run(
+                    "SELECT * FROM pdm_entity_mentions WHERE {user} = ? "
+                    "AND (observed_at > ? OR (observed_at = ? AND id > ?)) "
+                    "ORDER BY observed_at ASC, id ASC LIMIT ?",
+                    (user, cursor[0], cursor[0], cursor[1], batch),
+                ).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                yield mention_from_row(row)
+            cursor = (rows[-1]["observed_at"], rows[-1]["id"])
+            if len(rows) < batch:
+                return
 
     def update_source_event(self, event_id: str, **fields: Any) -> None:
         """Refused. The Python half of AC2; the trigger is the other half."""
@@ -256,7 +328,7 @@ class EventStoreMixin:
                SET entity_id = ?, resolution = ?, resolved_at = ?, confidence = ?
              WHERE id = ?
             """,
-            (entity_id, method, _now().isoformat(), confidence, mention_id),
+            (entity_id, method, normalize_instant(_now()), confidence, mention_id),
         )
         self._commit_if_idle(self._conn())
 
@@ -472,8 +544,12 @@ class EventStoreMixin:
             # it downgraded confirmed answers to whatever the merge was called
             # with, and resolve_mention then treated them as revisable again.
             self._run(
-                "UPDATE pdm_entity_mentions SET entity_id = ? WHERE entity_id = ?",
-                (keep_id, merge_id),
+                # `user` is in hand from the row we just read, and the only
+                # index here is (user, entity_id) — without it this is a scan
+                # of every mention in the store.
+                "UPDATE pdm_entity_mentions SET entity_id = ? "
+                "WHERE entity_id = ? AND {user} = ?",
+                (keep_id, merge_id, merged.user),
             )
             self._run(
                 "UPDATE pdm_signatures SET primary_entity_id = ? "
