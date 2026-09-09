@@ -153,8 +153,6 @@ def utc_now() -> datetime:
     return datetime.now(tz=timezone.utc)
 
 
-_now = utc_now
-
 
 def iso_utc(value: datetime | None) -> str | None:
     """
@@ -167,8 +165,6 @@ def iso_utc(value: datetime | None) -> str | None:
     """
     return normalize_instant(value) if value else None
 
-
-_iso = iso_utc  # internal alias, kept short at the call sites below
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +223,7 @@ class SourceEventRecord:
     )
 
     def __post_init__(self) -> None:
-        now = _now()
+        now = utc_now()
         self.occurred_at_known = self.occurred_at is not None
         self.was_deduplicated = False
         if self.occurred_at is None:
@@ -299,7 +295,7 @@ class EntityRecord:
 
     def __post_init__(self) -> None:
         if self.created_at is None:
-            self.created_at = _now()
+            self.created_at = utc_now()
 
 
 @dataclass
@@ -328,7 +324,7 @@ class EntityMentionRecord:
 
     def __post_init__(self) -> None:
         if self.observed_at is None:
-            self.observed_at = _now()
+            self.observed_at = utc_now()
         if self.resolution not in RESOLUTION_METHODS:
             raise ValueError(
                 f"resolution must be one of {sorted(RESOLUTION_METHODS)}, "
@@ -752,8 +748,8 @@ def entity_insert_row(entity: EntityRecord) -> tuple[Any, ...]:
         entity.origin_field_id,
         json.dumps(entity.aliases),
         entity.current_state_version,
-        _iso(entity.created_at),
-        _iso(entity.dissolved_at),
+        iso_utc(entity.created_at),
+        iso_utc(entity.dissolved_at),
         entity.merged_into,
     )
 
@@ -767,10 +763,10 @@ def mention_insert_row(mention: EntityMentionRecord) -> tuple[Any, ...]:
         mention.source_event_id,
         mention.signature_id,
         mention.field_id,
-        _iso(mention.observed_at),
+        iso_utc(mention.observed_at),
         mention.entity_id,
         mention.resolution,
-        _iso(mention.resolved_at),
+        iso_utc(mention.resolved_at),
         mention.confidence,
     )
 

@@ -576,3 +576,140 @@ class TestIntegrityCheck:
 
     def test_it_is_reachable_from_the_facade(self, log):
         assert log.check_integrity().ok
+
+
+class TestMappersStayInStepWithTheRecords:
+    """
+    Finding 17's root cause. Columns are written out by hand in eleven places —
+    three row readers, three row writers, five wire mappers — and they had
+    already drifted: event_from_payload left provenance a string, mention_payload
+    omitted resolved_at, mention_from_payload did not exist. Fixing the drift
+    without a test that notices the next one just resets the clock.
+
+    Each record's field set is the contract. Every mapper has to carry it.
+    """
+
+    def _fields(self, record_cls) -> set[str]:
+        import dataclasses
+
+        return {
+            f.name
+            for f in dataclasses.fields(record_cls)
+            if f.init  # transient flags like was_deduplicated are not columns
+        }
+
+    def test_every_source_event_field_survives_the_database(self, driver):
+        from datetime import datetime, timezone
+
+        stored = driver.get_source_event(
+            driver.save_source_event(
+                SourceEventRecord(
+                    user="default",
+                    event_type="email",
+                    occurred_at=datetime(2026, 5, 4, 3, 2, 1, tzinfo=timezone.utc),
+                    source_system="gmail",
+                    provenance={"author": "someone@example.com"},
+                    raw_reference="gmail:1",
+                    capture_authority_state="granted",
+                    compliance_state="reviewed",
+                ),
+                payload="hello",
+            )
+        )
+        for name in self._fields(SourceEventRecord) - {"id", "observed_at", "ingested_at"}:
+            assert getattr(stored, name), f"{name} did not survive the round trip"
+        assert stored.provenance == {"author": "someone@example.com"}
+
+    def test_every_source_event_field_survives_the_wire(self):
+        from datetime import datetime, timezone
+
+        from pdm_memory.storage.eventful_cloud import EventfulCloudDriver as C
+
+        event = SourceEventRecord(
+            event_type="email",
+            occurred_at=datetime(2026, 5, 4, tzinfo=timezone.utc),
+            source_system="gmail",
+            provenance={"author": "someone@example.com"},
+            raw_reference="gmail:1",
+            capture_authority_state="granted",
+            compliance_state="reviewed",
+        )
+        event.ensure_content_hash(payload="hello")
+        back = C.event_from_payload({**C.event_payload(event), "id": event.id})
+
+        for name in self._fields(SourceEventRecord) - {"observed_at", "ingested_at"}:
+            assert getattr(back, name) == getattr(event, name), f"{name} lost on the wire"
+
+    def test_every_mention_field_survives_the_wire(self):
+        from pdm_memory.storage.eventful_cloud import EventfulCloudDriver as C
+
+        mention = EntityMentionRecord(
+            surface_form="Alex",
+            source_event_id="e1",
+            signature_id="s1",
+            field_id="work",
+            entity_id="n1",
+            resolution="user_confirmed",
+            confidence=0.9,
+        )
+        back = C.mention_from_payload(C.mention_payload(mention))
+        for name in self._fields(EntityMentionRecord) - {"resolved_at"}:
+            assert getattr(back, name) == getattr(mention, name), f"{name} lost on the wire"
+
+    def test_every_entity_field_survives_the_wire(self):
+        from pdm_memory.storage.events import EntityRecord
+        from pdm_memory.storage.eventful_cloud import EventfulCloudDriver as C
+
+        entity = EntityRecord(
+            entity_type="project",
+            canonical_name="Orion",
+            disambiguator="work",
+            origin_field_id="work",
+            aliases=["orion", "Project Orion"],
+            current_state_version=3,
+        )
+        payload = {
+            "id": entity.id,
+            "user": entity.user,
+            "entity_type": entity.entity_type,
+            "canonical_name": entity.canonical_name,
+            "disambiguator": entity.disambiguator,
+            "origin_field_id": entity.origin_field_id,
+            "aliases": entity.aliases,
+            "current_state_version": entity.current_state_version,
+        }
+        back = C.entity_from_payload(payload)
+        for name in self._fields(EntityRecord) - {"created_at", "dissolved_at", "merged_into"}:
+            assert getattr(back, name) == getattr(entity, name), f"{name} lost on the wire"
+
+    def test_insert_row_width_matches_the_ddl(self):
+        """A column added to the table but not to the tuple fails at runtime."""
+        import re
+
+        from pdm_memory.storage.events import (
+            SCHEMA_EVENTS_SQLITE,
+            entity_insert_row,
+            event_insert_row,
+            mention_insert_row,
+        )
+        from pdm_memory.storage.events import EntityRecord as E
+
+        for table, builder, record in (
+            ("pdm_source_events", event_insert_row, SourceEventRecord()),
+            ("pdm_entities", entity_insert_row, E(canonical_name="x")),
+            ("pdm_entity_mentions", mention_insert_row, EntityMentionRecord(surface_form="x")),
+        ):
+            block = re.search(
+                rf"CREATE TABLE IF NOT EXISTS {table} \((.*?)\n\);",
+                SCHEMA_EVENTS_SQLITE,
+                re.S,
+            ).group(1)
+            columns = [
+                line.strip().split()[0]
+                for line in block.splitlines()
+                if line.strip() and not line.strip().startswith("--")
+            ]
+            assert len(builder(record)) == len(columns), (
+                f"{table}: DDL has {len(columns)} columns, "
+                f"the insert tuple carries {len(builder(record))}"
+            )

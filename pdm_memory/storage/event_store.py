@@ -86,7 +86,8 @@ class EventStoreMixin:
         """
         Run a statement that can fail, and never leave the failure behind.
 
-        A statement that raises — a foreign key refused, a lock timed out —
+        Every mutating statement in this class goes through here. A statement
+        that raises — a foreign key refused, a lock timed out —
         leaves the driver's implicit transaction open, and with it the write
         lock. Every other writer then queues behind a connection that has
         already given up, and the symptom surfaces as ``database is locked``
@@ -125,7 +126,7 @@ class EventStoreMixin:
         """
         event.ensure_content_hash(payload=payload)
 
-        cursor = self._run(
+        cursor = self._write(
             """
             INSERT INTO pdm_source_events (
                 id, {user}, event_type, occurred_at, observed_at, ingested_at,
@@ -272,7 +273,7 @@ class EventStoreMixin:
 
         Idempotent on ``(user, source_event_id, signature_id, surface_form)``.
         """
-        self._run(
+        self._write(
             """
             INSERT INTO pdm_entity_mentions (
                 id, {user}, surface_form, surface_norm, source_event_id,
@@ -345,7 +346,7 @@ class EventStoreMixin:
             )
             return
 
-        self._run(
+        self._write(
             """
             UPDATE pdm_entity_mentions
                SET entity_id = ?, resolution = ?, resolved_at = ?, confidence = ?
@@ -436,7 +437,7 @@ class EventStoreMixin:
             disambiguator=self._free_disambiguator(field_id, siblings),
             origin_field_id=field_id,
         )
-        self._run(
+        self._write(
             """
             INSERT INTO pdm_entities (
                 id, {user}, entity_type, canonical_name, canonical_norm,
@@ -574,12 +575,12 @@ class EventStoreMixin:
                 "WHERE entity_id = ? AND {user} = ?",
                 (keep_id, merge_id, merged.user),
             )
-            self._run(
+            self._write(
                 "UPDATE pdm_signatures SET primary_entity_id = ? "
                 "WHERE primary_entity_id = ? AND {user} = ?",
                 (keep_id, merge_id, merged.user),
             )
-            self._run(
+            self._write(
                 """
                 UPDATE pdm_entities
                    SET dissolved_at = ?, merged_into = ?,
