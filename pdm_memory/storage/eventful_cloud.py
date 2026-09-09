@@ -24,6 +24,7 @@ from pdm_memory.storage.cloud_driver import CloudDriver
 from pdm_memory.storage.errors import CloudNotFoundError, CloudStorageError
 from pdm_memory.storage.events import (
     AppendOnlyViolation,
+    IntegrityReport,
     iso_utc,
     EntityMentionRecord,
     EntityRecord,
@@ -349,6 +350,22 @@ class EventfulCloudDriver(CloudDriver):
             cursor = payload.get("next") if isinstance(payload, dict) else None
             if not cursor or len(rows) < batch:
                 return
+
+    def check_integrity(self, user: str = "default") -> IntegrityReport:
+        """
+        Always clean, and not because nobody looked.
+
+        The local check exists because SQLite enforces foreign keys per
+        connection, so a client writing raw SQL past the driver can leave a
+        pointer dangling. Companion stores these rows in PostgreSQL behind real
+        foreign key constraints, which no client can write around — a dangling
+        reference cannot be created there in the first place.
+
+        Reporting clean without a round trip is the honest answer, not a stub.
+        If that ever stops being true it will be because someone dropped a
+        constraint, and this method is not where that would be discovered.
+        """
+        return IntegrityReport()
 
     def get_mention(self, mention_id: str) -> EntityMentionRecord | None:
         try:

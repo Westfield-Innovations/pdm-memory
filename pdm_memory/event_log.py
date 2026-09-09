@@ -37,6 +37,7 @@ from typing import Any
 from pdm_memory.core.signature import SignatureRecord
 from pdm_memory.storage.events import (
     EntityMentionRecord,
+    IntegrityReport,
     EntityRecord,
     SourceEventRecord,
     storage_supports_events,
@@ -252,6 +253,15 @@ class EventLog:
     def pending(self, limit: int = 100) -> list[EntityMentionRecord]:
         """Mentions with no identity yet — the queue behind the prompt."""
         return self._storage.unresolved_mentions(user=self._user, limit=limit)
+
+    def check_integrity(self) -> "IntegrityReport":
+        """
+        Report references that lead nowhere. Reads only; repairs nothing.
+
+        Worth running after anything that wrote to the store outside the SDK —
+        a restored backup, a manual fix, a migration from another tool.
+        """
+        return self._storage.check_integrity(user=self._user)
 
     def entities(self, include_dissolved: bool = False) -> list[EntityRecord]:
         return self._storage.list_entities(

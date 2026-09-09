@@ -25,6 +25,7 @@ from pdm_memory.storage.events import (
     REVISABLE_RESOLUTIONS,
     AppendOnlyViolation,
     EntityMentionRecord,
+    IntegrityReport,
     EntityRecord,
     SourceEventRecord,
     entity_from_row,
@@ -587,6 +588,68 @@ class EventStoreMixin:
                 """,
                 (normalize_instant(utc_now()), keep_id, merge_id),
             )
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+
+    def check_integrity(self, user: str = "default") -> IntegrityReport:
+        """
+        Find pointers that lead nowhere. Read-only, four queries, no repair.
+
+        A signature or mention can end up referencing a row that does not
+        exist only through raw SQL written past both drivers — SQLite enforces
+        foreign keys per connection, and the eventful driver is the only one
+        that turns them on. Rather than police that with a trigger on the
+        shared signatures table, this finds it after the fact, on demand, at
+        the cost of nothing on the write path.
+
+        Anything it reports is a repair someone has to decide about: clearing
+        the pointer loses the link, and recreating the missing row invents
+        evidence. Neither is a call this method should make on its own.
+        """
+        report = IntegrityReport()
+
+        report.signatures_without_event = [
+            row["id"]
+            for row in self._run(
+                "SELECT s.id FROM pdm_signatures s "
+                "LEFT JOIN pdm_source_events e ON e.id = s.source_event_id "
+                "WHERE s.{user} = ? AND s.source_event_id IS NOT NULL AND e.id IS NULL",
+                (user,),
+            ).fetchall()
+        ]
+        report.signatures_without_entity = [
+            row["id"]
+            for row in self._run(
+                "SELECT s.id FROM pdm_signatures s "
+                "LEFT JOIN pdm_entities n ON n.id = s.primary_entity_id "
+                "WHERE s.{user} = ? AND s.primary_entity_id IS NOT NULL AND n.id IS NULL",
+                (user,),
+            ).fetchall()
+        ]
+        report.mentions_without_event = [
+            row["id"]
+            for row in self._run(
+                "SELECT m.id FROM pdm_entity_mentions m "
+                "LEFT JOIN pdm_source_events e ON e.id = m.source_event_id "
+                "WHERE m.{user} = ? AND m.source_event_id <> '' AND e.id IS NULL",
+                (user,),
+            ).fetchall()
+        ]
+        report.mentions_without_entity = [
+            row["id"]
+            for row in self._run(
+                "SELECT m.id FROM pdm_entity_mentions m "
+                "LEFT JOIN pdm_entities n ON n.id = m.entity_id "
+                "WHERE m.{user} = ? AND m.entity_id IS NOT NULL AND n.id IS NULL",
+                (user,),
+            ).fetchall()
+        ]
+
+        if not report.ok:
+            logger.warning("[PDM-Events] %s", report.render().splitlines()[0])
+        return report
 
     # ------------------------------------------------------------------
     # Wiring signatures to their evidence

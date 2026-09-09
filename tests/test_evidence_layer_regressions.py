@@ -497,3 +497,82 @@ class TestAFailedWriteReleasesTheLock:
         thread.start()
         thread.join(timeout=10)
         assert not errors, errors
+
+
+class TestIntegrityCheck:
+    """
+    Finding 18, the half that can be closed cheaply. `PRAGMA foreign_keys` is
+    per connection, so a client writing raw SQL past both drivers can leave a
+    signature pointing at an event that does not exist. Enforcing that with a
+    trigger would put a rule on pdm_signatures — the table every caller writes
+    to, including those who never touch the event layer — and make every insert
+    pay for it. Finding the damage costs nothing and risks nothing.
+    """
+
+    def _dangle(self, driver):
+        """Do what only raw SQL can: point a signature at nothing."""
+        import sqlite3
+
+        from pdm_memory.core.signature import SignatureRecord
+
+        sig = SignatureRecord(compressed_fact="x", intent_tags=["a", "b", "c"])
+        driver.save(sig)
+        raw = sqlite3.connect(driver.db_path)
+        raw.execute(
+            "UPDATE pdm_signatures SET source_event_id = 'no-such-event' WHERE id = ?",
+            (sig.id,),
+        )
+        raw.commit()
+        raw.close()
+        return sig.id
+
+    def test_a_clean_store_reports_clean(self, driver):
+        event_id = driver.save_source_event(SourceEventRecord(raw_reference="c:1"), payload="x")
+        from pdm_memory.core.signature import SignatureRecord
+
+        sig = SignatureRecord(compressed_fact="ok", intent_tags=["a", "b", "c"])
+        driver.save(sig)
+        driver.link_signature(sig.id, source_event_id=event_id)
+
+        report = driver.check_integrity()
+        assert report.ok
+        assert report.total == 0
+
+    def test_a_dangling_signature_is_found(self, driver):
+        sig_id = self._dangle(driver)
+
+        report = driver.check_integrity()
+        assert not report.ok
+        assert sig_id in report.signatures_without_event
+        assert report.total == 1
+        assert "no-such-event" not in str(report), "the report names rows, not values"
+
+    def test_a_mention_pointing_at_a_deleted_entity_is_found(self, driver):
+        import sqlite3
+
+        event_id = driver.save_source_event(SourceEventRecord(raw_reference="c:2"), payload="y")
+        mention = driver.record_mention(
+            EntityMentionRecord(surface_form="Alex", source_event_id=event_id, field_id="w")
+        )
+        entity = driver.resolve_or_create_entity(
+            user="default", surface_form="Alex", field_id="w"
+        )
+        driver.resolve_mention(mention, entity_id=entity, method="user_confirmed")
+
+        raw = sqlite3.connect(driver.db_path)
+        raw.execute("DELETE FROM pdm_entities WHERE id = ?", (entity,))
+        raw.commit()
+        raw.close()
+
+        report = driver.check_integrity()
+        assert mention in report.mentions_without_entity
+
+    def test_the_check_reads_and_never_writes(self, driver):
+        """A diagnostic that repairs things by surprise is not a diagnostic."""
+        self._dangle(driver)
+        before = driver.check_integrity()
+        after = driver.check_integrity()
+        assert before.signatures_without_event == after.signatures_without_event
+
+    def test_it_is_reachable_from_the_facade(self, log):
+        assert log.check_integrity().ok

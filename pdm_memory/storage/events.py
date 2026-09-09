@@ -45,6 +45,7 @@ __all__ = [
     "CONTENT_HASH_VERSION",
     "RESOLUTION_METHODS",
     "AppendOnlyViolation",
+    "IntegrityReport",
     "EntityMentionRecord",
     "EntityRecord",
     "SourceEventRecord",
@@ -54,6 +55,55 @@ __all__ = [
     "apply_event_migrations_sqlite",
     "compute_content_hash",
 ]
+
+
+@dataclass
+class IntegrityReport:
+    """
+    Rows whose pointers lead nowhere.
+
+    ``PRAGMA foreign_keys`` is a per-connection setting, so a client writing
+    raw SQL past both drivers can leave a signature pointing at an event that
+    was never recorded. Refusing such a write would mean a trigger on
+    ``pdm_signatures`` — a rule on the table every caller writes to, paid for
+    on every insert by people who never touch this layer. Finding the damage
+    afterwards costs one query per relation and risks nothing, so that is what
+    this does. It reports; it never repairs.
+    """
+
+    signatures_without_event: list[str] = field(default_factory=list)
+    signatures_without_entity: list[str] = field(default_factory=list)
+    mentions_without_event: list[str] = field(default_factory=list)
+    mentions_without_entity: list[str] = field(default_factory=list)
+
+    @property
+    def total(self) -> int:
+        return (
+            len(self.signatures_without_event)
+            + len(self.signatures_without_entity)
+            + len(self.mentions_without_event)
+            + len(self.mentions_without_entity)
+        )
+
+    @property
+    def ok(self) -> bool:
+        return self.total == 0
+
+    def render(self) -> str:
+        if self.ok:
+            return "Evidence layer: every reference resolves."
+        lines = [f"Evidence layer: {self.total} references lead nowhere."]
+        for label, ids in (
+            ("signatures with a missing source event", self.signatures_without_event),
+            ("signatures with a missing entity", self.signatures_without_entity),
+            ("mentions with a missing source event", self.mentions_without_event),
+            ("mentions with a missing entity", self.mentions_without_entity),
+        ):
+            if ids:
+                shown = ", ".join(ids[:5])
+                more = f" (+{len(ids) - 5} more)" if len(ids) > 5 else ""
+                lines.append(f"  {len(ids)} {label}: {shown}{more}")
+        return "\n".join(lines)
 
 
 class AppendOnlyViolation(RuntimeError):
@@ -379,6 +429,8 @@ class SupportsEvents(Protocol):
     ) -> list[EntityRecord]: ...
 
     def get_mention(self, mention_id: str) -> EntityMentionRecord | None: ...
+
+    def check_integrity(self, user: str = "default") -> IntegrityReport: ...
 
     def mentions_for_entity(
         self, entity_id: str, user: str = "default"
