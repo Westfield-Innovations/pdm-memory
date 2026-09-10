@@ -62,6 +62,7 @@ from pdm_memory.core.signature import (
 )
 from pdm_memory.models import (
     AlignmentReport,
+    FieldStateSnapshot,
     MemoryListPage,
     RelationshipChannelResolution,
     SurfaceReport,
@@ -1508,30 +1509,63 @@ class Memory:
         Requires ``store="cloud"`` or a JWT ``token`` (and optional ``cloud_url``)
         so the SDK can reach the Companion integrity API.
         """
-        from pdm_memory.storage.cloud_driver import CloudDriver
-
-        cloud: CloudDriver | None = None
-        if isinstance(self._storage, CloudDriver):
-            cloud = self._storage
-        elif self._cloud_driver is not None and isinstance(
-            self._cloud_driver, CloudDriver
-        ):
-            cloud = self._cloud_driver
-        else:
-            resolved = self._get_cloud_driver(None, None)
-            if isinstance(resolved, CloudDriver):
-                cloud = resolved
-                self._cloud_driver = cloud
-
-        if cloud is None:
-            raise RuntimeError(
-                "current_resolution requires ecosystem/cloud mode: "
-                "Memory(store='cloud', token=...) or Memory(..., token=..., cloud_url=...)."
-            )
-        return cloud.current_resolution(
+        return self._require_cloud("current_resolution").current_resolution(
             observer=observer,
             target=target,
             domain=domain,
+        )
+
+    def state_at(
+        self,
+        field_id: str,
+        timestamp: datetime,
+        cursor: str | None = None,
+        limit: int | None = None,
+        envelope: bool = True,
+    ) -> FieldStateSnapshot:
+        """
+        A bounded field's reconciled state at a past moment (ecosystem / cloud only).
+
+        Thin client over Companion ``GET /api/v1/pdm/field-state/``. Returns the
+        memberships, relationships and visible entities of ``field_id`` as they
+        stood, filtered to what this observer may reveal — there is no
+        unfiltered mode. ``timestamp`` must carry a timezone and must not be
+        past the server's Now.
+
+        ``envelope=False`` returns the entities page alone; use it when
+        following ``entities_next_cursor``.
+
+        Requires ``store="cloud"`` or a JWT ``token`` (and optional ``cloud_url``).
+        """
+        return self._require_cloud("state_at").state_at(
+            field_id,
+            timestamp,
+            cursor=cursor,
+            limit=limit,
+            envelope=envelope,
+        )
+
+    def current_state(
+        self,
+        field_id: str,
+        cursor: str | None = None,
+        limit: int | None = None,
+        envelope: bool = True,
+    ) -> FieldStateSnapshot:
+        """
+        A bounded field's state now (ecosystem / cloud only).
+
+        Same route as :meth:`state_at` with the moment left out, so the server
+        answers from its own clock. Sending ours would name a moment it reads
+        as future whenever this machine runs ahead, and be refused for the skew.
+
+        Requires ``store="cloud"`` or a JWT ``token`` (and optional ``cloud_url``).
+        """
+        return self._require_cloud("current_state").current_state(
+            field_id,
+            cursor=cursor,
+            limit=limit,
+            envelope=envelope,
         )
 
     def count(self) -> int:
@@ -1786,6 +1820,33 @@ class Memory:
         if store.strip() == "cloud":
             self._cloud_driver = driver
         return driver
+
+    def _require_cloud(self, operation: str) -> Any:
+        """
+        The CloudDriver behind this Memory, or a refusal naming what needs one.
+
+        ``operation`` only shapes the message: a caller in local mode should
+        learn which call they made needs the ecosystem, not that something
+        somewhere did.
+        """
+        from pdm_memory.storage.cloud_driver import CloudDriver
+
+        if isinstance(self._storage, CloudDriver):
+            return self._storage
+        if self._cloud_driver is not None and isinstance(
+            self._cloud_driver, CloudDriver
+        ):
+            return self._cloud_driver
+
+        resolved = self._get_cloud_driver(None, None)
+        if isinstance(resolved, CloudDriver):
+            self._cloud_driver = resolved
+            return resolved
+
+        raise RuntimeError(
+            f"{operation} requires ecosystem/cloud mode: "
+            "Memory(store='cloud', token=...) or Memory(..., token=..., cloud_url=...)."
+        )
 
     def _get_cloud_driver(
         self,
