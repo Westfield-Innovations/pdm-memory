@@ -17,6 +17,27 @@ jobs:
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
 
+    # Everything Postgres-shaped in this package — the plpgsql trigger bodies,
+    # ON CONFLICT without a conflict target, psycopg's rowcount, the quoting of
+    # the reserved word "user" — was previously asserted as strings against a
+    # recorder. That proves the SQL was composed, not that a server accepts it.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pdm_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      PDM_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/pdm_test
+
     steps:
       - uses: actions/checkout@v4
 
