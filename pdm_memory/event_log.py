@@ -147,13 +147,12 @@ class EventLog:
         that were already on file under an earlier event — their provenance
         stays with the message that first carried them.
         """
-        seen_before = (
-            self._storage.find_event_by_hash(
-                event.ensure_content_hash(payload=payload), user=self._user
-            )
-            is not None
-        )
+        # No probe before the write. save_source_event is idempotent on the
+        # hash and reports on the record whether the store already held the
+        # event, so asking first is a round trip spent learning what the write
+        # is about to say.
         event_id = self.record(event, payload=payload)
+        seen_before = event.was_deduplicated
 
         signature_ids: list[str] = []
         entity_ids: dict[str, str] = {}

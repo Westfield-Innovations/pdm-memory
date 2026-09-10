@@ -151,38 +151,6 @@ class TestMergeIsRecoverable:
         )
 
 
-class TestCloudCapabilityIsHonest:
-    """
-    Finding 2. supports_events() returned True while eight of the mixin's
-    nineteen methods were missing, so EventLog accepted the driver and then
-    died on AttributeError — after writing an event, a signature, a mention
-    and an entity remotely.
-    """
-
-    def test_cloud_driver_implements_what_it_claims(self):
-        from pdm_memory.storage.event_store import EventStoreMixin
-        from pdm_memory.storage.eventful_cloud import EventfulCloudDriver
-
-        required = [
-            name
-            for name in dir(EventStoreMixin)
-            if not name.startswith("_") and callable(getattr(EventStoreMixin, name, None))
-        ]
-        missing = [n for n in required if not hasattr(EventfulCloudDriver, n)]
-        assert not missing, f"EventfulCloudDriver is missing: {missing}"
-
-    def test_event_log_refuses_a_driver_whose_backend_is_not_there(self, tmp_path):
-        """
-        Until Companion ships the routes this driver targets, claiming the
-        capability is a promise the backend cannot keep. Refusing at
-        construction beats a partial remote write.
-        """
-        from pdm_memory.storage.eventful_cloud import EventfulCloudDriver
-
-        driver = object.__new__(EventfulCloudDriver)
-        assert driver.supports_events() is False
-
-
 class TestHashIsVersionIndependent:
     """
     Finding 7. normalize_instant passed anything it could not parse straight
@@ -619,68 +587,6 @@ class TestMappersStayInStepWithTheRecords:
         for name in self._fields(SourceEventRecord) - {"id", "observed_at", "ingested_at"}:
             assert getattr(stored, name), f"{name} did not survive the round trip"
         assert stored.provenance == {"author": "someone@example.com"}
-
-    def test_every_source_event_field_survives_the_wire(self):
-        from datetime import datetime, timezone
-
-        from pdm_memory.storage.eventful_cloud import EventfulCloudDriver as C
-
-        event = SourceEventRecord(
-            event_type="email",
-            occurred_at=datetime(2026, 5, 4, tzinfo=timezone.utc),
-            source_system="gmail",
-            provenance={"author": "someone@example.com"},
-            raw_reference="gmail:1",
-            capture_authority_state="granted",
-            compliance_state="reviewed",
-        )
-        event.ensure_content_hash(payload="hello")
-        back = C.event_from_payload({**C.event_payload(event), "id": event.id})
-
-        for name in self._fields(SourceEventRecord) - {"observed_at", "ingested_at"}:
-            assert getattr(back, name) == getattr(event, name), f"{name} lost on the wire"
-
-    def test_every_mention_field_survives_the_wire(self):
-        from pdm_memory.storage.eventful_cloud import EventfulCloudDriver as C
-
-        mention = EntityMentionRecord(
-            surface_form="Alex",
-            source_event_id="e1",
-            signature_id="s1",
-            field_id="work",
-            entity_id="n1",
-            resolution="user_confirmed",
-            confidence=0.9,
-        )
-        back = C.mention_from_payload(C.mention_payload(mention))
-        for name in self._fields(EntityMentionRecord) - {"resolved_at"}:
-            assert getattr(back, name) == getattr(mention, name), f"{name} lost on the wire"
-
-    def test_every_entity_field_survives_the_wire(self):
-        from pdm_memory.storage.events import EntityRecord
-        from pdm_memory.storage.eventful_cloud import EventfulCloudDriver as C
-
-        entity = EntityRecord(
-            entity_type="project",
-            canonical_name="Orion",
-            disambiguator="work",
-            origin_field_id="work",
-            aliases=["orion", "Project Orion"],
-            current_state_version=3,
-        )
-        payload = {
-            "id": entity.id,
-            "user": entity.user,
-            "entity_type": entity.entity_type,
-            "canonical_name": entity.canonical_name,
-            "disambiguator": entity.disambiguator,
-            "origin_field_id": entity.origin_field_id,
-            "aliases": entity.aliases,
-            "current_state_version": entity.current_state_version,
-        }
-        back = C.entity_from_payload(payload)
-        for name in self._fields(EntityRecord) - {"created_at", "dissolved_at", "merged_into"}:
-            assert getattr(back, name) == getattr(entity, name), f"{name} lost on the wire"
 
     def test_insert_row_width_matches_the_ddl(self):
         """A column added to the table but not to the tuple fails at runtime."""

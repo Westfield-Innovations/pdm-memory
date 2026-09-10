@@ -35,6 +35,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from pdm_memory.storage.event_hash import (
     CONTENT_HASH_VERSION,
+    _parse_iso,
     compute_content_hash,
     normalize_instant,
 )
@@ -76,6 +77,13 @@ class IntegrityReport:
     mentions_without_event: list[str] = field(default_factory=list)
     mentions_without_entity: list[str] = field(default_factory=list)
 
+    # Counted, not faulted. A signature written before the event layer existed
+    # has no source and never will; one that lost its source to a sync looks
+    # exactly the same from here. The number is what makes the second case
+    # visible at all — an empty pointer is not a broken one, so none of the
+    # queries above ever saw it.
+    signatures_without_provenance: int = 0
+
     @property
     def total(self) -> int:
         return (
@@ -90,9 +98,14 @@ class IntegrityReport:
         return self.total == 0
 
     def render(self) -> str:
+        loose = (
+            f" {self.signatures_without_provenance} without a recorded source."
+            if self.signatures_without_provenance
+            else ""
+        )
         if self.ok:
-            return "Evidence layer: every reference resolves."
-        lines = [f"Evidence layer: {self.total} references lead nowhere."]
+            return f"Evidence layer: every reference resolves.{loose}"
+        lines = [f"Evidence layer: {self.total} references lead nowhere.{loose}"]
         for label, ids in (
             ("signatures with a missing source event", self.signatures_without_event),
             ("signatures with a missing entity", self.signatures_without_entity),
@@ -428,6 +441,10 @@ class SupportsEvents(Protocol):
 
     def check_integrity(self, user: str = "default") -> IntegrityReport: ...
 
+    def iter_linked_signatures(
+        self, user: str = "default", batch: int = 500
+    ) -> Any: ...
+
     def mentions_for_entity(
         self, entity_id: str, user: str = "default"
     ) -> list[EntityMentionRecord]: ...
@@ -446,9 +463,9 @@ def storage_supports_events(storage: Any) -> bool:
     catches a driver that answers the capability question while missing methods
     the caller will reach for, which is how a half-implemented backend used to
     accept an ingest and then die partway through it. ``supports_events()`` is
-    the driver's own answer about the backend behind it — a cloud driver can
-    have every method and still be pointed at a deployment that serves none of
-    the routes.
+    the driver's own answer about the backend behind it, which having the
+    methods does not settle: a remote driver can implement every one of them
+    and still be pointed at a deployment that serves none of them.
 
     Never raises on a plain driver.
     """
@@ -663,12 +680,17 @@ apply_event_migrations = apply_event_migrations_sqlite
 
 
 def _parse_dt(value: str | None) -> datetime | None:
+    """
+    Read a stored timestamp with the grammar the hash uses.
+
+    Going through ``fromisoformat`` here meant a value this package had
+    written could fail to read back on an older runtime: the record then fell
+    to its default of ``now()``, moving both the content hash and the keyset
+    cursor that pages by it.
+    """
     if not value:
         return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
+    return _parse_iso(value.strip())
 
 
 def event_from_row(row: Any) -> SourceEventRecord:

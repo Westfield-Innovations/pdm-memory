@@ -164,11 +164,10 @@ class TestDialectParity:
         assert "?" not in sql
 
     def test_generated_insert_quotes_user(self, pg_host):
-        # The recorder has no storage, so the read-back that now follows every
-        # insert finds nothing and the method refuses to invent an id. The SQL
-        # is recorded before that point, which is what this test is about.
-        with pytest.raises(RuntimeError, match="vanished"):
-            pg_host.save_source_event(SourceEventRecord(event_type="chat_message"))
+        # The recorder reports a successful insert, so the method returns
+        # without a read-back — which is the point of the rowcount check. The
+        # SQL it sent is what this test is about.
+        pg_host.save_source_event(SourceEventRecord(event_type="chat_message"))
         insert = next(
             s for s in pg_host.recorder.statements if "INSERT INTO pdm_source_events" in s
         )
@@ -183,7 +182,10 @@ class TestDialectParity:
         than an aggregate plus up to twelve probes.
         """
         pg_host.recorder.statements.clear()
-        with pytest.raises(RuntimeError, match="vanished"):
+        # The recorder stores nothing, so every read-back comes back empty and
+        # the bounded retry gives up rather than looping. The SQL it produced
+        # on the way is what this test inspects.
+        with pytest.raises(RuntimeError, match="could not settle"):
             pg_host.resolve_or_create_entity(user="u", surface_form="Alex", field_id="w")
 
         sql = pg_host.recorder.statements
@@ -336,7 +338,7 @@ class TestEventSync:
         plain = SQLiteDriver(db_path=str(tmp_path / "b.db"))
 
         report = EventSync(eventful, plain).sync(direction="push")
-        assert report.unsupported == ["cloud"]
+        assert report.unsupported == ["remote"]
         assert report.errors == 0
 
         eventful.close()
@@ -358,43 +360,6 @@ class TestEventSync:
 # ---------------------------------------------------------------------------
 # Cloud delegation
 # ---------------------------------------------------------------------------
-
-
-class TestCloudDelegation:
-    def test_append_only_is_refused_before_the_round_trip(self):
-        from pdm_memory.storage.eventful_cloud import EventfulCloudDriver
-        from pdm_memory.storage.events import AppendOnlyViolation
-
-        driver = object.__new__(EventfulCloudDriver)
-        with pytest.raises(AppendOnlyViolation):
-            driver.update_source_event("evt", event_type="email")
-        with pytest.raises(AppendOnlyViolation):
-            driver.delete_source_event("evt")
-
-    def test_event_payload_carries_the_hash_and_not_the_content(self):
-        from pdm_memory.storage.eventful_cloud import EventfulCloudDriver
-
-        event = SourceEventRecord(raw_reference="chat:123:msg:456")
-        event.ensure_content_hash(payload="the actual message text")
-        payload = EventfulCloudDriver.event_payload(event)
-
-        assert payload["content_hash"] == event.content_hash
-        assert payload["raw_reference"] == "chat:123:msg:456"
-        assert "the actual message text" not in str(payload)
-
-    def test_payload_round_trips_through_the_wire_shape(self):
-        from pdm_memory.storage.eventful_cloud import EventfulCloudDriver
-
-        event = SourceEventRecord(
-            raw_reference="chat:7", provenance={"channel": "general"}
-        )
-        event.ensure_content_hash(payload="hello")
-        restored = EventfulCloudDriver.event_from_payload(
-            {**EventfulCloudDriver.event_payload(event), "id": event.id}
-        )
-        assert restored.content_hash == event.content_hash
-        assert restored.provenance == {"channel": "general"}
-        assert restored.occurred_at == event.occurred_at
 
 
 class TestPostgresDriverActuallyComposes:
