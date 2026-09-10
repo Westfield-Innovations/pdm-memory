@@ -77,6 +77,13 @@ class IntegrityReport:
     mentions_without_event: list[str] = field(default_factory=list)
     mentions_without_entity: list[str] = field(default_factory=list)
 
+    # Counted, not faulted. A signature written before the event layer existed
+    # has no source and never will; one that lost its source to a sync looks
+    # exactly the same from here. The number is what makes the second case
+    # visible at all — an empty pointer is not a broken one, so none of the
+    # queries above ever saw it.
+    signatures_without_provenance: int = 0
+
     @property
     def total(self) -> int:
         return (
@@ -91,9 +98,14 @@ class IntegrityReport:
         return self.total == 0
 
     def render(self) -> str:
+        loose = (
+            f" {self.signatures_without_provenance} without a recorded source."
+            if self.signatures_without_provenance
+            else ""
+        )
         if self.ok:
-            return "Evidence layer: every reference resolves."
-        lines = [f"Evidence layer: {self.total} references lead nowhere."]
+            return f"Evidence layer: every reference resolves.{loose}"
+        lines = [f"Evidence layer: {self.total} references lead nowhere.{loose}"]
         for label, ids in (
             ("signatures with a missing source event", self.signatures_without_event),
             ("signatures with a missing entity", self.signatures_without_entity),
@@ -428,6 +440,10 @@ class SupportsEvents(Protocol):
     def get_mention(self, mention_id: str) -> EntityMentionRecord | None: ...
 
     def check_integrity(self, user: str = "default") -> IntegrityReport: ...
+
+    def iter_linked_signatures(
+        self, user: str = "default", batch: int = 500
+    ) -> Any: ...
 
     def mentions_for_entity(
         self, entity_id: str, user: str = "default"

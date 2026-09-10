@@ -712,6 +712,12 @@ class EventStoreMixin:
             ).fetchall()
         ]
 
+        report.signatures_without_provenance = self._run(
+            "SELECT COUNT(*) AS n FROM pdm_signatures "
+            "WHERE {user} = ? AND is_deleted = 0 AND source_event_id IS NULL",
+            (user,),
+        ).fetchone()["n"]
+
         if not report.ok:
             logger.warning("[PDM-Events] %s", report.render().splitlines()[0])
         return report
@@ -798,6 +804,42 @@ class EventStoreMixin:
 
         self._commit_if_idle(self._conn())
         return claimed
+
+    def iter_linked_signatures(
+        self, user: str = "default", batch: int = 500
+    ) -> Iterator[tuple[str, str | None, str | None]]:
+        """
+        Every signature that carries provenance, as ``(id, event, entity)``.
+
+        Only the linked ones: a store holds far more signatures than events,
+        and a sync that walked all of them to find the few with pointers would
+        pay for the whole table on every pass.
+        """
+        cursor: str | None = None
+        while True:
+            if cursor is None:
+                rows = self._run(
+                    "SELECT id, source_event_id, primary_entity_id FROM pdm_signatures "
+                    "WHERE {user} = ? AND is_deleted = 0 "
+                    "AND (source_event_id IS NOT NULL OR primary_entity_id IS NOT NULL) "
+                    "ORDER BY id ASC LIMIT ?",
+                    (user, batch),
+                ).fetchall()
+            else:
+                rows = self._run(
+                    "SELECT id, source_event_id, primary_entity_id FROM pdm_signatures "
+                    "WHERE {user} = ? AND is_deleted = 0 AND id > ? "
+                    "AND (source_event_id IS NOT NULL OR primary_entity_id IS NOT NULL) "
+                    "ORDER BY id ASC LIMIT ?",
+                    (user, cursor, batch),
+                ).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                yield row["id"], row["source_event_id"], row["primary_entity_id"]
+            cursor = rows[-1]["id"]
+            if len(rows) < batch:
+                return
 
     def signatures_for_event(
         self, event_id: str, user: str = "default"

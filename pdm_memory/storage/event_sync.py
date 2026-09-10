@@ -45,6 +45,8 @@ class EventSyncReport:
     entities_pulled: int = 0
     mentions_pushed: int = 0
     mentions_pulled: int = 0
+    links_transferred: int = 0
+    links_missing_signature: int = 0
     errors: int = 0
     unsupported: list[str] = field(default_factory=list)
 
@@ -55,8 +57,21 @@ class EventSyncReport:
             f"deduplicated={self.events_deduplicated}, "
             f"entities={self.entities_pushed}/{self.entities_pulled}, "
             f"mentions={self.mentions_pushed}/{self.mentions_pulled}, "
+            f"links={self.links_transferred}, "
             f"errors={self.errors})"
         )
+
+    @property
+    def advice(self) -> str:
+        """What the caller should do about anything this pass could not finish."""
+        if self.links_missing_signature:
+            return (
+                f"{self.links_missing_signature} signature links had no signature "
+                "to attach to on the far side. EventSync moves events, entities "
+                "and mentions; signatures are MemorySync's. Run MemorySync first, "
+                "then this."
+            )
+        return ""
 
 
 class EventSync:
@@ -123,6 +138,7 @@ class EventSync:
         self._transfer_mentions(
             source, target, user, report, events, entities, pulling=pulling
         )
+        self._transfer_signature_links(source, target, user, report, events, entities)
 
     def _transfer_events(
         self, source, target, user: str, report: EventSyncReport, *, pulling: bool
@@ -199,6 +215,59 @@ class EventSync:
                 )
                 report.errors += 1
         return remapped
+
+    def _transfer_signature_links(
+        self,
+        source,
+        target,
+        user: str,
+        report: EventSyncReport,
+        events: dict[str, str],
+        entities: dict[str, str],
+    ) -> None:
+        """
+        Reattach each fact to the message it came from, and to whom it is about.
+
+        Signatures themselves are MemorySync's cargo — its payload predates
+        these two columns and it is a frozen module, so it cannot learn them.
+        That left the links belonging to nobody: events crossed, facts crossed,
+        and what tied them together did not. Both passes reported no errors,
+        and the far side looked clean, because a pointer that is empty is not a
+        pointer that dangles.
+
+        Runs last because it needs the other three to have finished: the ids it
+        writes are the far side's own, taken from the translation tables the
+        earlier passes built.
+        """
+        try:
+            linked = source.iter_linked_signatures(user=user, batch=self._page_size)
+        except Exception as exc:
+            logger.warning("[PDM-EventSync] cannot read signature links: %s", exc)
+            report.errors += 1
+            return
+
+        for signature_id, event_id, entity_id in linked:
+            try:
+                target.link_signature(
+                    signature_id,
+                    source_event_id=events.get(event_id) if event_id else None,
+                    primary_entity_id=entities.get(entity_id) if entity_id else None,
+                    user=user,
+                )
+                report.links_transferred += 1
+            except KeyError:
+                # The signature is not there yet. Counted rather than raised:
+                # a caller who has not run MemorySync wants to be told what to
+                # do, not handed a traceback halfway through a sync.
+                report.links_missing_signature += 1
+            except Exception as exc:
+                logger.warning(
+                    "[PDM-EventSync] link for signature %s: %s", signature_id, exc
+                )
+                report.errors += 1
+
+        if report.links_missing_signature:
+            logger.warning("[PDM-EventSync] %s", report.advice)
 
     def _transfer_mentions(
         self,

@@ -212,3 +212,128 @@ class TestFinding11MergeUsesTheGuardedWrite:
 
         body = inspect.getsource(EventStoreMixin.merge_entities)
         assert "self._run(" not in body
+
+
+class TestFinding5ProvenanceCrossesTheSync:
+    """
+    Signatures carry two pointers and neither crossed. MemorySync moves
+    signatures but its payload predates the columns; EventSync moved events,
+    entities and mentions and never touched signatures. Both reported
+    errors=0, and check_integrity called the result clean, because a pointer
+    that is empty is not a pointer that dangles.
+
+    The step was in the docstring — "then the signature links" — and was
+    removed rather than written.
+    """
+
+    def _pair(self, tmp_path):
+        left = EventfulSQLiteDriver(db_path=str(tmp_path / "left.db"))
+        right = EventfulSQLiteDriver(db_path=str(tmp_path / "right.db"))
+        return left, right
+
+    def test_a_fact_keeps_the_message_it_came_from(self, tmp_path):
+        from pdm_memory.storage.event_sync import EventSync
+        from pdm_memory.sync import MemorySync
+
+        left, right = self._pair(tmp_path)
+        mem = Memory(storage=left)
+        log = EventLog(mem)
+        result = log.ingest(
+            event=log.event(raw_reference="chat:123:msg:456", source_system="azus_chat"),
+            payload="Moved the Orion release review to Friday.",
+            facts=[
+                {
+                    "text": "Orion release moved to Friday",
+                    "tags": ["orion", "release", "date"],
+                    "about": "Alex",
+                }
+            ],
+            field_id="work",
+        )
+
+        MemorySync(left, right).sync(direction="push")
+        report = EventSync(left, right).sync(direction="push")
+
+        assert report.errors == 0
+        assert report.links_transferred == 1, report
+
+        arrived = right.list_source_events()[0]
+        assert arrived.raw_reference == "chat:123:msg:456"
+        assert [s.compressed_fact for s in right.signatures_for_event(arrived.id)] == [
+            "Orion release moved to Friday"
+        ], "the fact arrived without the message it came from"
+
+        entity = right.list_entities()[0]
+        assert len(right.signatures_for_entity(entity.id)) == 1
+        mem.close()
+        right.close()
+
+    def test_links_are_translated_not_copied(self, tmp_path):
+        """
+        Each side keys its own rows. A link copied verbatim would point at an
+        id that means nothing on the far side — or worse, at a different row.
+        """
+        from pdm_memory.storage.event_sync import EventSync
+        from pdm_memory.sync import MemorySync
+
+        left, right = self._pair(tmp_path)
+        # Give the right store an event of its own first, so the ids diverge.
+        right.save_source_event(SourceEventRecord(raw_reference="other"), payload="other")
+
+        mem = Memory(storage=left)
+        log = EventLog(mem)
+        log.ingest(
+            event=log.event(raw_reference="chat:1"),
+            payload="one",
+            facts=[{"text": "a fact", "tags": ["a", "b", "c"]}],
+        )
+        MemorySync(left, right).sync(direction="push")
+        EventSync(left, right).sync(direction="push")
+
+        mine = next(e for e in right.list_source_events() if e.raw_reference == "chat:1")
+        theirs = next(e for e in right.list_source_events() if e.raw_reference == "other")
+        assert len(right.signatures_for_event(mine.id)) == 1
+        assert right.signatures_for_event(theirs.id) == []
+        mem.close()
+        right.close()
+
+    def test_a_signature_that_has_not_crossed_yet_is_reported(self, tmp_path):
+        """
+        EventSync does not move signatures — MemorySync does. Running them in
+        the wrong order must say so rather than drop the links quietly.
+        """
+        from pdm_memory.storage.event_sync import EventSync
+
+        left, right = self._pair(tmp_path)
+        mem = Memory(storage=left)
+        log = EventLog(mem)
+        log.ingest(
+            event=log.event(raw_reference="chat:1"),
+            payload="one",
+            facts=[{"text": "a fact", "tags": ["a", "b", "c"]}],
+        )
+
+        report = EventSync(left, right).sync(direction="push")  # no MemorySync
+        assert report.links_missing_signature == 1, report
+        assert "MemorySync" in report.advice
+        mem.close()
+        right.close()
+
+    def test_integrity_notices_a_fact_with_no_source(self, driver):
+        """
+        Not an error — a signature written before the event layer legitimately
+        has none — but a count the caller can see, where before there was
+        nothing to look at.
+        """
+        from pdm_memory.core.signature import SignatureRecord
+
+        event_id = driver.save_source_event(SourceEventRecord(raw_reference="c:1"), payload="x")
+        linked = SignatureRecord(compressed_fact="linked", intent_tags=["a", "b", "c"])
+        driver.save(linked)
+        driver.link_signature(linked.id, source_event_id=event_id)
+        driver.save(SignatureRecord(compressed_fact="loose", intent_tags=["a", "b", "c"]))
+
+        report = driver.check_integrity()
+        assert report.ok, "an absent pointer is not a broken one"
+        assert report.signatures_without_provenance == 1
+        assert "1 without a recorded source" in report.render()
