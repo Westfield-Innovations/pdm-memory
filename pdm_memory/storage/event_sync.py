@@ -219,6 +219,20 @@ class EventSync:
                 resolved_to = (
                     entities.get(mention.entity_id) if mention.entity_id else None
                 )
+                if mention.entity_id and resolved_to is None:
+                    # The entity did not make it across. Carrying its grade
+                    # anyway lands the mention in the unresolved queue wearing
+                    # a human's confirmation, where resolve_mention refuses to
+                    # touch it because a confirmation is not revisable — stuck
+                    # for good. It arrives as what it now is: unattributed.
+                    logger.warning(
+                        "[PDM-EventSync] mention %s arrives unresolved: its "
+                        "entity did not transfer",
+                        mention.id,
+                    )
+                    mention.resolution = "unresolved"
+                    mention.resolved_at = None
+                    mention.confidence = None
                 mention.entity_id = resolved_to
                 mention_id = target.record_mention(mention)
 

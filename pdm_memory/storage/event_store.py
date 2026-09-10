@@ -140,6 +140,12 @@ class EventStoreMixin:
         inserted = bool(getattr(cursor, "rowcount", 1))
         self._commit_if_idle(self._conn())
 
+        if inserted:
+            # The insert went in, so this row is the event. Reading it back
+            # would be asking the database to confirm what it just did.
+            event.was_deduplicated = False
+            return event.id
+
         # Whoever holds the hash owns the event — us, or the writer who got
         # there first. Letting the unique index arbitrate in a single statement
         # is what removes the race: the read-then-write version could lose
@@ -151,7 +157,7 @@ class EventStoreMixin:
                 f"source event {event.content_hash[:12]} vanished immediately "
                 "after insert"
             )
-        event.was_deduplicated = stored.id != event.id or not inserted
+        event.was_deduplicated = True
         if event.was_deduplicated:
             logger.debug("[PDM-Events] Reusing event %s for hash", stored.id)
         return stored.id
@@ -451,27 +457,85 @@ class EventStoreMixin:
         self._commit_if_idle(self._conn())
 
         # Read back rather than trust our own id. Two threads naming the same
-        # person in the same field both compute the same identity triple, so
-        # the unique index picks one and the other must adopt it — the same
-        # arbitration used for events and mentions, and for the same reason:
-        # a losing INSERT that raises leaves the write lock parked behind a
-        # thread that has already given up.
+        # person in the same field compute the same identity triple, so the
+        # unique index picks one and the other adopts it.
         winner = self._run(
             "SELECT * FROM pdm_entities "
             "WHERE {user} = ? AND canonical_norm = ? AND origin_field_id = ? LIMIT 1",
             (user, norm, field_id),
         ).fetchone()
-        if winner is None:
-            raise RuntimeError(
-                f"entity {entity.canonical_name!r} vanished immediately after insert"
+        if winner is not None:
+            if siblings:
+                logger.info(
+                    "[PDM-Events] %r in field %r is a second identity, not a merge",
+                    entity.canonical_name,
+                    field_id,
+                )
+            return self._follow_merge(entity_from_row(winner)).id
+
+        # Nothing under our field, so the conflict was not ours to adopt: a
+        # thread naming the same person in a *different* field took the
+        # disambiguator we had picked, both of us having seen no siblings.
+        # Look again with what is there now and take the next free one.
+        return self._retry_after_disambiguator_clash(
+            user=user,
+            norm=norm,
+            field_id=field_id,
+            entity_type=entity_type,
+            canonical_name=entity.canonical_name,
+        )
+
+    def _retry_after_disambiguator_clash(
+        self,
+        *,
+        user: str,
+        norm: str,
+        field_id: str,
+        entity_type: str,
+        canonical_name: str,
+        attempts: int = 4,
+    ) -> str:
+        """Re-read the siblings and insert again, bounded."""
+        for _ in range(attempts):
+            siblings = {
+                r["disambiguator"]
+                for r in self._run(
+                    "SELECT disambiguator FROM pdm_entities "
+                    "WHERE {user} = ? AND canonical_norm = ?",
+                    (user, norm),
+                ).fetchall()
+            }
+            entity = EntityRecord(
+                user=user,
+                entity_type=entity_type,
+                canonical_name=canonical_name,
+                disambiguator=self._free_disambiguator(field_id, siblings),
+                origin_field_id=field_id,
             )
-        if siblings:
-            logger.info(
-                "[PDM-Events] %r in field %r is a second identity, not a merge",
-                entity.canonical_name,
-                field_id,
+            self._write(
+                """
+                INSERT INTO pdm_entities (
+                    id, {user}, entity_type, canonical_name, canonical_norm,
+                    disambiguator, origin_field_id, aliases, current_state_version,
+                    created_at, dissolved_at, merged_into
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT DO NOTHING
+                """,
+                entity_insert_row(entity),
             )
-        return self._follow_merge(entity_from_row(winner)).id
+            self._commit_if_idle(self._conn())
+            winner = self._run(
+                "SELECT * FROM pdm_entities "
+                "WHERE {user} = ? AND canonical_norm = ? AND origin_field_id = ? LIMIT 1",
+                (user, norm, field_id),
+            ).fetchone()
+            if winner is not None:
+                return self._follow_merge(entity_from_row(winner)).id
+
+        raise RuntimeError(
+            f"could not settle an identity for {canonical_name!r} in field "
+            f"{field_id!r} after {attempts} attempts"
+        )
 
     def _free_disambiguator(self, field_id: str, siblings: set[str]) -> str:
         """
@@ -567,7 +631,7 @@ class EventStoreMixin:
             # a model — and a merge is not a re-decision of that. Overwriting
             # it downgraded confirmed answers to whatever the merge was called
             # with, and resolve_mention then treated them as revisable again.
-            self._run(
+            self._write(
                 # `user` is in hand from the row we just read, and the only
                 # index here is (user, entity_id) — without it this is a scan
                 # of every mention in the store.
@@ -690,13 +754,39 @@ class EventStoreMixin:
         claimed = True
 
         if source_event_id is not None:
-            guard = "" if overwrite else " AND source_event_id IS NULL"
+            # "Already ours" is not a loss. rowcount alone reported False for a
+            # signature this same event had linked before, for an id that does
+            # not exist, and for another user's row — three different things
+            # counted as one, and every ingest on cloud counted as reuse.
+            guard = (
+                ""
+                if overwrite
+                else " AND (source_event_id IS NULL OR source_event_id = ?)"
+            )
+            params = (
+                (source_event_id, signature_id, user)
+                if overwrite
+                else (source_event_id, signature_id, user, source_event_id)
+            )
             cursor = self._write(
                 "UPDATE pdm_signatures SET source_event_id = ? "
                 f"WHERE id = ? AND {{user}} = ?{guard}",
-                (source_event_id, signature_id, user),
+                params,
             )
             claimed = bool(getattr(cursor, "rowcount", 1))
+            if not claimed:
+                # Either an earlier event owns it, or there is no such row.
+                # Only the first is a reuse; the second is a caller error and
+                # should not be quietly folded into a count.
+                owner = self._run(
+                    "SELECT source_event_id FROM pdm_signatures "
+                    "WHERE id = ? AND {user} = ? LIMIT 1",
+                    (signature_id, user),
+                ).fetchone()
+                if owner is None:
+                    raise KeyError(
+                        f"signature {signature_id!r} not found for user {user!r}"
+                    )
 
         if primary_entity_id is not None:
             guard = "" if overwrite else " AND primary_entity_id IS NULL"

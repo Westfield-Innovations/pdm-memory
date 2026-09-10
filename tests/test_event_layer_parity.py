@@ -164,11 +164,10 @@ class TestDialectParity:
         assert "?" not in sql
 
     def test_generated_insert_quotes_user(self, pg_host):
-        # The recorder has no storage, so the read-back that now follows every
-        # insert finds nothing and the method refuses to invent an id. The SQL
-        # is recorded before that point, which is what this test is about.
-        with pytest.raises(RuntimeError, match="vanished"):
-            pg_host.save_source_event(SourceEventRecord(event_type="chat_message"))
+        # The recorder reports a successful insert, so the method returns
+        # without a read-back — which is the point of the rowcount check. The
+        # SQL it sent is what this test is about.
+        pg_host.save_source_event(SourceEventRecord(event_type="chat_message"))
         insert = next(
             s for s in pg_host.recorder.statements if "INSERT INTO pdm_source_events" in s
         )
@@ -183,7 +182,10 @@ class TestDialectParity:
         than an aggregate plus up to twelve probes.
         """
         pg_host.recorder.statements.clear()
-        with pytest.raises(RuntimeError, match="vanished"):
+        # The recorder stores nothing, so every read-back comes back empty and
+        # the bounded retry gives up rather than looping. The SQL it produced
+        # on the way is what this test inspects.
+        with pytest.raises(RuntimeError, match="could not settle"):
             pg_host.resolve_or_create_entity(user="u", surface_form="Alex", field_id="w")
 
         sql = pg_host.recorder.statements

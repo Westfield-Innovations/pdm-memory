@@ -35,6 +35,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from pdm_memory.storage.event_hash import (
     CONTENT_HASH_VERSION,
+    _parse_iso,
     compute_content_hash,
     normalize_instant,
 )
@@ -663,12 +664,17 @@ apply_event_migrations = apply_event_migrations_sqlite
 
 
 def _parse_dt(value: str | None) -> datetime | None:
+    """
+    Read a stored timestamp with the grammar the hash uses.
+
+    Going through ``fromisoformat`` here meant a value this package had
+    written could fail to read back on an older runtime: the record then fell
+    to its default of ``now()``, moving both the content hash and the keyset
+    cursor that pages by it.
+    """
     if not value:
         return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
+    return _parse_iso(value.strip())
 
 
 def event_from_row(row: Any) -> SourceEventRecord:

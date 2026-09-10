@@ -82,6 +82,66 @@
       "content_hash": "d1214118017b6dc10224c39f539f708cbf8bb41328b2a2d29079589d75701722"
     },
     {
+      "name": "basic_format_compact",
+      "input": {
+        "event_type": "chat_message",
+        "occurred_at": "20260907T100000Z",
+        "source_system": "azus_chat",
+        "raw_reference": "chat:1",
+        "payload": ""
+      },
+      "canonical_document": {
+        "v": 1,
+        "event_type": "chat_message",
+        "occurred_at": "2026-09-07T10:00:00.000000Z",
+        "source_system": "azus_chat",
+        "raw_reference": "chat:1",
+        "payload": ""
+      },
+      "canonical_json": "{\"event_type\":\"chat_message\",\"occurred_at\":\"2026-09-07T10:00:00.000000Z\",\"payload\":\"\",\"raw_reference\":\"chat:1\",\"source_system\":\"azus_chat\",\"v\":1}",
+      "content_hash": "68f0707875b794f882a63cc1dc579d12e1792ec5cf28db11c7e52935bee29447"
+    },
+    {
+      "name": "seven_fractional_digits_truncate",
+      "input": {
+        "event_type": "chat_message",
+        "occurred_at": "2026-09-07T10:00:00.1234567Z",
+        "source_system": "azus_chat",
+        "raw_reference": "chat:2",
+        "payload": ""
+      },
+      "canonical_document": {
+        "v": 1,
+        "event_type": "chat_message",
+        "occurred_at": "2026-09-07T10:00:00.123456Z",
+        "source_system": "azus_chat",
+        "raw_reference": "chat:2",
+        "payload": ""
+      },
+      "canonical_json": "{\"event_type\":\"chat_message\",\"occurred_at\":\"2026-09-07T10:00:00.123456Z\",\"payload\":\"\",\"raw_reference\":\"chat:2\",\"source_system\":\"azus_chat\",\"v\":1}",
+      "content_hash": "7cfae6a089722069b1fb8b8feb3672ea4c304cff813058a5d708e154cc27a982"
+    },
+    {
+      "name": "comma_fraction_and_bare_hour_offset",
+      "input": {
+        "event_type": "email",
+        "occurred_at": "2026-09-07T05:00:00,5-05",
+        "source_system": "gmail",
+        "raw_reference": "gmail:3",
+        "payload": ""
+      },
+      "canonical_document": {
+        "v": 1,
+        "event_type": "email",
+        "occurred_at": "2026-09-07T10:00:00.500000Z",
+        "source_system": "gmail",
+        "raw_reference": "gmail:3",
+        "payload": ""
+      },
+      "canonical_json": "{\"event_type\":\"email\",\"occurred_at\":\"2026-09-07T10:00:00.500000Z\",\"payload\":\"\",\"raw_reference\":\"gmail:3\",\"source_system\":\"gmail\",\"v\":1}",
+      "content_hash": "621fb4cbad22b7a65e2b4f91d29ca39339e2e8251dce67f76391f70b528d463d"
+    },
+    {
       "name": "whitespace_is_stripped",
       "input": {
         "event_type": "  chat_message  ",

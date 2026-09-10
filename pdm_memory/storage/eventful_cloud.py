@@ -63,6 +63,23 @@ def _as_dict(value: Any) -> dict[str, Any]:
     return value or {}
 
 
+def _next_cursor(payload: Any, rows: list[dict[str, Any]]) -> str | None:
+    """
+    The cursor convention the rest of this SDK already speaks.
+
+    CloudDriver.list pages Companion with ``cursor_id`` in and
+    ``next_cursor_id`` out, falling back to the last row's id. Inventing
+    ``after``/``next`` beside it meant a server answering the SDK's own
+    protocol would stop after one page — or, handed a DRF ``next`` URL, feed
+    that URL back as a cursor and loop forever.
+    """
+    if isinstance(payload, dict):
+        nxt = payload.get("next_cursor_id")
+        if nxt:
+            return str(nxt)
+    return str(rows[-1].get("id")) if rows and rows[-1].get("id") else None
+
+
 def _as_list(value: Any) -> list[Any]:
     if isinstance(value, str):
         try:
@@ -218,15 +235,26 @@ class EventfulCloudDriver(CloudDriver):
         source_event_id: str | None = None,
         primary_entity_id: str | None = None,
         user: str = "default",
-    ) -> None:
+        overwrite: bool = False,
+    ) -> bool:
+        """
+        Returns whether this call claimed the provenance, like the local
+        drivers. Returning None from a method the Protocol types as bool made
+        every fact on cloud count as reused.
+        """
         body: dict[str, Any] = {}
         if source_event_id is not None:
             body["source_event_id"] = source_event_id
         if primary_entity_id is not None:
             body["primary_entity_id"] = primary_entity_id
         if not body:
-            return
-        self._patch(f"/api/v1/pdm/signatures/{signature_id}", body)
+            return True
+        resp = self._patch(f"/api/v1/pdm/signatures/{signature_id}", body)
+        try:
+            claimed = resp.json().get("source_event_claimed")
+        except Exception:  # pragma: no cover - a body that is not JSON
+            claimed = None
+        return True if claimed is None else bool(claimed)
 
     # ------------------------------------------------------------------
     # Wire shapes — one place, so sync and the endpoint cannot drift apart
@@ -319,16 +347,16 @@ class EventfulCloudDriver(CloudDriver):
         """
         cursor: str | None = None
         while True:
-            params: dict[str, Any] = {"user": user, "limit": batch, "order": "occurred_at"}
+            params: dict[str, Any] = {"user": user, "limit": batch}
             if cursor:
-                params["after"] = cursor
+                params["cursor_id"] = cursor
             payload = self._get(EVENTS_PATH, params=params).json()
             rows = _rows(payload)
             if not rows:
                 return
             for row in rows:
                 yield self.event_from_payload(row)
-            cursor = payload.get("next") if isinstance(payload, dict) else None
+            cursor = _next_cursor(payload, rows)
             if not cursor or len(rows) < batch:
                 return
 
@@ -338,16 +366,16 @@ class EventfulCloudDriver(CloudDriver):
         """Every mention, resolved or not — see the mixin's note on why both."""
         cursor: str | None = None
         while True:
-            params: dict[str, Any] = {"user": user, "limit": batch, "order": "observed_at"}
+            params: dict[str, Any] = {"user": user, "limit": batch}
             if cursor:
-                params["after"] = cursor
+                params["cursor_id"] = cursor
             payload = self._get(MENTIONS_PATH, params=params).json()
             rows = _rows(payload)
             if not rows:
                 return
             for row in rows:
                 yield self.mention_from_payload(row)
-            cursor = payload.get("next") if isinstance(payload, dict) else None
+            cursor = _next_cursor(payload, rows)
             if not cursor or len(rows) < batch:
                 return
 

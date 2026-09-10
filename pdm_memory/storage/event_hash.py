@@ -107,17 +107,35 @@ def normalize_instant(value: datetime | str | None) -> str:
 # module exists to remove, only louder than before. One grammar, every runtime.
 _ISO_PATTERN = re.compile(
     r"""^
-    (?P<year>\d{4}) -? (?P<month>\d{2}) -? (?P<day>\d{2})
     (?:
-        [T ]
-        (?P<hour>\d{2}) :? (?P<minute>\d{2})
-        (?: :? (?P<second>\d{2}) )?
-        (?: [.,] (?P<fraction>\d+) )?
-        (?P<offset> Z | z | [+-]\d{2} :? \d{2} | [+-]\d{2} )?
-    )?
+        # Extended: separators throughout, or none at all. ISO-8601 does not
+        # allow mixing them, and "2026-0907T10:00:00Z" is not a date in either
+        # grammar — it was accepted as one while the separators were optional.
+        (?P<year>\d{4}) - (?P<month>\d{2}) - (?P<day>\d{2})
+        (?:
+            [T ]
+            (?P<hour>\d{2}) : (?P<minute>\d{2})
+            (?: : (?P<second>\d{2}) )?
+            (?: [.,] (?P<fraction>\d+) )?
+            (?P<offset> Z | z | [+-]\d{2} :? [0-5]\d | [+-]\d{2} )?
+        )?
+      |
+        # Basic
+        (?P<byear>\d{4}) (?P<bmonth>\d{2}) (?P<bday>\d{2})
+        (?:
+            T
+            (?P<bhour>\d{2}) (?P<bminute>\d{2})
+            (?P<bsecond>\d{2})?
+            (?: [.,] (?P<bfraction>\d+) )?
+            (?P<boffset> Z | z | [+-]\d{2} :? [0-5]\d | [+-]\d{2} )?
+        )?
+    )
     $""",
     re.VERBOSE,
 )
+
+# Offset minutes are minutes: "+03:99" used to parse as four hours thirty-nine,
+# quietly moving the instant that gets hashed.
 
 
 def _parse_iso(raw: str) -> datetime | None:
@@ -125,7 +143,18 @@ def _parse_iso(raw: str) -> datetime | None:
     match = _ISO_PATTERN.match(raw)
     if match is None:
         return None
-    part = match.groupdict()
+    g = match.groupdict()
+    basic = g["year"] is None
+    part = {
+        "year": g["byear"] if basic else g["year"],
+        "month": g["bmonth"] if basic else g["month"],
+        "day": g["bday"] if basic else g["day"],
+        "hour": g["bhour"] if basic else g["hour"],
+        "minute": g["bminute"] if basic else g["minute"],
+        "second": g["bsecond"] if basic else g["second"],
+        "fraction": g["bfraction"] if basic else g["fraction"],
+        "offset": g["boffset"] if basic else g["offset"],
+    }
 
     # Six digits, whatever the input carried. Fewer are padded, more are
     # truncated — the same rounding a microsecond-resolution column applies,
@@ -256,6 +285,33 @@ GOLDEN_VECTOR_INPUTS: tuple[dict[str, Any], ...] = (
         "source_system": "azus_chat",
         "raw_reference": "",
         "payload": "Зустріч з Алексом — переніс на п'ятницю 🙂",
+    },
+    {
+        # Forms the grammar accepts that the original five did not cover —
+        # committed so Companion asserts against them rather than discovering
+        # them in production.
+        "name": "basic_format_compact",
+        "event_type": "chat_message",
+        "occurred_at": "20260907T100000Z",
+        "source_system": "azus_chat",
+        "raw_reference": "chat:1",
+        "payload": "",
+    },
+    {
+        "name": "seven_fractional_digits_truncate",
+        "event_type": "chat_message",
+        "occurred_at": "2026-09-07T10:00:00.1234567Z",
+        "source_system": "azus_chat",
+        "raw_reference": "chat:2",
+        "payload": "",
+    },
+    {
+        "name": "comma_fraction_and_bare_hour_offset",
+        "event_type": "email",
+        "occurred_at": "2026-09-07T05:00:00,5-05",
+        "source_system": "gmail",
+        "raw_reference": "gmail:3",
+        "payload": "",
     },
     {
         "name": "whitespace_is_stripped",
