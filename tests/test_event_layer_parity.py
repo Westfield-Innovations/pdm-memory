@@ -338,7 +338,7 @@ class TestEventSync:
         plain = SQLiteDriver(db_path=str(tmp_path / "b.db"))
 
         report = EventSync(eventful, plain).sync(direction="push")
-        assert report.unsupported == ["cloud"]
+        assert report.unsupported == ["remote"]
         assert report.errors == 0
 
         eventful.close()
@@ -360,43 +360,6 @@ class TestEventSync:
 # ---------------------------------------------------------------------------
 # Cloud delegation
 # ---------------------------------------------------------------------------
-
-
-class TestCloudDelegation:
-    def test_append_only_is_refused_before_the_round_trip(self):
-        from pdm_memory.storage.eventful_cloud import EventfulCloudDriver
-        from pdm_memory.storage.events import AppendOnlyViolation
-
-        driver = object.__new__(EventfulCloudDriver)
-        with pytest.raises(AppendOnlyViolation):
-            driver.update_source_event("evt", event_type="email")
-        with pytest.raises(AppendOnlyViolation):
-            driver.delete_source_event("evt")
-
-    def test_event_payload_carries_the_hash_and_not_the_content(self):
-        from pdm_memory.storage.eventful_cloud import EventfulCloudDriver
-
-        event = SourceEventRecord(raw_reference="chat:123:msg:456")
-        event.ensure_content_hash(payload="the actual message text")
-        payload = EventfulCloudDriver.event_payload(event)
-
-        assert payload["content_hash"] == event.content_hash
-        assert payload["raw_reference"] == "chat:123:msg:456"
-        assert "the actual message text" not in str(payload)
-
-    def test_payload_round_trips_through_the_wire_shape(self):
-        from pdm_memory.storage.eventful_cloud import EventfulCloudDriver
-
-        event = SourceEventRecord(
-            raw_reference="chat:7", provenance={"channel": "general"}
-        )
-        event.ensure_content_hash(payload="hello")
-        restored = EventfulCloudDriver.event_from_payload(
-            {**EventfulCloudDriver.event_payload(event), "id": event.id}
-        )
-        assert restored.content_hash == event.content_hash
-        assert restored.provenance == {"channel": "general"}
-        assert restored.occurred_at == event.occurred_at
 
 
 class TestPostgresDriverActuallyComposes:

@@ -63,23 +63,6 @@ class TestFinding1CrossFieldRace:
         assert len(set(results)) == 2, "two fields, two identities"
 
 
-class TestFinding2CloudCursorConvention:
-    """
-    The paging invented `after=`/`next`, while the rest of the SDK pages
-    Companion with cursor_id / next_cursor_id. A server answering the SDK's
-    own convention would either stop after one page or loop forever.
-    """
-
-    def test_paging_uses_the_convention_the_sdk_already_speaks(self):
-        import inspect
-
-        from pdm_memory.storage.eventful_cloud import EventfulCloudDriver
-
-        source = inspect.getsource(EventfulCloudDriver.iter_source_events)
-        assert "cursor_id" in source
-        assert '"after"' not in source
-
-
 class TestFinding3MentionResolutionOnFailedTranslation:
     """
     When an entity could not be translated to the far side, the mention still
@@ -169,14 +152,6 @@ class TestFinding6ReuseCountAndCloudReturn:
         driver.link_signature(sig.id, source_event_id=first)
 
         assert driver.link_signature(sig.id, source_event_id=second) is False
-
-    def test_cloud_link_signature_returns_a_bool(self):
-        import inspect
-
-        from pdm_memory.storage.eventful_cloud import EventfulCloudDriver
-
-        source = inspect.getsource(EventfulCloudDriver.link_signature)
-        assert "return True" in source or "return False" in source
 
 
 class TestFinding7OffsetValidation:

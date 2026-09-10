@@ -447,9 +447,9 @@ def storage_supports_events(storage: Any) -> bool:
     catches a driver that answers the capability question while missing methods
     the caller will reach for, which is how a half-implemented backend used to
     accept an ingest and then die partway through it. ``supports_events()`` is
-    the driver's own answer about the backend behind it — a cloud driver can
-    have every method and still be pointed at a deployment that serves none of
-    the routes.
+    the driver's own answer about the backend behind it, which having the
+    methods does not settle: a remote driver can implement every one of them
+    and still be pointed at a deployment that serves none of them.
 
     Never raises on a plain driver.
     """

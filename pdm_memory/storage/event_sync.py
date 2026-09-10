@@ -1,5 +1,5 @@
 """
-``EventSync`` — carry the evidence layer across local ↔ cloud.
+``EventSync`` — carry the evidence layer between two stores.
 
 ``MemorySync`` moves signatures and is frozen, so this sits beside it rather
 than inside it, and takes the same two arguments for the same reason: it works
@@ -62,9 +62,17 @@ class EventSyncReport:
 class EventSync:
     """Move source events, entities and mentions between two stores."""
 
-    def __init__(self, local, cloud, *, page_size: int = DEFAULT_PAGE_SIZE) -> None:
+    def __init__(self, local, remote, *, page_size: int = DEFAULT_PAGE_SIZE) -> None:
+        """
+        Args:
+            local:  The store being synced from on a push, into on a pull.
+            remote: The other one. Named for its role, not its transport —
+                    both sides are ordinary BaseStorage, and with the
+                    speculative cloud client gone the realistic pairing is a
+                    local SQLite against a shared Postgres.
+        """
         self._local = local
-        self._cloud = cloud
+        self._remote = remote
         self._page_size = max(1, page_size)
 
     def sync(self, user: str = "default", direction: str = "push") -> EventSyncReport:
@@ -80,7 +88,7 @@ class EventSync:
         """
         report = EventSyncReport(direction=direction)
 
-        for name, store in (("local", self._local), ("cloud", self._cloud)):
+        for name, store in (("local", self._local), ("remote", self._remote)):
             if not storage_supports_events(store):
                 report.unsupported.append(name)
 
@@ -92,9 +100,9 @@ class EventSync:
             return report
 
         if direction in ("push", "bidirectional"):
-            self._transfer(self._local, self._cloud, user, report, pulling=False)
+            self._transfer(self._local, self._remote, user, report, pulling=False)
         if direction in ("pull", "bidirectional"):
-            self._transfer(self._cloud, self._local, user, report, pulling=True)
+            self._transfer(self._remote, self._local, user, report, pulling=True)
 
         logger.info("[PDM-EventSync] %s", report)
         return report
