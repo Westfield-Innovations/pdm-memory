@@ -10,6 +10,7 @@ python -m pdm_memory.examples.guarded_agent_logic
 python -m pdm_memory.examples.handling_contradictions
 python -m pdm_memory.examples.temporal_recall_demo
 python -m pdm_memory.examples.industrial_safety_gate
+python -m pdm_memory.examples.field_state_demo
 ```
 
 From a source checkout you can also run the wrappers in this directory:

@@ -170,6 +170,45 @@ mem.save_many(
 - `mem.delete(id)` → soft-delete (`is_deleted`) when the API supports it; cloud list/get hide those rows.
 - Permanent removal is storage-level `hard_delete` (CloudDriver), not the default Memory facade API.
 
+### Field State
+
+The reconciled state of a bounded field — who belongs to it, how they are
+connected, and what is visible in it — at a moment.
+
+```python
+from datetime import datetime, timezone
+
+# As it stands now. The moment is left out of the request on purpose, so the
+# server answers from its own clock rather than yours.
+state = mem.current_state("westfield")
+
+# As it stood then. Must carry a timezone, and must not be in the future.
+state = mem.state_at("westfield", datetime(2026, 3, 1, 12, tzinfo=timezone.utc))
+
+state.field_memberships   # standing in the field, with the intervals it held
+state.relationships       # edges, each with how current its channel reads
+state.entities            # what this observer may reveal, one keyset page
+
+# Nested fields match by prefix: "westfield" covers "westfield/dqs".
+state = mem.current_state("westfield/dqs")
+
+# Paging: follow the cursor and drop the envelope, which does not change
+# between pages.
+page = mem.current_state("westfield", cursor=state.entities_next_cursor, envelope=False)
+```
+
+- **Cloud only.** Fields and memberships do not exist in the local schema, so
+  both calls raise in privacy mode rather than inventing a second data model.
+- **Every item declares its own provenance.** `state_type` is `"measured"` or
+  `"projected"` on each item, never inferred from where it sits. A payload with
+  an untagged item is rejected rather than guessed at.
+- **`envelope_included=False` means the envelope is absent, not empty.** The
+  fields are omitted rather than returned as `[]`, so a page-2 response can
+  never be read as a statement about the field.
+- **Results are filtered to what the observer may reveal.** There is no
+  unfiltered mode, and permission resolves against now — a revoked grant does
+  not reopen last year.
+
 ### Sync Local ↔ Cloud
 
 ```python
