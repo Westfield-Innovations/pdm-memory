@@ -22,6 +22,7 @@ from typing import Any
 from pdm_memory.storage.event_hash import normalize_instant
 from pdm_memory.storage.events import utc_now
 from pdm_memory.storage.fields import (
+    DISCOUNTED_STATES,
     LIVE_STATES,
     SignatureFieldMembershipRecord,
     FieldMembershipRecord,
@@ -45,6 +46,22 @@ __all__ = ["FieldStore"]
 # one field on the client and another on the server — a disagreement nobody
 # would think to look for.
 _LIVE = ", ".join(f"'{s}'" for s in sorted(LIVE_STATES))
+
+
+def _settle_on_write(record: Any, end: str | None, *, entered_field: bool) -> None:
+    """
+    Stamp a new row with the store's clock.
+
+    ``valid_from`` and ``valid_to`` are whatever the caller says about the world
+    and are often in the past; these say when the store took the row in. A
+    pending or denied membership never entered the field and gets no
+    ``settled_at``. A window written with its end already known settles that
+    end in the same moment.
+    """
+    if entered_field:
+        record.settled_at = record.created_at
+    if end is not None:
+        record.end_settled_at = record.created_at
 
 
 class FieldStore:
@@ -98,13 +115,15 @@ class FieldStore:
         )
         record.valid_from = start
         record.valid_to = end
+        _settle_on_write(record, end, entered_field=state not in DISCOUNTED_STATES)
 
         self._write(
             """
             INSERT INTO pdm_field_memberships (
                 id, {user}, entity_id, field_id, role,
-                valid_from, valid_to, state, derived_by, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                valid_from, valid_to, state, derived_by, created_at,
+                settled_at, end_settled_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT DO NOTHING
             """,
             # Built from the record rather than listed here: one place decides
@@ -161,13 +180,15 @@ class FieldStore:
         )
         record.valid_from = start
         record.valid_to = end
+        _settle_on_write(record, end, entered_field=True)
 
         self._write(
             """
             INSERT INTO pdm_signature_field_memberships (
                 id, {user}, signature_id, field_id, weight, confidence,
-                valid_from, valid_to, derived_by, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                valid_from, valid_to, derived_by, created_at,
+                settled_at, end_settled_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT DO NOTHING
             """,
             signature_membership_insert_row(record),
@@ -211,10 +232,13 @@ class FieldStore:
                 f"cannot end a membership at {closing}, before it began "
                 f"({row['valid_from']})"
             )
+        # `closing` is when the fact left the field; the second stamp is when the
+        # store was told, which is now whatever `at` says.
         self._write(
-            "UPDATE pdm_signature_field_memberships SET valid_to = ? "
+            "UPDATE pdm_signature_field_memberships "
+            "SET valid_to = ?, end_settled_at = ? "
             "WHERE id = ? AND {user} = ? AND valid_to IS NULL",
-            (closing, membership_id, user),
+            (closing, self._instant(None), membership_id, user),
         )
         self._commit_if_idle(self._conn())
 
@@ -339,10 +363,12 @@ class FieldStore:
                 f"({row['valid_from']})"
             )
 
+        # See unfile_signature: `closing` is the world's end, the last stamp
+        # the store's record of when it heard.
         self._write(
-            "UPDATE pdm_field_memberships SET valid_to = ?, state = ? "
+            "UPDATE pdm_field_memberships SET valid_to = ?, state = ?, end_settled_at = ? "
             "WHERE id = ? AND {user} = ? AND valid_to IS NULL",
-            (closing, state, membership_id, user),
+            (closing, state, self._instant(None), membership_id, user),
         )
         self._commit_if_idle(self._conn())
 
@@ -379,13 +405,15 @@ class FieldStore:
         )
         record.valid_from = start
         record.valid_to = end
+        _settle_on_write(record, end, entered_field=state not in DISCOUNTED_STATES)
 
         self._write(
             """
             INSERT INTO pdm_relationships (
                 id, {user}, source_entity_id, target_entity_id, relationship_type,
-                directionality, valid_from, valid_to, state, derived_by, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                directionality, valid_from, valid_to, state, derived_by, created_at,
+                settled_at, end_settled_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT DO NOTHING
             """,
             relationship_insert_row(record),
@@ -431,9 +459,9 @@ class FieldStore:
             )
 
         self._write(
-            "UPDATE pdm_relationships SET valid_to = ?, state = ? "
+            "UPDATE pdm_relationships SET valid_to = ?, state = ?, end_settled_at = ? "
             "WHERE id = ? AND {user} = ? AND valid_to IS NULL",
-            (closing, state, relationship_id, user),
+            (closing, state, self._instant(None), relationship_id, user),
         )
         self._commit_if_idle(self._conn())
 

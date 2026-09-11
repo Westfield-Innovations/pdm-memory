@@ -15,6 +15,7 @@ import pytest
 
 from pdm_memory import Memory
 from pdm_memory.event_log import EventLog
+from pdm_memory.storage.event_hash import normalize_instant
 from pdm_memory.storage.eventful_sqlite import EventfulSQLiteDriver
 
 MARCH = datetime(2026, 3, 1, tzinfo=timezone.utc)
@@ -475,6 +476,123 @@ class TestFactLevelFiling:
         first = log.file_fact(sig, "work")
         again = log.file_fact(sig, "work")
         assert first == again
+
+
+def _row(log: EventLog, table: str, row_id: str) -> dict:
+    import sqlite3
+
+    raw = sqlite3.connect(log._storage.db_path)
+    raw.row_factory = sqlite3.Row
+    try:
+        found = raw.execute(f"SELECT * FROM {table} WHERE id = ?", (row_id,))
+        return dict(found.fetchone())
+    finally:
+        raw.close()
+
+
+class TestSettlement:
+    """
+    ``settled_at`` and ``end_settled_at`` are the store's clock; the window is
+    the world's. Every case backdates the window, because a settlement stamp
+    that only ever agrees with ``valid_from`` proves nothing about which of the
+    two it is reading.
+    """
+
+    def test_a_backdated_membership_settles_when_it_is_written(self, log):
+        alex = person(log, "Alex", "work")
+        now = datetime.now(timezone.utc)
+
+        membership = log.add_field_membership(alex, "work", now - timedelta(days=90))
+
+        row = _row(log, "pdm_field_memberships", membership)
+        assert row["settled_at"] >= normalize_instant(now) > row["valid_from"]
+        assert row["end_settled_at"] is None
+
+    def test_an_end_given_later_settles_when_it_is_given(self, log):
+        alex = person(log, "Alex", "work")
+        now = datetime.now(timezone.utc)
+        membership = log.add_field_membership(alex, "work", now - timedelta(days=90))
+        ended = now - timedelta(days=30)
+
+        log.end_membership(membership, ended)
+
+        row = _row(log, "pdm_field_memberships", membership)
+        assert row["valid_to"] == normalize_instant(ended)
+        assert row["end_settled_at"] >= normalize_instant(now)
+
+    def test_a_window_written_already_closed_settles_both_ends_at_once(self, log):
+        alex = person(log, "Alex", "work")
+        membership = log.add_field_membership(alex, "project/orion", MARCH, AUGUST)
+
+        row = _row(log, "pdm_field_memberships", membership)
+        assert row["settled_at"] == row["end_settled_at"] == row["created_at"]
+
+    def test_a_pending_membership_has_not_settled(self, log):
+        alex = person(log, "Alex", "work")
+        membership = log._storage.add_field_membership(
+            alex, "work", MARCH, state="pending", user="default"
+        )
+
+        assert _row(log, "pdm_field_memberships", membership)["settled_at"] is None
+
+    def test_links_and_filings_settle_the_same_way(self, log):
+        now = datetime.now(timezone.utc)
+        link = log.link("e1", "e2", "manager", valid_from=now - timedelta(days=90))
+        filing = log.file_fact("s-1", "work", now - timedelta(days=90))
+
+        log.end_link(link, now - timedelta(days=30))
+        log.unfile_fact(filing, now - timedelta(days=30))
+
+        for table, row_id in (
+            ("pdm_relationships", link),
+            ("pdm_signature_field_memberships", filing),
+        ):
+            row = _row(log, table, row_id)
+            assert row["settled_at"] >= normalize_instant(now), table
+            assert row["valid_to"] < normalize_instant(now), table
+            assert row["end_settled_at"] >= normalize_instant(now), table
+
+    def test_an_older_database_is_brought_up_to_date_honestly(self, tmp_path):
+        import re
+        import sqlite3
+
+        from pdm_memory.storage.fields import (
+            SCHEMA_FIELDS_SQLITE,
+            apply_field_migrations_sqlite,
+        )
+
+        before = re.sub(
+            r",\n\s+settled_at\s+TEXT,\n\s+end_settled_at\s+TEXT",
+            "",
+            SCHEMA_FIELDS_SQLITE,
+        )
+        assert "settled_at" not in before
+
+        conn = sqlite3.connect(tmp_path / "old.db")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(before)
+        created = "2026-03-02T00:00:00.000000Z"
+        conn.executemany(
+            "INSERT INTO pdm_field_memberships (id, user, entity_id, field_id, "
+            "role, valid_from, valid_to, state, derived_by, created_at) "
+            "VALUES (?, 'default', ?, 'work', '', "
+            "'2026-03-01T00:00:00.000000Z', ?, ?, 'sdk', ?)",
+            [
+                ("live", "e1", None, "active", created),
+                ("closed", "e2", "2026-06-01T00:00:00.000000Z", "expired", created),
+                ("proposed", "e3", None, "pending", created),
+            ],
+        )
+
+        apply_field_migrations_sqlite(conn)
+        apply_field_migrations_sqlite(conn)
+
+        rows = {r["id"]: dict(r) for r in conn.execute("SELECT * FROM pdm_field_memberships")}
+        conn.close()
+        assert rows["live"]["settled_at"] == created
+        assert rows["closed"]["settled_at"] == created
+        assert rows["closed"]["end_settled_at"] is None, "when it closed is not known"
+        assert rows["proposed"]["settled_at"] is None, "a proposal never entered"
 
 
 class TestBothDialectsAgree:

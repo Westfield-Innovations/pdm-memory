@@ -169,6 +169,12 @@ class FieldMembershipRecord:
     state: str = "active"
     derived_by: str = "sdk"
     created_at: datetime | None = None
+    # The store's clock, where the window is the world's: when this row entered
+    # the field state, and when its end was recorded. Set by the store on write
+    # and never filled in here — a row read back from before these columns
+    # existed has no honest value to be given.
+    settled_at: datetime | None = None
+    end_settled_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.created_at is None:
@@ -217,6 +223,9 @@ class SignatureFieldMembershipRecord:
 
     derived_by: str = "sdk"
     created_at: datetime | None = None
+    # See FieldMembershipRecord.
+    settled_at: datetime | None = None
+    end_settled_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.created_at is None:
@@ -255,6 +264,9 @@ class RelationshipRecord:
     state: str = "active"
     derived_by: str = "sdk"
     created_at: datetime | None = None
+    # See FieldMembershipRecord.
+    settled_at: datetime | None = None
+    end_settled_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.created_at is None:
@@ -296,7 +308,9 @@ CREATE TABLE IF NOT EXISTS pdm_field_memberships (
     valid_to     TEXT,
     state        TEXT NOT NULL DEFAULT 'active',
     derived_by   TEXT NOT NULL DEFAULT 'sdk',
-    created_at   TEXT NOT NULL
+    created_at   TEXT NOT NULL,
+    settled_at   TEXT,
+    end_settled_at TEXT
 );
 
 -- One open membership per (entity, field, role). Overlapping windows are the
@@ -323,7 +337,9 @@ CREATE TABLE IF NOT EXISTS pdm_signature_field_memberships (
     valid_from    TEXT NOT NULL,
     valid_to      TEXT,
     derived_by    TEXT NOT NULL DEFAULT 'sdk',
-    created_at    TEXT NOT NULL
+    created_at    TEXT NOT NULL,
+    settled_at    TEXT,
+    end_settled_at TEXT
 );
 
 -- Companion's pdm_sfm_unique_live, mirrored: one live row per fact per field.
@@ -347,7 +363,9 @@ CREATE TABLE IF NOT EXISTS pdm_relationships (
     valid_to           TEXT,
     state              TEXT NOT NULL DEFAULT 'active',
     derived_by         TEXT NOT NULL DEFAULT 'sdk',
-    created_at         TEXT NOT NULL
+    created_at         TEXT NOT NULL,
+    settled_at         TEXT,
+    end_settled_at     TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pdm_rel_open
@@ -377,9 +395,45 @@ def _quote_user(ddl: str) -> str:
 SCHEMA_FIELDS_POSTGRES = _quote_user(SCHEMA_FIELDS_SQLITE)
 
 
+# Tables that gained the settlement columns after they first shipped, and
+# whether each has a ``state`` a row can hold without ever having entered the
+# field. SQLite has no ADD COLUMN IF NOT EXISTS, so its path checks PRAGMA
+# table_info first — the evidence layer does the same for signatures.
+SETTLEMENT_TABLES: tuple[tuple[str, bool], ...] = (
+    ("pdm_field_memberships", True),
+    ("pdm_signature_field_memberships", False),
+    ("pdm_relationships", True),
+)
+
+
+def _settle_existing_sql(table: str, has_state: bool) -> str:
+    """
+    Backfill ``settled_at`` from ``created_at`` for rows that predate it.
+
+    Honest here because every row entered the field state when it was written,
+    except a pending or denied one, which never entered it and stays NULL.
+    ``end_settled_at`` is left alone: when an old row was closed is recorded
+    nowhere, and a guess would be a false record.
+    """
+    unreconciled = " AND state NOT IN ('pending', 'denied')" if has_state else ""
+    return (
+        f"UPDATE {table} SET settled_at = created_at "
+        f"WHERE settled_at IS NULL{unreconciled}"
+    )
+
+
 def apply_field_migrations_sqlite(conn: Any) -> None:
-    """Create the membership tables. Idempotent."""
+    """Create the membership tables, or bring older ones up to date. Idempotent."""
     conn.executescript(SCHEMA_FIELDS_SQLITE)
+    for table, has_state in SETTLEMENT_TABLES:
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        # Backfilled once, in the run that adds the column. From then on every
+        # row carries whatever the store gave it on write.
+        if "settled_at" not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN settled_at TEXT")
+            conn.execute(_settle_existing_sql(table, has_state))
+        if "end_settled_at" not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN end_settled_at TEXT")
     logger.debug("[PDM-Fields] Membership tables ready (sqlite)")
 
 
@@ -388,6 +442,19 @@ def apply_field_migrations_postgres(conn: Any) -> None:
     for statement in SCHEMA_FIELDS_POSTGRES.split(";"):
         if statement.strip():
             conn.execute(statement)
+    for table, has_state in SETTLEMENT_TABLES:
+        present = conn.execute(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_schema = current_schema() "
+            "AND table_name = %s AND column_name = 'settled_at'",
+            (table,),
+        ).fetchone()
+        if present is None:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN settled_at TEXT")
+            conn.execute(_settle_existing_sql(table, has_state))
+        conn.execute(
+            f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS end_settled_at TEXT"
+        )
     logger.debug("[PDM-Fields] Membership tables ready (postgres)")
 
 
@@ -419,6 +486,8 @@ def membership_from_row(row: Any) -> FieldMembershipRecord:
         state=row["state"],
         derived_by=row["derived_by"],
         created_at=_parse_dt(row["created_at"]),
+        settled_at=_parse_dt(row["settled_at"]),
+        end_settled_at=_parse_dt(row["end_settled_at"]),
     )
 
 
@@ -435,6 +504,8 @@ def membership_insert_row(m: FieldMembershipRecord) -> tuple[Any, ...]:
         m.state,
         m.derived_by,
         _as_stamp(m.created_at),
+        _as_stamp(m.settled_at),
+        _as_stamp(m.end_settled_at),
     )
 
 
@@ -450,6 +521,8 @@ def signature_membership_from_row(row: Any) -> SignatureFieldMembershipRecord:
         valid_to=_parse_dt(row["valid_to"]),
         derived_by=row["derived_by"],
         created_at=_parse_dt(row["created_at"]),
+        settled_at=_parse_dt(row["settled_at"]),
+        end_settled_at=_parse_dt(row["end_settled_at"]),
     )
 
 
@@ -467,6 +540,8 @@ def signature_membership_insert_row(
         _as_stamp(m.valid_to),
         m.derived_by,
         _as_stamp(m.created_at),
+        _as_stamp(m.settled_at),
+        _as_stamp(m.end_settled_at),
     )
 
 
@@ -483,6 +558,8 @@ def relationship_from_row(row: Any) -> RelationshipRecord:
         state=row["state"],
         derived_by=row["derived_by"],
         created_at=_parse_dt(row["created_at"]),
+        settled_at=_parse_dt(row["settled_at"]),
+        end_settled_at=_parse_dt(row["end_settled_at"]),
     )
 
 
@@ -499,4 +576,6 @@ def relationship_insert_row(r: RelationshipRecord) -> tuple[Any, ...]:
         r.state,
         r.derived_by,
         _as_stamp(r.created_at),
+        _as_stamp(r.settled_at),
+        _as_stamp(r.end_settled_at),
     )
