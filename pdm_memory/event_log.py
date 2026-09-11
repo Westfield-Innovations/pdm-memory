@@ -277,3 +277,158 @@ class EventLog:
     def merge(self, keep_id: str, merge_id: str, *, method: str = "user_confirmed") -> None:
         """Two identities turned out to be one person. Reversible; see D6."""
         self._storage.merge_entities(keep_id, merge_id, method=method)
+
+    # ------------------------------------------------------------------
+    # Fields — who belongs where, and when (TKT-102)
+    # ------------------------------------------------------------------
+
+    def add_field_membership(
+        self,
+        entity_id: str,
+        field_id: str,
+        valid_from: datetime | str | None = None,
+        valid_to: datetime | str | None = None,
+        *,
+        role: str = "",
+        derived_by: str = "sdk",
+    ) -> str:
+        """
+        Put an entity in a field for a window of time.
+
+        Adding a second membership does not end the first: an entity is in Work
+        and in Project Orion at once, and that is the point. Boundaries are
+        validated before anything is written — an end at or before the start is
+        refused rather than stored.
+        """
+        self._require_fields()
+        return self._storage.add_field_membership(
+            entity_id,
+            field_id,
+            valid_from,
+            valid_to,
+            role=role,
+            derived_by=derived_by,
+            user=self._user,
+        )
+
+    def end_membership(
+        self, membership_id: str, at: datetime | str | None = None
+    ) -> None:
+        """Close a membership. The row keeps its history rather than vanishing."""
+        self._require_fields()
+        self._storage.end_field_membership(membership_id, at, user=self._user)
+
+    def link(
+        self,
+        source_entity_id: str,
+        target_entity_id: str,
+        relationship_type: str,
+        directionality: str = "directed",
+        valid_from: datetime | str | None = None,
+        valid_to: datetime | str | None = None,
+        *,
+        derived_by: str = "sdk",
+    ) -> str:
+        """
+        Record that two entities stood in some relation for a window of time.
+
+        ``directed`` is followed one way — "Alex manages Orion" read backwards
+        is a different claim. ``symmetric`` is followed both ways from one row.
+        """
+        self._require_fields()
+        return self._storage.link(
+            source_entity_id,
+            target_entity_id,
+            relationship_type,
+            directionality,
+            valid_from,
+            valid_to,
+            derived_by=derived_by,
+            user=self._user,
+        )
+
+    def end_link(self, relationship_id: str, at: datetime | str | None = None) -> None:
+        """Close a relationship."""
+        self._require_fields()
+        self._storage.end_relationship(relationship_id, at, user=self._user)
+
+    def fields_of(self, entity_id: str, at: datetime | str | None = None) -> list[str]:
+        """Which fields an entity was in at *at*. Several is normal."""
+        self._require_fields()
+        return self._storage.fields_of(entity_id, at, user=self._user)
+
+    def members_of(self, field_id: str, at: datetime | str | None = None) -> list[str]:
+        """Which entities were in a field at *at*."""
+        self._require_fields()
+        return self._storage.members_of(field_id, at, user=self._user)
+
+    def related(
+        self, entity_id: str, at: datetime | str | None = None
+    ) -> set[str]:
+        """Entities a live link reaches from this one at *at*. One hop."""
+        self._require_fields()
+        return self._storage.related_entities(entity_id, at, user=self._user)
+
+    def recall(
+        self,
+        query: str,
+        k: int = 5,
+        *,
+        field: str,
+        at: datetime | str | None = None,
+        follow_links: bool = True,
+        min_pressure: float = 0.0,
+        candidate_limit: int = 2000,
+    ) -> list[Any]:
+        """
+        Ask a question inside one field, as of an instant.
+
+        Facts about entities outside the field do not come back unless a live
+        link reaches them — the isolation the field table exists for. Facts
+        about no entity in particular do: they are not in another field, they
+        are in none, and dropping them would empty most of a store the first
+        time anyone scoped a query.
+
+        ``at`` defaults to now. A question about April deserves April's answer,
+        and memberships move.
+
+        Scoped recall goes through this rather than ``Memory.recall`` because
+        that method is frozen and cannot pass a field down to the engine.
+        """
+        self._require_fields()
+        from pdm_memory.core.field_scoped_retrieval import FieldScopedRetrievalEngine
+
+        loader = getattr(self._memory, "_load_recall_candidates", None)
+        if callable(loader):
+            records = loader(
+                query=query,
+                min_pressure=min_pressure,
+                drawer=None,
+                candidate_limit=candidate_limit,
+                page_size=min(500, candidate_limit),
+            )
+        else:  # pragma: no cover - only if Memory's internals move
+            records = self._storage.list(user=self._user, limit=candidate_limit)
+
+        engine = self._memory._engine
+        if not isinstance(engine, FieldScopedRetrievalEngine):
+            engine = FieldScopedRetrievalEngine(storage=self._storage)
+        else:
+            engine.bind(self._storage)
+
+        return engine.recall(
+            records=records,
+            query=query,
+            k=k,
+            field=field,
+            at=at,
+            follow_links=follow_links,
+            user=self._user,
+        )
+
+    def _require_fields(self) -> None:
+        if not hasattr(self._storage, "supports_fields"):
+            raise RuntimeError(
+                f"{type(self._storage).__name__} does not carry field "
+                "memberships. Use Memory(storage=EventfulSQLiteDriver(...))."
+            )

@@ -22,7 +22,9 @@ import sqlite3
 from typing import Any
 
 from pdm_memory.storage.event_store import EventStoreMixin
+from pdm_memory.storage.field_store import FieldStore
 from pdm_memory.storage.events import apply_event_migrations_sqlite
+from pdm_memory.storage.fields import apply_field_migrations_sqlite
 from pdm_memory.storage.sqlite_driver import SQLiteDriver
 
 logger = logging.getLogger(__name__)
@@ -30,7 +32,7 @@ logger = logging.getLogger(__name__)
 __all__ = ["EventfulSQLiteDriver", "enable_events"]
 
 
-class EventfulSQLiteDriver(EventStoreMixin, SQLiteDriver):
+class EventfulSQLiteDriver(FieldStore, EventStoreMixin, SQLiteDriver):
     """``SQLiteDriver`` plus source events, entities and mentions."""
 
     _EVENT_PLACEHOLDER = "?"
@@ -40,6 +42,7 @@ class EventfulSQLiteDriver(EventStoreMixin, SQLiteDriver):
         super().__init__(db_path=db_path, store_raw=store_raw)
         conn = self._conn()
         apply_event_migrations_sqlite(conn)
+        apply_field_migrations_sqlite(conn)
         conn.commit()
 
     def _conn(self) -> sqlite3.Connection:

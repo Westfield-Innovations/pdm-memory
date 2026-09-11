@@ -15,7 +15,9 @@ from __future__ import annotations
 import logging
 
 from pdm_memory.storage.event_store import EventStoreMixin
+from pdm_memory.storage.field_store import FieldStore
 from pdm_memory.storage.events import apply_event_migrations_postgres
+from pdm_memory.storage.fields import apply_field_migrations_postgres
 from pdm_memory.storage.postgres_driver import PostgresDriver
 
 logger = logging.getLogger(__name__)
@@ -23,7 +25,7 @@ logger = logging.getLogger(__name__)
 __all__ = ["EventfulPostgresDriver"]
 
 
-class EventfulPostgresDriver(EventStoreMixin, PostgresDriver):
+class EventfulPostgresDriver(FieldStore, EventStoreMixin, PostgresDriver):
     """``PostgresDriver`` plus source events, entities and mentions."""
 
     _EVENT_PLACEHOLDER = "%s"
@@ -33,4 +35,5 @@ class EventfulPostgresDriver(EventStoreMixin, PostgresDriver):
         super().__init__(dsn=dsn, store_raw=store_raw)
         conn = self._conn()
         apply_event_migrations_postgres(conn)
+        apply_field_migrations_postgres(conn)
         conn.commit()
