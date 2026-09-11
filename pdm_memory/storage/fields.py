@@ -40,6 +40,7 @@ __all__ = [
     "FIELD_ID_PATTERN",
     "MEMBERSHIP_STATES",
     "FieldMembershipRecord",
+    "SignatureFieldMembershipRecord",
     "RelationshipRecord",
     "apply_field_migrations_sqlite",
     "normalize_field_id",
@@ -187,6 +188,50 @@ class FieldMembershipRecord:
 
 
 @dataclass
+class SignatureFieldMembershipRecord:
+    """
+    A fact belonged to a field for a stretch of time.
+
+    Distinct from ``FieldMembershipRecord``, which files an *entity*. A fact
+    about a colleague can sit in Work while the colleague themselves also sits
+    in Personal — the fact is filed where it was said, not wherever its subject
+    happens to belong. Companion scopes queries on this table, so the SDK has
+    to as well or the same question answers differently on the two sides.
+
+    ``weight`` and ``confidence`` mirror Companion's: a fact can belong to a
+    field partly, and a classifier can be unsure. Neither is used for scoping
+    yet — presence is what decides — but they travel so a sync does not have
+    to invent them later.
+    """
+
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    user: str = "default"
+
+    signature_id: str = ""
+    field_id: str = ""
+    weight: float = 1.0
+    confidence: float = 1.0
+
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
+
+    derived_by: str = "sdk"
+    created_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if self.created_at is None:
+            self.created_at = utc_now()
+        if self.valid_from is None:
+            self.valid_from = utc_now()
+        if self.derived_by not in DERIVATIONS:
+            raise ValueError(
+                f"derived_by must be one of {sorted(DERIVATIONS)}, "
+                f"got {self.derived_by!r}"
+            )
+        self.field_id = normalize_field_id(self.field_id)
+
+
+@dataclass
 class RelationshipRecord:
     """
     E1 stood in some relation to E2 for a stretch of time.
@@ -268,6 +313,29 @@ CREATE INDEX IF NOT EXISTS idx_pdm_fm_field_window
 CREATE INDEX IF NOT EXISTS idx_pdm_fm_entity_window
     ON pdm_field_memberships (user, entity_id, valid_from, valid_to);
 
+CREATE TABLE IF NOT EXISTS pdm_signature_field_memberships (
+    id            TEXT PRIMARY KEY,
+    user          TEXT NOT NULL DEFAULT 'default',
+    signature_id  TEXT NOT NULL,
+    field_id      TEXT NOT NULL,
+    weight        REAL NOT NULL DEFAULT 1.0,
+    confidence    REAL NOT NULL DEFAULT 1.0,
+    valid_from    TEXT NOT NULL,
+    valid_to      TEXT,
+    derived_by    TEXT NOT NULL DEFAULT 'sdk',
+    created_at    TEXT NOT NULL
+);
+
+-- Companion's pdm_sfm_unique_live, mirrored: one live row per fact per field.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pdm_sfm_unique_live
+    ON pdm_signature_field_memberships (user, signature_id, field_id)
+    WHERE valid_to IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_pdm_sfm_sig_field
+    ON pdm_signature_field_memberships (user, signature_id, field_id);
+CREATE INDEX IF NOT EXISTS idx_pdm_sfm_field_from
+    ON pdm_signature_field_memberships (user, field_id, valid_from);
+
 CREATE TABLE IF NOT EXISTS pdm_relationships (
     id                 TEXT PRIMARY KEY,
     user               TEXT NOT NULL DEFAULT 'default',
@@ -292,11 +360,21 @@ CREATE INDEX IF NOT EXISTS idx_pdm_rel_target
     ON pdm_relationships (user, target_entity_id, valid_from, valid_to);
 """
 
-SCHEMA_FIELDS_POSTGRES = SCHEMA_FIELDS_SQLITE.replace(
-    "    user         TEXT", '    "user"       TEXT'
-).replace(
-    "    user               TEXT", '    "user"             TEXT'
-).replace("(user, ", '("user", ')
+def _quote_user(ddl: str) -> str:
+    """
+    Quote every bare ``user`` for PostgreSQL, where it is a reserved word.
+
+    Derived from the SQLite DDL rather than written twice so a column cannot be
+    added to one dialect and forgotten in the other — the drift that produced
+    five mismatched mappers in TKT-101. Done with a word-boundary match rather
+    than by matching indentation: the first version replaced fixed-width column
+    prefixes, and a table whose columns happened to line up differently slipped
+    through unquoted and failed on the server with nothing catching it here.
+    """
+    return re.sub(r'(?<!")\buser\b(?!")', '"user"', ddl)
+
+
+SCHEMA_FIELDS_POSTGRES = _quote_user(SCHEMA_FIELDS_SQLITE)
 
 
 def apply_field_migrations_sqlite(conn: Any) -> None:
@@ -355,6 +433,38 @@ def membership_insert_row(m: FieldMembershipRecord) -> tuple[Any, ...]:
         _as_stamp(m.valid_from),
         _as_stamp(m.valid_to),
         m.state,
+        m.derived_by,
+        _as_stamp(m.created_at),
+    )
+
+
+def signature_membership_from_row(row: Any) -> SignatureFieldMembershipRecord:
+    return SignatureFieldMembershipRecord(
+        id=row["id"],
+        user=row["user"],
+        signature_id=row["signature_id"],
+        field_id=row["field_id"],
+        weight=row["weight"],
+        confidence=row["confidence"],
+        valid_from=_parse_dt(row["valid_from"]),
+        valid_to=_parse_dt(row["valid_to"]),
+        derived_by=row["derived_by"],
+        created_at=_parse_dt(row["created_at"]),
+    )
+
+
+def signature_membership_insert_row(
+    m: SignatureFieldMembershipRecord,
+) -> tuple[Any, ...]:
+    return (
+        m.id,
+        m.user,
+        m.signature_id,
+        m.field_id,
+        m.weight,
+        m.confidence,
+        _as_stamp(m.valid_from),
+        _as_stamp(m.valid_to),
         m.derived_by,
         _as_stamp(m.created_at),
     )

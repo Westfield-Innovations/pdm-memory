@@ -328,7 +328,7 @@ class TestMatchesTheServerSemantics:
         facts stop being any one field's to withhold rather than vanishing
         from every field but the one it used to be in.
         """
-        alex = log.mention("Alex", field_id="work", signature_id="s1")
+        log.mention("Alex", field_id="work", signature_id="s1")
         result = log.ingest(
             event=log.event(raw_reference="chat:1"),
             payload="x",
@@ -367,3 +367,178 @@ class TestMatchesTheServerSemantics:
             for h in log.recall("alex meeting schedule", k=10, field="work", at=JUNE)
         ]
         assert "Lunch with Alex on Sunday" not in found
+
+
+class TestFactLevelFiling:
+    """
+    Companion scopes on the fact's own membership, not its subject's. A fact is
+    filed where it was said: something said about a colleague in a work chat
+    belongs to Work even though the colleague also belongs to Personal.
+    """
+
+    def test_ingest_files_what_it_writes(self, log):
+        result = log.ingest(
+            event=log.event(raw_reference="chat:1"),
+            payload="x",
+            facts=[{"text": "Orion ships Friday", "tags": ["orion", "ship", "friday"]}],
+            field_id="work",
+        )
+        assert log.fact_fields(result["signature_ids"][0]) == ["work"]
+
+    def test_a_fact_filed_elsewhere_is_withheld(self, log):
+        """The case entity-based filtering could not express."""
+        tags = ["alex", "meeting", "schedule"]
+        log.ingest(
+            event=log.event(raw_reference="chat:w"),
+            payload="w",
+            facts=[{"text": "Alex reviewed the release", "tags": tags}],
+            field_id="work",
+        )
+        log.ingest(
+            event=log.event(raw_reference="chat:f"),
+            payload="f",
+            facts=[{"text": "Lunch with Alex on Sunday", "tags": tags}],
+            field_id="family",
+        )
+
+        found = [h.text for h in log.recall("alex meeting schedule", k=10, field="work")]
+        assert "Alex reviewed the release" in found
+        assert "Lunch with Alex on Sunday" not in found
+
+    def test_one_fact_can_sit_in_two_fields(self, log):
+        result = log.ingest(
+            event=log.event(raw_reference="chat:1"),
+            payload="x",
+            facts=[{"text": "Orion ships Friday", "tags": ["orion", "ship", "friday"]}],
+            field_id="work",
+        )
+        sig = result["signature_ids"][0]
+        log.file_fact(sig, "project/orion")
+
+        assert log.fact_fields(sig) == ["project/orion", "work"]
+        for field in ("work", "project/orion"):
+            found = [h.text for h in log.recall("orion ship friday", k=5, field=field)]
+            assert "Orion ships Friday" in found
+
+    def test_filing_is_temporal(self, log):
+        result = log.ingest(
+            event=log.event(raw_reference="chat:1"),
+            payload="x",
+            facts=[{"text": "Orion ships Friday", "tags": ["orion", "ship", "friday"]}],
+            field_id="work",
+        )
+        sig = result["signature_ids"][0]
+        log.file_fact(sig, "project/orion", MARCH, AUGUST)
+
+        assert "project/orion" in log.fact_fields(sig, JUNE)
+        assert "project/orion" not in log.fact_fields(sig, OCTOBER)
+
+    def test_a_fact_that_left_its_only_field_becomes_unfiled(self, log):
+        """
+        Companion's rule, on facts: no membership in force, not no row ever. A
+        fact that left its only field stops being anyone's to withhold instead
+        of vanishing from every field but that one.
+        """
+        result = log.ingest(
+            event=log.event(raw_reference="chat:1"),
+            payload="x",
+            facts=[{"text": "Orion ships Friday", "tags": ["orion", "ship", "friday"]}],
+            field_id="work",
+        )
+        sig = result["signature_ids"][0]
+        # ingest files at the moment it writes, so the close has to come after
+        # that rather than at a date from the fixtures above.
+        membership = log._storage._run(
+            "SELECT id FROM pdm_signature_field_memberships WHERE signature_id = ?",
+            (sig,),
+        ).fetchone()["id"]
+        closed_at = datetime.now(timezone.utc) + timedelta(days=1)
+        log.unfile_fact(membership, closed_at)
+
+        found = [
+            h.text
+            for h in log.recall(
+                "orion ship friday", k=5, field="family",
+                at=closed_at + timedelta(days=1),
+            )
+        ]
+        assert "Orion ships Friday" in found
+
+    def test_one_live_row_per_fact_per_field(self, log):
+        result = log.ingest(
+            event=log.event(raw_reference="chat:1"),
+            payload="x",
+            facts=[{"text": "Orion ships Friday", "tags": ["orion", "ship", "friday"]}],
+            field_id="work",
+        )
+        sig = result["signature_ids"][0]
+        first = log.file_fact(sig, "work")
+        again = log.file_fact(sig, "work")
+        assert first == again
+
+
+class TestBothDialectsAgree:
+    """
+    The Postgres DDL is derived from the SQLite one so a column cannot be added
+    to one and forgotten in the other. These check the derivation actually did
+    its job — the first version matched fixed-width column prefixes and let a
+    whole table through unquoted, which failed only on a real server.
+    """
+
+    BARE_USER = __import__("re").compile(r'(?<!")\buser\b(?!")')
+
+    def _strip_comments(self, sql: str) -> str:
+        return "\n".join(
+            line for line in sql.splitlines() if not line.strip().startswith("--")
+        )
+
+    def test_postgres_quotes_every_user(self):
+        from pdm_memory.storage.fields import SCHEMA_FIELDS_POSTGRES
+
+        leaked = self.BARE_USER.findall(self._strip_comments(SCHEMA_FIELDS_POSTGRES))
+        assert not leaked, f"{len(leaked)} unquoted `user` would fail on the server"
+
+    def test_sqlite_leaves_it_bare(self):
+        from pdm_memory.storage.fields import SCHEMA_FIELDS_SQLITE
+
+        assert self.BARE_USER.search(self._strip_comments(SCHEMA_FIELDS_SQLITE))
+
+    def test_both_declare_the_same_tables_and_indexes(self):
+        import re
+
+        from pdm_memory.storage.fields import (
+            SCHEMA_FIELDS_POSTGRES,
+            SCHEMA_FIELDS_SQLITE,
+        )
+
+        for pattern in (
+            r"CREATE TABLE IF NOT EXISTS (\w+)",
+            r"INDEX IF NOT EXISTS (\w+)",
+        ):
+            assert set(re.findall(pattern, SCHEMA_FIELDS_SQLITE)) == set(
+                re.findall(pattern, SCHEMA_FIELDS_POSTGRES)
+            )
+
+    def test_every_table_has_the_same_column_count(self):
+        import re
+
+        from pdm_memory.storage.fields import (
+            SCHEMA_FIELDS_POSTGRES,
+            SCHEMA_FIELDS_SQLITE,
+        )
+
+        def columns(ddl: str) -> dict[str, int]:
+            out = {}
+            for name, body in re.findall(
+                r"CREATE TABLE IF NOT EXISTS (\w+) \((.*?)\n\);", ddl, re.S
+            ):
+                out[name] = len(
+                    [
+                        line
+                        for line in body.splitlines()
+                        if line.strip() and not line.strip().startswith("--")
+                    ]
+                )
+            return out
+
+        assert columns(SCHEMA_FIELDS_SQLITE) == columns(SCHEMA_FIELDS_POSTGRES)

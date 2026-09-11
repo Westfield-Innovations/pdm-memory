@@ -9,17 +9,26 @@ coupling, the same order. What changes is which records reach it.
 Two rules decide that, and both are evaluated at the instant the question is
 about rather than at the instant it is asked:
 
-* a fact about an entity in the field is in scope;
-* a fact about an entity a live link reaches from the field is in scope;
-* a fact about an entity filed nowhere is in scope;
+* a fact filed in the field is in scope;
+* a fact filed somewhere else is not;
+* a fact filed nowhere falls back to its subject: in scope if the subject is
+  in the field, if a live link reaches them, or if they are filed nowhere
+  either.
 
-everything else about a known entity is out. The third rule is Companion's,
-mirrored deliberately: "filed nowhere" means no membership in force, not no
-membership row ever, so an entity that left its only field becomes unfiled
-rather than invisible everywhere but there. A fact about nobody at all stays
-in for the same reason — it is not in another field, it is in none, and hiding
-the bulk of a store behind a feature nobody switched on reads as data loss
-rather than isolation.
+The first two are Companion's ``field_scoped_q``, which scopes on the fact's
+own membership rather than its subject's — a fact is filed where it was said,
+and something said about a colleague in a work chat belongs to Work even
+though the colleague also belongs to Personal.
+
+"Filed nowhere" means no membership in force, not no membership row ever.
+Their docstring records getting that wrong first: a fact that once held a
+field and later left it still has rows, so an emptiness test hides it, and it
+disappears from every field except the one it no longer belongs to.
+
+The third rule is this SDK's, and it is what carries the ticket's "unless an
+active relationship or joint membership exists". It also keeps a store that
+has never filed anything working: without it, switching on a field would empty
+every query.
 
 Filtering happens before ranking, not after. Trimming to ``k`` and then
 discarding what does not belong returns fewer than the caller asked for and
@@ -120,35 +129,43 @@ class FieldScopedRetrievalEngine(RetrievalEngine):
                 "`field` argument to rank without scoping."
             )
 
-        visible = self._storage.entities_visible_in(
+        # Companion scopes on the fact's own membership, so this does too.
+        # A fact is filed where it was said, which is not always where its
+        # subject belongs: something said about a colleague in a work chat sits
+        # in Work while the colleague also sits in Personal. Filtering on the
+        # subject instead answered the same question differently on the two
+        # sides, with nothing raising anywhere.
+        filed_here, unfiled = self._storage.partition_signatures_by_field(
+            [r.id for r in records], field, at, user=user
+        )
+
+        # The subject is the second layer, not the first: it is what carries
+        # the ticket's "unless an active relationship or joint membership
+        # exists", which the server's scope filter leaves to its own gate.
+        visible_entities = self._storage.entities_visible_in(
             field, at, follow_links=follow_links, user=user
         )
-        # SignatureRecord is frozen and carries no entity column, so the link
-        # is asked of the store — once for the whole candidate set.
         subjects = self._storage.entity_ids_for_signatures(
             [r.id for r in records], user=user
         )
-
-        # Companion's rule, mirrored: in the field, or filed nowhere. "Filed
-        # nowhere" is no membership in force, not no membership row ever — an
-        # entity that left its only field becomes unfiled rather than
-        # disappearing from every field except the one it used to be in, which
-        # is the failure their own docstring records hitting first.
-        unfiled = self._storage.entities_with_no_live_membership(
+        unfiled_entities = self._storage.entities_with_no_live_membership(
             sorted(set(subjects.values())), at, user=user
         )
 
         kept: list[SignatureRecord] = []
         excluded = 0
         for record in records:
-            entity = subjects.get(record.id)
-            if entity is None or entity in unfiled:
-                # About nobody, or about someone in no field at all. Neither is
-                # another field's to withhold, and dropping them would empty
-                # most of a store the first time anyone scoped a query.
+            if record.id in filed_here:
                 kept.append(record)
                 continue
-            if entity in visible:
+            if record.id not in unfiled:
+                # Filed somewhere, and not here. This field's to withhold.
+                excluded += 1
+                continue
+
+            # The fact itself is filed nowhere, so its subject decides.
+            entity = subjects.get(record.id)
+            if entity is None or entity in unfiled_entities or entity in visible_entities:
                 kept.append(record)
             else:
                 excluded += 1

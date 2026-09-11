@@ -190,6 +190,15 @@ class EventLog:
             if not claimed:
                 reused += 1
 
+            # File the fact where it was said. The caller already named the
+            # field for the mention; leaving the signature unfiled would mean
+            # scoped recall fell back to the subject every time, which is the
+            # weaker rule and not the one Companion uses.
+            if field_id:
+                self._storage.file_signature_in_field(
+                    memory_id, field_id, user=self._user
+                )
+
         return {
             "source_event_id": event_id,
             "signature_ids": signature_ids,
@@ -351,6 +360,49 @@ class EventLog:
         """Close a relationship."""
         self._require_fields()
         self._storage.end_relationship(relationship_id, at, user=self._user)
+
+    def file_fact(
+        self,
+        signature_id: str,
+        field_id: str,
+        valid_from: datetime | str | None = None,
+        valid_to: datetime | str | None = None,
+        *,
+        weight: float = 1.0,
+        confidence: float = 1.0,
+        derived_by: str = "sdk",
+    ) -> str:
+        """
+        File a fact in a field for a window of time.
+
+        ``ingest`` does this for what it writes; this is for facts saved any
+        other way, and for filing an existing fact somewhere additional.
+        """
+        self._require_fields()
+        return self._storage.file_signature_in_field(
+            signature_id,
+            field_id,
+            valid_from,
+            valid_to,
+            weight=weight,
+            confidence=confidence,
+            derived_by=derived_by,
+            user=self._user,
+        )
+
+    def unfile_fact(
+        self, membership_id: str, at: datetime | str | None = None
+    ) -> None:
+        """Close a fact's membership in a field."""
+        self._require_fields()
+        self._storage.unfile_signature(membership_id, at, user=self._user)
+
+    def fact_fields(
+        self, signature_id: str, at: datetime | str | None = None
+    ) -> list[str]:
+        """Which fields a fact was filed in at *at*."""
+        self._require_fields()
+        return self._storage.signature_fields(signature_id, at, user=self._user)
 
     def fields_of(self, entity_id: str, at: datetime | str | None = None) -> list[str]:
         """Which fields an entity was in at *at*. Several is normal."""

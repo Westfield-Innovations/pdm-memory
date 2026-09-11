@@ -23,6 +23,7 @@ from pdm_memory.storage.event_hash import normalize_instant
 from pdm_memory.storage.events import utc_now
 from pdm_memory.storage.fields import (
     LIVE_STATES,
+    SignatureFieldMembershipRecord,
     FieldMembershipRecord,
     RelationshipRecord,
     membership_from_row,
@@ -30,6 +31,8 @@ from pdm_memory.storage.fields import (
     normalize_field_id,
     relationship_from_row,
     relationship_insert_row,
+    signature_membership_from_row,
+    signature_membership_insert_row,
     validate_interval,
 )
 
@@ -124,6 +127,182 @@ class FieldStore:
             if standing is not None:
                 return standing["id"]
         return record.id
+
+    def file_signature_in_field(
+        self,
+        signature_id: str,
+        field_id: str,
+        valid_from: datetime | str | None = None,
+        valid_to: datetime | str | None = None,
+        *,
+        weight: float = 1.0,
+        confidence: float = 1.0,
+        derived_by: str = "sdk",
+        user: str = "default",
+    ) -> str:
+        """
+        File a fact in a field for a window of time.
+
+        A fact is filed where it was said, which is not always where its
+        subject belongs: something said about a colleague in a work chat sits
+        in Work even though the colleague also sits in Personal. Companion
+        scopes queries on this table rather than on the subject's memberships,
+        so the SDK does too — filtering on a different basis would answer the
+        same question differently on the two sides.
+        """
+        start, end = validate_interval(valid_from, valid_to)
+        record = SignatureFieldMembershipRecord(
+            user=user,
+            signature_id=signature_id,
+            field_id=normalize_field_id(field_id),
+            weight=weight,
+            confidence=confidence,
+            derived_by=derived_by,
+        )
+        record.valid_from = start
+        record.valid_to = end
+
+        self._write(
+            """
+            INSERT INTO pdm_signature_field_memberships (
+                id, {user}, signature_id, field_id, weight, confidence,
+                valid_from, valid_to, derived_by, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT DO NOTHING
+            """,
+            signature_membership_insert_row(record),
+        )
+        self._commit_if_idle(self._conn())
+
+        if end is None:
+            standing = self._run(
+                "SELECT id FROM pdm_signature_field_memberships "
+                "WHERE {user} = ? AND signature_id = ? AND field_id = ? "
+                "AND valid_to IS NULL LIMIT 1",
+                (user, signature_id, record.field_id),
+            ).fetchone()
+            if standing is not None:
+                return standing["id"]
+        return record.id
+
+    def unfile_signature(
+        self,
+        membership_id: str,
+        at: datetime | str | None = None,
+        *,
+        user: str = "default",
+    ) -> None:
+        """Close a fact's membership. The row keeps saying it once held."""
+        row = self._run(
+            "SELECT * FROM pdm_signature_field_memberships "
+            "WHERE id = ? AND {user} = ? LIMIT 1",
+            (membership_id, user),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"signature membership {membership_id!r} not found")
+        if row["valid_to"] is not None:
+            raise ValueError(
+                f"signature membership {membership_id!r} already ended at "
+                f"{row['valid_to']}"
+            )
+        closing = self._instant(at)
+        if closing <= row["valid_from"]:
+            raise ValueError(
+                f"cannot end a membership at {closing}, before it began "
+                f"({row['valid_from']})"
+            )
+        self._write(
+            "UPDATE pdm_signature_field_memberships SET valid_to = ? "
+            "WHERE id = ? AND {user} = ? AND valid_to IS NULL",
+            (closing, membership_id, user),
+        )
+        self._commit_if_idle(self._conn())
+
+    def signature_fields(
+        self,
+        signature_id: str,
+        at: datetime | str | None = None,
+        *,
+        user: str = "default",
+    ) -> list[str]:
+        """Which fields a fact was filed in at *at*."""
+        moment = self._instant(at)
+        rows = self._run(
+            "SELECT DISTINCT field_id FROM pdm_signature_field_memberships "
+            "WHERE {user} = ? AND signature_id = ? "
+            "AND valid_from <= ? AND (valid_to IS NULL OR valid_to >= ?) "
+            "ORDER BY field_id",
+            (user, signature_id, moment, moment),
+        ).fetchall()
+        return [row["field_id"] for row in rows]
+
+    def signature_memberships_of(
+        self,
+        signature_id: str,
+        *,
+        include_ended: bool = True,
+        user: str = "default",
+    ) -> list[SignatureFieldMembershipRecord]:
+        """
+        Every filing row for a fact — where it has been, not only where it is.
+
+        The counterpart of ``memberships_of`` for entities, and the reason the
+        rows are closed rather than deleted: "this fact used to sit in Project
+        Orion" stays answerable after it stops sitting there.
+        """
+        query = (
+            "SELECT * FROM pdm_signature_field_memberships "
+            "WHERE {user} = ? AND signature_id = ?"
+        )
+        if not include_ended:
+            query += " AND valid_to IS NULL"
+        rows = self._run(
+            query + " ORDER BY valid_from DESC, id", (user, signature_id)
+        ).fetchall()
+        return [signature_membership_from_row(row) for row in rows]
+
+    def partition_signatures_by_field(
+        self,
+        signature_ids: list[str],
+        field_id: str,
+        at: datetime | str | None = None,
+        *,
+        user: str = "default",
+    ) -> tuple[set[str], set[str]]:
+        """
+        Split these facts into (filed here, filed nowhere) at *at*.
+
+        Companion's rule, in two sets rather than a correlated subquery:
+        ``Exists(live_in_field) | ~Exists(has_any_live_membership)``. Anything
+        in neither set is filed somewhere else and is that field's to withhold.
+
+        "Filed nowhere" is no membership in force, not no membership row ever.
+        Their docstring records getting that wrong first: a fact that once held
+        a field and left it still has rows, so an emptiness test hides it — and
+        it vanishes from every field except the one it no longer belongs to.
+        """
+        if not signature_ids:
+            return set(), set()
+
+        moment = self._instant(at)
+        here: set[str] = set()
+        filed_anywhere: set[str] = set()
+        chunk = 500
+        for start in range(0, len(signature_ids), chunk):
+            batch = signature_ids[start : start + chunk]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._run(
+                f"SELECT signature_id, field_id FROM pdm_signature_field_memberships "
+                f"WHERE {{user}} = ? AND signature_id IN ({placeholders}) "
+                f"AND valid_from <= ? AND (valid_to IS NULL OR valid_to >= ?)",
+                (user, *batch, moment, moment),
+            ).fetchall()
+            for row in rows:
+                filed_anywhere.add(row["signature_id"])
+                if row["field_id"] == normalize_field_id(field_id):
+                    here.add(row["signature_id"])
+
+        return here, set(signature_ids) - filed_anywhere
 
     def end_field_membership(
         self,
