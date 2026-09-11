@@ -37,6 +37,10 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["FieldStore"]
 
+# Inclusive at the closing instant, matching Companion's
+# ``valid_to__gte=at_time``. An exclusive end would put the boundary moment in
+# one field on the client and another on the server — a disagreement nobody
+# would think to look for.
 _LIVE = ", ".join(f"'{s}'" for s in sorted(LIVE_STATES))
 
 
@@ -274,7 +278,7 @@ class FieldStore:
         rows = self._run(
             f"SELECT DISTINCT field_id FROM pdm_field_memberships "
             f"WHERE {{user}} = ? AND entity_id = ? AND state IN ({_LIVE}) "
-            f"AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?) "
+            f"AND valid_from <= ? AND (valid_to IS NULL OR valid_to >= ?) "
             f"ORDER BY field_id",
             (user, entity_id, moment, moment),
         ).fetchall()
@@ -292,7 +296,7 @@ class FieldStore:
         rows = self._run(
             f"SELECT DISTINCT entity_id FROM pdm_field_memberships "
             f"WHERE {{user}} = ? AND field_id = ? AND state IN ({_LIVE}) "
-            f"AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?) "
+            f"AND valid_from <= ? AND (valid_to IS NULL OR valid_to >= ?) "
             f"ORDER BY entity_id",
             (user, normalize_field_id(field_id), moment, moment),
         ).fetchall()
@@ -333,7 +337,7 @@ class FieldStore:
         moment = self._instant(at)
         window = (
             f"state IN ({_LIVE}) AND valid_from <= ? "
-            f"AND (valid_to IS NULL OR valid_to > ?)"
+            f"AND (valid_to IS NULL OR valid_to >= ?)"
         )
         type_clause = " AND relationship_type = ?" if relationship_type else ""
 
@@ -411,6 +415,43 @@ class FieldStore:
             for row in rows:
                 found[row["id"]] = row["primary_entity_id"]
         return found
+
+    def entities_with_no_live_membership(
+        self,
+        entity_ids: list[str],
+        at: datetime | str | None = None,
+        *,
+        user: str = "default",
+    ) -> set[str]:
+        """
+        Of these entities, the ones filed nowhere at *at*.
+
+        "Nowhere" means no membership in force, not no membership row ever.
+        Companion's scope filter records getting this wrong first: testing
+        whether the relation is empty hides an entity that once belonged to a
+        field and later left it, because it still has rows. It would then
+        vanish from every field except the one it used to be in — the failure
+        the clause exists to prevent, reached through history instead of
+        absence.
+        """
+        if not entity_ids:
+            return set()
+
+        moment = self._instant(at)
+        filed: set[str] = set()
+        chunk = 500
+        for start in range(0, len(entity_ids), chunk):
+            batch = entity_ids[start : start + chunk]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._run(
+                f"SELECT DISTINCT entity_id FROM pdm_field_memberships "
+                f"WHERE {{user}} = ? AND entity_id IN ({placeholders}) "
+                f"AND state IN ({_LIVE}) "
+                f"AND valid_from <= ? AND (valid_to IS NULL OR valid_to >= ?)",
+                (user, *batch, moment, moment),
+            ).fetchall()
+            filed |= {row["entity_id"] for row in rows}
+        return set(entity_ids) - filed
 
     def entities_visible_in(
         self,

@@ -11,10 +11,14 @@ about rather than at the instant it is asked:
 
 * a fact about an entity in the field is in scope;
 * a fact about an entity a live link reaches from the field is in scope;
+* a fact about an entity filed nowhere is in scope;
 
-everything else about a known entity is out. A fact that is about nobody stays
-in, because it is not in another field — it is in none, and hiding the bulk of
-a store's memories behind a feature nobody switched on would read as data loss
+everything else about a known entity is out. The third rule is Companion's,
+mirrored deliberately: "filed nowhere" means no membership in force, not no
+membership row ever, so an entity that left its only field becomes unfiled
+rather than invisible everywhere but there. A fact about nobody at all stays
+in for the same reason — it is not in another field, it is in none, and hiding
+the bulk of a store behind a feature nobody switched on reads as data loss
 rather than isolation.
 
 Filtering happens before ranking, not after. Trimming to ``k`` and then
@@ -125,14 +129,23 @@ class FieldScopedRetrievalEngine(RetrievalEngine):
             [r.id for r in records], user=user
         )
 
+        # Companion's rule, mirrored: in the field, or filed nowhere. "Filed
+        # nowhere" is no membership in force, not no membership row ever — an
+        # entity that left its only field becomes unfiled rather than
+        # disappearing from every field except the one it used to be in, which
+        # is the failure their own docstring records hitting first.
+        unfiled = self._storage.entities_with_no_live_membership(
+            sorted(set(subjects.values())), at, user=user
+        )
+
         kept: list[SignatureRecord] = []
         excluded = 0
         for record in records:
             entity = subjects.get(record.id)
-            if entity is None:
-                # About nobody in particular, so in no field, so not another
-                # field's to leak. Keeping it is what stops a store's existing
-                # memories vanishing the first time someone scopes a query.
+            if entity is None or entity in unfiled:
+                # About nobody, or about someone in no field at all. Neither is
+                # another field's to withhold, and dropping them would empty
+                # most of a store the first time anyone scoped a query.
                 kept.append(record)
                 continue
             if entity in visible:

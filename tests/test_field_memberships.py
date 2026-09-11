@@ -268,3 +268,102 @@ class TestAC3BoundaryValidation:
         assert log.fields_of(alex, JUNE) == ["work"], (
             "ending a membership must not erase that it existed"
         )
+
+
+class TestMatchesTheServerSemantics:
+    """
+    The same question asked of the SDK and of Companion has to get the same
+    answer. These pin the three places mine differed from
+    ``pdm/field_resonance/scope.py`` and ``fields.py``, which have been in
+    service on the server side and have already been through the failures
+    their docstrings describe.
+    """
+
+    def test_only_pending_and_denied_are_discounted(self, log):
+        """
+        The server excludes exactly those two, "neither of which ever
+        represented real membership". Everything else — expired, revoked,
+        historical — was true for its window, and the window is what decides
+        whether it is true now.
+        """
+        alex = person(log, "Alex", "work")
+        log._storage.add_field_membership(
+            alex, "work", MARCH, AUGUST, state="revoked", user="default"
+        )
+        assert log.fields_of(alex, JUNE) == ["work"], (
+            "a revoked membership was still real while it lasted"
+        )
+        assert log.fields_of(alex, OCTOBER) == []
+
+    def test_a_pending_membership_is_not_membership(self, log):
+        alex = person(log, "Alex", "work")
+        log._storage.add_field_membership(
+            alex, "work", MARCH, state="pending", user="default"
+        )
+        assert log.fields_of(alex, JUNE) == []
+
+    def test_a_denied_membership_is_not_membership(self, log):
+        alex = person(log, "Alex", "work")
+        log._storage.add_field_membership(
+            alex, "work", MARCH, state="denied", user="default"
+        )
+        assert log.fields_of(alex, JUNE) == []
+
+    def test_the_closing_instant_is_still_inside(self, log):
+        """
+        The server tests ``valid_to >= at_time``. An exclusive end here would
+        put the boundary instant in one field on the client and another on the
+        server — a disagreement nobody would think to look for.
+        """
+        alex = person(log, "Alex", "work")
+        log.add_field_membership(alex, "work", MARCH, AUGUST)
+        assert log.fields_of(alex, AUGUST) == ["work"]
+        assert log.fields_of(alex, AUGUST + timedelta(microseconds=1)) == []
+
+    def test_an_entity_with_no_live_membership_is_visible_everywhere(self, log):
+        """
+        The server's rule is "no LIVE membership anywhere", not "no membership
+        rows ever" — and its docstring records getting this wrong first. An
+        entity that was in Project and left has no live membership, so its
+        facts stop being any one field's to withhold rather than vanishing
+        from every field but the one it used to be in.
+        """
+        alex = log.mention("Alex", field_id="work", signature_id="s1")
+        result = log.ingest(
+            event=log.event(raw_reference="chat:1"),
+            payload="x",
+            facts=[{"text": "Alex reviewed the release",
+                    "tags": ["alex", "meeting", "schedule"], "about": "Alex"}],
+            field_id="work",
+        )
+        entity = result["entity_ids"]["Alex"]
+
+        membership = log.add_field_membership(entity, "project/orion", MARCH)
+        log.end_membership(membership, AUGUST)
+
+        found = [
+            h.text
+            for h in log.recall("alex meeting schedule", k=10, field="work", at=OCTOBER)
+        ]
+        assert "Alex reviewed the release" in found, (
+            "an entity that left its only field disappeared instead of becoming "
+            "unfiled"
+        )
+
+    def test_an_entity_live_elsewhere_is_withheld(self, log):
+        """The other half: a live membership somewhere else does withhold it."""
+        result = log.ingest(
+            event=log.event(raw_reference="chat:2"),
+            payload="y",
+            facts=[{"text": "Lunch with Alex on Sunday",
+                    "tags": ["alex", "meeting", "schedule"], "about": "Alex"}],
+            field_id="family",
+        )
+        entity = result["entity_ids"]["Alex"]
+        log.add_field_membership(entity, "family", MARCH)
+
+        found = [
+            h.text
+            for h in log.recall("alex meeting schedule", k=10, field="work", at=JUNE)
+        ]
+        assert "Lunch with Alex on Sunday" not in found

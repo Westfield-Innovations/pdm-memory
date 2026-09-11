@@ -64,6 +64,7 @@ MEMBERSHIP_STATES: frozenset[str] = frozenset(
         "implicit",     # inferred, not declared
         "structural",   # a standing fact about the field itself; never ends
         "historical",   # kept for the record, not part of the live picture
+        "denied",       # asked for and refused; never was membership
     }
 )
 
@@ -74,11 +75,14 @@ MEMBERSHIP_STATES: frozenset[str] = frozenset(
 # state as well erased the past every time someone closed a window, which is
 # the opposite of what a closed interval is for.
 #
-# What is excluded never was a membership at that instant: "pending" has not
-# begun, "revoked" and "denied" were taken back.
-COUNTED_STATES: frozenset[str] = frozenset(
-    {"active", "implicit", "structural", "expired", "historical"}
-)
+# Excluded are exactly the two Companion's ``_membership_state_filter``
+# excludes: "pending" has not begun and "denied" was refused, and neither ever
+# represented real membership. "revoked" is not among them — it ended
+# deliberately, but it was real until it did, and its ``valid_to`` already says
+# when. Discounting it by state as well would answer a question about June with
+# September's decision.
+DISCOUNTED_STATES: frozenset[str] = frozenset({"pending", "denied"})
+COUNTED_STATES: frozenset[str] = MEMBERSHIP_STATES - DISCOUNTED_STATES
 
 # Kept under the old name for the store, which reads it as "states a query
 # counts" rather than "states that are current".
