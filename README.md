@@ -59,8 +59,10 @@ from pdm_memory import Memory
 mem = Memory(store="./my_app_memory.db")
 
 # Write: PDM assigns pressure and stores a signature.
-mem.save("User prefers metric units and short answers", source="chat",
-         tags=["units", "formatting", "preferences"], p_magnitude=85)
+# Optional shape: ephemeral (2h) / behavioral (90d) / structural (∞).
+mem.save("User prefers metric units and short answers", source="manual",
+         tags=["units", "formatting", "preferences"], p_magnitude=85,
+         shape="behavioral")
 
 # Read: resonance retrieval — surfaces what's relevant, not just what matches.
 hits = mem.recall("how should I format the answer?", k=5)
@@ -71,11 +73,23 @@ for h in hits:
 # Reinforce a memory manually (recall() does this automatically).
 mem.reinforce(hits[0].id)
 
+# Contrary evidence: lower active pressure/V without rewriting the stored fact.
+result = mem.apply_contrary_evidence(
+    hits[0].id,
+    "User prefers imperial units",
+    evidence_tags=["units", "formatting", "preferences"],
+)
+print(result.p_before, "→", result.p_after)
+
 # Inspect why a memory surfaced.
 report = mem.explain(hits[0].id, query="how should I format the answer?")
 print(report.render())
 
-# Decay runs automatically on each recall(). Manual trigger:
+# Live decay snapshot for one memory (read-only):
+snap = mem.decay_at(hits[0].id)
+print(snap.shape, snap.half_life_days, snap.p_effective)
+
+# Store-wide purge of memories below the live P_effective threshold:
 counts = mem.decay()
 print(f"Decayed: {counts['decayed']}, Deleted: {counts['deleted']}")
 ```
@@ -608,14 +622,17 @@ Use `report.is_safe_to_act` (True only when `status == "ALIGNED"`) before trigge
 
 | Method | Description |
 |--------|-------------|
-| `save(text, source, tags, p_magnitude, t_persistence, drawer, regime, deadline, dedupe=True, idempotency_key=None)` | Store a memory (content dedupe and/or idempotency when storage supports it) |
-| `save_many(items, dedupe=True)` → `dict` | Batch save; returns `{saved, skipped, errors}` |
+| `save(text, source, tags, p_magnitude, t_persistence, drawer, regime, deadline, shape=None, dedupe=True, idempotency_key=None)` | Store a memory; optional `shape` (`ephemeral` / `behavioral` / `structural`) sets half-life via `metadata[memory_shape]` |
+| `save_many(items, dedupe=True)` → `dict` | Batch save; returns `{saved, skipped, errors}` (items may include `shape`) |
 | `recall(query, k, min_pressure, search_cost, drawer, reinforce)` → `List[MemoryHit]` | Retrieve top-k relevant memories |
 | `verify_alignment(intent_text, min_pressure, k_goals, torsion_threshold)` → `AlignmentReport` | Same GAA gate against goals already stored in Memory |
 | `detect_torsion(drawer, threshold)` → `List[TorsionReport]` | Find contradicting facts (Reverse Resonance) |
 | `reinforce(memory_id, coupling_score)` | Manually raise a memory's pressure (and V-counters where supported) |
+| `penalize(memory_id, coupling_score)` | Record a wrong prediction: lower P and V |
+| `apply_contrary_evidence(target, evidence, …)` → `ContraryEvidenceResult` | Immediate V-miss + Δp on conflicting evidence; does not rewrite historical fact fields |
 | `delete(memory_id)` → `bool` | Soft-delete when storage supports it |
-| `decay(dry_run)` → `dict` | Trigger decay pass (runs automatically on recall) |
+| `decay_at(signature, now=None)` → `DecaySnapshot` | Live shape-aware decay metrics for one memory (read-only) |
+| `decay(dry_run=False)` → `dict` | Purge signatures whose live `P_effective` is below threshold |
 | `explain(memory_id, query)` → `ExplainReport` | Show why a memory has its current pressure |
 | `list(limit, min_pressure, drawer, cursor_id)` → `MemoryListPage` | Keyset page of memories (storage list API on cloud) |
 | `sync(direction, token, cloud_url)` → `SyncReport` | Sync local ↔ cloud |
@@ -642,11 +659,11 @@ Use `report.is_safe_to_act` (True only when `status == "ALIGNED"`) before trigge
 
 **Pressure** — every memory has a p_magnitude (0–100). Important, frequently-used memories stay strong. Unused ones decay. You control the baseline; the system adjusts dynamically.
 
-**Decay** — computed at recall time based on elapsed days vs. domain-specific half-lives. No scheduler required (Celery-free). Market signals decay in 1 day; core facts persist for a year.
+**Decay** — live `P_effective` uses an exponential half-life at recall/explain time (stored `p_magnitude` is not rewritten on read). Domain half-lives still apply (market signals ~1 day; core facts ~1 year). When a **memory shape** is set (`ephemeral` / `behavioral` / `structural`), it overrides domain: 2 hours / 90 days / ∞. `mem.decay_at(id)` returns a live snapshot; `mem.decay()` purges signatures below the live threshold.
 
 **Retrieval (TAS)** — Threshold-Adjustment Search lowers the pressure threshold based on query uncertainty (search_cost). Then coupling scores rank memories by tag overlap, domain, regime, and pressure proximity. The most resonant memories surface first.
 
-**Validation Coefficient (V)** — Laplace-smoothed accuracy tracker. Memories that prove predictively useful grow stronger; ones that mislead decay faster.
+**Validation Coefficient (V)** — Laplace-smoothed accuracy tracker. Memories that prove predictively useful grow stronger; ones that mislead lose authority. Use `reinforce` / `penalize`, or `apply_contrary_evidence` when new facts conflict with a stored claim.
 
 ---
 

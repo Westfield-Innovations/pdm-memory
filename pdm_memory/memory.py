@@ -11,7 +11,7 @@ Quick start (local mode):
     from pdm_memory import Memory
 
     mem = Memory(store="./my_app.db")
-    mem.save("User prefers metric units", source="chat", tags=["units", "formatting"])
+    mem.save("User prefers metric units", source="manual", tags=["units", "formatting"])
     hits = mem.recall("how should I format the response?", k=5)
 
     for h in hits:
@@ -34,27 +34,34 @@ from __future__ import annotations
 
 import builtins
 import logging
+import math
 import os
 from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from typing_extensions import Self
 
 from pdm_memory.core.alignment import verify_records
 from pdm_memory.core.math import (
     DECAY_DELETE_THRESHOLD,
+    MEMORY_SHAPE_KEY,
+    SHAPE_HALF_LIVES,
     calculate_decay_factor,
     calculate_effective_spike,
     calculate_intent_weight,
     calculate_p_effective,
     calculate_v,
+    half_life_for_signature,
     infer_domain,
-    resolve_half_life,
+    infer_shape,
+    resolve_memory_shape,
 )
 from pdm_memory.core.retrieval import DEFAULT_DIVERSITY_BIAS, RetrievalEngine
 from pdm_memory.core.signature import (
+    ContraryEvidenceResult,
+    DecaySnapshot,
     DrawerInfo,
     ExplainReport,
     MemoryHit,
@@ -211,7 +218,7 @@ class Memory:
     def save(
         self,
         text: str,
-        source: str = "chat",
+        source: str = "manual",
         tags: builtins.list[str] | None = None,
         p_magnitude: float = 50.0,
         t_persistence: float = 30.0,
@@ -222,6 +229,7 @@ class Memory:
         event_at: datetime | None = None,
         metadata: dict[str, Any] | None = None,
         *,
+        shape: str | None = None,
         dedupe: bool = True,
         dedupe_reinforce: bool = False,
         idempotency_key: str | None = None,
@@ -234,7 +242,8 @@ class Memory:
 
         Args:
             text:           The memory content (max 500 chars recommended).
-            source:         Origin label: "chat", "manual", "csv", etc.
+            source:         Origin label: "manual", "azus_chat", "csv", etc.
+                            Use ``azus_chat`` only for Companion chat extract.
             tags:           Intent tags (3+ recommended for best retrieval).
             p_magnitude:    Initial pressure / importance (0–100).
             t_persistence:  Days this memory stays relevant before decaying.
@@ -245,6 +254,9 @@ class Memory:
             event_at:       Optional event datetime (PDM-T ``t_event_at`` — when it
                             happened / will happen; powers "what was yesterday").
             metadata:       Arbitrary extra data attached to the memory.
+            shape:          Memory shape half-life key: ``ephemeral`` / ``behavioral`` /
+                            ``structural``. Stored in ``metadata[memory_shape]``. When
+                            omitted, inferred from tags/text when possible.
             dedupe:         If True, return existing ID when fact hash already stored.
             dedupe_reinforce: When dedupe hits, call reinforce() on the existing memory.
             idempotency_key:  If set, repeated saves with the same key return the existing ID.
@@ -287,6 +299,7 @@ class Memory:
             deadline=deadline,
             event_at=event_at,
             metadata=metadata,
+            shape=shape,
             idempotency_key=idempotency_key,
         )
         sig = self._run_pre_save_hooks(sig)
@@ -307,7 +320,7 @@ class Memory:
 
         Each item accepts the same keys as :meth:`save` (``text``, ``tags``,
         ``p_magnitude``, ``drawer``, ``source``, ``regime``, ``t_persistence``,
-        ``metadata``, ``deadline``, ``event_at``).
+        ``metadata``, ``shape``, ``deadline``, ``event_at``).
 
         Returns:
             Dict with ``saved``, ``skipped``, ``errors`` counts.
@@ -392,6 +405,7 @@ class Memory:
                         deadline=item.get("deadline") or item.get("t_deadline"),
                         event_at=item.get("event_at") or item.get("t_event_at"),
                         metadata=item.get("metadata"),
+                        shape=item.get("shape"),
                         phase_privilege=float(item.get("phase_privilege", 1.0)),
                         idempotency_key=idempotency_key or None,
                     )
@@ -509,6 +523,7 @@ class Memory:
         regime: str | None = None,
         source: str | None = None,
         metadata: dict[str, Any] | None = None,
+        shape: str | None = None,
         deadline: datetime | None = None,
         event_at: datetime | None = None,
     ) -> MemoryHit:
@@ -525,6 +540,7 @@ class Memory:
             regime:      New question regime.
             source:      New source label.
             metadata:    Shallow-merged into existing metadata dict.
+            shape:       Set ``metadata[memory_shape]`` (ephemeral / behavioral / structural).
             deadline:    New ``t_deadline`` (pass to clear with care — use storage).
             event_at:    New ``t_event_at`` event timestamp.
 
@@ -548,6 +564,7 @@ class Memory:
             regime=regime,
             source=source,
             metadata=metadata,
+            shape=shape,
             deadline=deadline,
             event_at=event_at,
         )
@@ -871,26 +888,209 @@ class Memory:
         if rec is None:
             logger.warning("[PDM] penalize(%s): not found", memory_id)
             return
+        self._apply_prediction_miss(rec, coupling_score=coupling_score)
+
+    def apply_contrary_evidence(
+        self,
+        target: str | SignatureRecord,
+        evidence: str | SignatureRecord | Mapping[str, Any],
+        *,
+        coupling_score: float = 0.5,
+        persist_evidence: bool = True,
+        evidence_tags: builtins.list[str] | None = None,
+        evidence_shape: str | None = None,
+    ) -> ContraryEvidenceResult:
+        """
+        Immediately lower active pressure on ``target`` when contrary evidence arrives.
+
+        Applies the same V-miss + Δp update as :meth:`penalize` without rewriting
+        the target's ``compressed_fact``, ``created_at``, or
+        ``validation_prediction_correct``. Optionally persists the evidence as a
+        new signature linked via ``metadata["contrary_to"]``.
+
+        Args:
+            target:            Target memory id or loaded ``SignatureRecord``.
+            evidence:          Contrary fact as text, record, or mapping with
+                               ``text`` / ``tags`` / ``shape`` / ``metadata``.
+            coupling_score:    Strength of the miss (0–1), same as ``penalize``.
+            persist_evidence:  If True, ``save`` the evidence as a new signature.
+            evidence_tags:     Tags for the evidence signature (overrides mapping).
+            evidence_shape:    Optional shape for the evidence signature.
+
+        Returns:
+            :class:`ContraryEvidenceResult` with before/after pressure metrics.
+
+        Raises:
+            KeyError: Target memory not found.
+            ValueError: Empty evidence text.
+        """
+        if isinstance(target, SignatureRecord):
+            rec = target
+            target_id = rec.id
+            # Refresh so we operate on stored state
+            stored = self._storage.get(target_id, user=self._user)
+            if stored is None:
+                raise KeyError(
+                    f"Memory '{target_id}' not found for user '{self._user}'."
+                )
+            rec = stored
+        else:
+            target_id = str(target)
+            rec = self._storage.get(target_id, user=self._user)
+            if rec is None:
+                raise KeyError(
+                    f"Memory '{target_id}' not found for user '{self._user}'."
+                )
+
+        fact_before = rec.compressed_fact
+        created_before = rec.created_at
+        correct_before = int(rec.validation_prediction_correct or 0)
+        p_before = float(rec.p_magnitude)
+        v_before = calculate_v(
+            rec.validation_prediction_correct,
+            rec.validation_prediction_total,
+        )
+
+        updated = self._apply_prediction_miss(
+            rec, coupling_score=coupling_score, touch=False
+        )
+        v_after = calculate_v(
+            updated.validation_prediction_correct,
+            updated.validation_prediction_total,
+        )
+        snap = self.decay_at(updated)
+        p_effective_after = snap.p_effective
+
+        evidence_id: str | None = None
+        if persist_evidence:
+            text, tags, meta, shape = self._normalize_contrary_evidence(
+                evidence,
+                evidence_tags=evidence_tags,
+                evidence_shape=evidence_shape,
+            )
+            meta = {**(meta or {}), "contrary_to": target_id}
+            evidence_id = self.save(
+                text,
+                tags=tags,
+                metadata=meta,
+                shape=shape,
+                source="contrary_evidence",
+                dedupe=False,
+            )
+
+        logger.info(
+            "[PDM] apply_contrary_evidence(target=%s) P=%.1f→%.1f V=%.4f→%.4f evidence=%s",
+            target_id[:8],
+            p_before,
+            updated.p_magnitude,
+            v_before,
+            v_after,
+            (evidence_id or "")[:8] or "—",
+        )
+        return ContraryEvidenceResult(
+            target_id=target_id,
+            evidence_id=evidence_id,
+            p_before=p_before,
+            p_after=float(updated.p_magnitude),
+            v_before=v_before,
+            v_after=v_after,
+            p_effective_after=p_effective_after,
+            compressed_fact=fact_before,
+            created_at=created_before,
+            validation_prediction_correct=correct_before,
+        )
+
+    def _apply_prediction_miss(
+        self,
+        rec: SignatureRecord,
+        *,
+        coupling_score: float = 0.5,
+        touch: bool = True,
+    ) -> SignatureRecord:
+        """
+        Record a wrong prediction: Δp down, V total +1, correct unchanged.
+
+        Does not modify ``compressed_fact`` or ``created_at``.
+
+        Args:
+            touch: When True (default, ``penalize``), bump ``last_retrieved``.
+                   When False (``apply_contrary_evidence``), leave the decay
+                   clock alone so live ``P_effective`` does not rebound.
+        """
         delta = self._engine.compute_reinforcement_delta(
             rec.p_magnitude, rec.retrieval_count, coupling_score
         )
         new_p = max(0.0, rec.p_magnitude - delta)
-        new_spike = calculate_effective_spike(new_p, rec.t_persistence, rec.phase_privilege)
+        new_spike = calculate_effective_spike(
+            new_p, rec.t_persistence, rec.phase_privilege
+        )
         new_total = (rec.validation_prediction_total or 0) + 1
-        # correct count stays the same — this was a wrong prediction
-        self._storage.update(
-            memory_id,
-            user=self._user,
-            p_magnitude=new_p,
-            effective_spike=new_spike,
-            retrieval_count=(rec.retrieval_count or 0) + 1,
-            last_retrieved=datetime.now(tz=timezone.utc),
-            validation_prediction_total=new_total,
-        )
+        fields: dict[str, Any] = {
+            "p_magnitude": new_p,
+            "effective_spike": new_spike,
+            "validation_prediction_total": new_total,
+        }
+        if touch:
+            now = datetime.now(tz=timezone.utc)
+            fields["retrieval_count"] = (rec.retrieval_count or 0) + 1
+            fields["last_retrieved"] = now
+        self._storage.update(rec.id, user=self._user, **fields)
         logger.debug(
-            "[PDM] penalize(%s) Δp=-%.2f → P=%.1f  V_total=%d V_correct=%d",
-            memory_id, delta, new_p, new_total, rec.validation_prediction_correct or 0,
+            "[PDM] prediction_miss(%s) Δp=-%.2f → P=%.1f  V_total=%d V_correct=%d touch=%s",
+            rec.id,
+            delta,
+            new_p,
+            new_total,
+            rec.validation_prediction_correct or 0,
+            touch,
         )
+        updated = self._storage.get(rec.id, user=self._user)
+        if updated is None:
+            rec.p_magnitude = new_p
+            rec.effective_spike = new_spike
+            rec.validation_prediction_total = new_total
+            if touch:
+                rec.retrieval_count = (rec.retrieval_count or 0) + 1
+                rec.last_retrieved = fields["last_retrieved"]
+            return rec
+        return updated
+
+    @staticmethod
+    def _normalize_contrary_evidence(
+        evidence: str | SignatureRecord | Mapping[str, Any],
+        *,
+        evidence_tags: builtins.list[str] | None = None,
+        evidence_shape: str | None = None,
+    ) -> tuple[str, builtins.list[str] | None, dict[str, Any] | None, str | None]:
+        """Normalize evidence input → (text, tags, metadata, shape)."""
+        if isinstance(evidence, SignatureRecord):
+            text = evidence.compressed_fact
+            tags = evidence_tags if evidence_tags is not None else list(evidence.intent_tags)
+            meta = dict(evidence.metadata or {})
+            shape = evidence_shape or resolve_memory_shape(
+                evidence.metadata, evidence.intent_tags, evidence.compressed_fact
+            )
+        elif isinstance(evidence, Mapping):
+            text = str(
+                evidence.get("text")
+                or evidence.get("compressed_fact")
+                or ""
+            ).strip()
+            raw_tags = evidence_tags
+            if raw_tags is None:
+                raw_tags = evidence.get("tags") or evidence.get("intent_tags")
+            tags = list(raw_tags) if raw_tags else None
+            meta = dict(evidence.get("metadata") or {})
+            shape = evidence_shape or evidence.get("shape")
+        else:
+            text = str(evidence).strip()
+            tags = evidence_tags
+            meta = {}
+            shape = evidence_shape
+
+        if not text:
+            raise ValueError("Contrary evidence text cannot be empty.")
+        return text[:500], tags, meta, shape
 
     def delete(self, memory_id: str) -> bool:
 
@@ -1155,14 +1355,76 @@ class Memory:
         )
         return report
 
+    def decay_at(
+        self,
+        signature: SignatureRecord | str,
+        now: datetime | None = None,
+    ) -> DecaySnapshot:
+        """
+        Live shape-aware decay metrics for one signature (read-only).
+
+        Does not mutate storage. Uses the same half-life law as ``recall`` /
+        ``explain``. For store-wide purge, use :meth:`decay`.
+        """
+        as_of = now or datetime.now(tz=timezone.utc)
+        if isinstance(signature, SignatureRecord):
+            memory_id = signature.id
+        else:
+            memory_id = str(signature)
+        rec = self._storage.get(memory_id, user=self._user)
+        if rec is None:
+            raise KeyError(
+                f"Memory '{memory_id}' not found for user '{self._user}'."
+            )
+
+        days_since = self._days_since(rec.last_retrieved or rec.created_at, as_of)
+        days_since_created = self._days_since(rec.created_at, as_of)
+        shape = resolve_memory_shape(
+            rec.metadata, rec.intent_tags, rec.compressed_fact
+        )
+        domain = rec.domain or infer_domain(rec.intent_tags)
+        half_life = half_life_for_signature(
+            rec.domain,
+            intent_tags=rec.intent_tags,
+            metadata=rec.metadata,
+            text=rec.compressed_fact,
+        )
+        decay = calculate_decay_factor(
+            days_since,
+            half_life,
+            days_since_created=days_since_created,
+            t_persistence=rec.t_persistence,
+        )
+        v = calculate_v(
+            rec.validation_prediction_correct,
+            rec.validation_prediction_total,
+        )
+        p_eff = calculate_p_effective(
+            rec.p_magnitude, v, decay, intent_weight=1.0, quality=0.80
+        )
+        return DecaySnapshot(
+            memory_id=rec.id,
+            shape=shape,
+            domain=domain,
+            half_life_days=half_life,
+            decay_factor=decay,
+            days_since_retrieved=days_since,
+            days_since_created=days_since_created,
+            p_magnitude=rec.p_magnitude,
+            v_coefficient=v,
+            p_effective=p_eff,
+            as_of=as_of,
+        )
+
     def decay(self, dry_run: bool = False) -> dict[str, int]:
         """
         Purge memories whose live ``P_effective`` is below the delete threshold.
 
-        Uses the SAME half-life law as ``recall()`` / ``explain()``. Does not
-        rewrite ``p_magnitude`` with a separate power-law (that caused double
-        decay). ``decayed`` stays in the return dict for API compat and is
-        always 0.
+        Uses the same half-life law as ``recall()`` / ``explain()``. Does not
+        rewrite ``p_magnitude``. ``decayed`` stays in the return dict for API
+        compat and is always 0.
+
+        For a single-memory live snapshot, use :meth:`decay_at`.
 
         Args:
             dry_run: If True, compute what would be deleted but make no writes.
@@ -1178,8 +1440,12 @@ class Memory:
         for rec in records:
             days_since_touch = self._days_since(rec.last_retrieved or rec.created_at, now)
             days_since_created = self._days_since(rec.created_at, now)
-            domain = rec.domain or infer_domain(rec.intent_tags)
-            half_life = resolve_half_life(domain)
+            half_life = half_life_for_signature(
+                rec.domain,
+                intent_tags=rec.intent_tags,
+                metadata=rec.metadata,
+                text=rec.compressed_fact,
+            )
             decay = calculate_decay_factor(
                 days_since_touch,
                 half_life,
@@ -1220,6 +1486,8 @@ class Memory:
             return 0.0
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
         return max(0.0, (now - dt).total_seconds() / 86400.0)
 
     def _record_to_hit(self, rec: SignatureRecord) -> MemoryHit:
@@ -1227,8 +1495,12 @@ class Memory:
         now = datetime.now(tz=timezone.utc)
         days_since = self._days_since(rec.last_retrieved or rec.created_at, now)
         days_since_created = self._days_since(rec.created_at, now)
-        domain = rec.domain or infer_domain(rec.intent_tags)
-        half_life = resolve_half_life(domain)
+        half_life = half_life_for_signature(
+            rec.domain,
+            intent_tags=rec.intent_tags,
+            metadata=rec.metadata,
+            text=rec.compressed_fact,
+        )
         decay = calculate_decay_factor(
             days_since,
             half_life,
@@ -1316,7 +1588,12 @@ class Memory:
         days_since_created = self._days_since(rec.created_at, now)
 
         domain = rec.domain or infer_domain(rec.intent_tags)
-        half_life = resolve_half_life(domain)
+        half_life = half_life_for_signature(
+            rec.domain,
+            intent_tags=rec.intent_tags,
+            metadata=rec.metadata,
+            text=rec.compressed_fact,
+        )
         decay = calculate_decay_factor(
             days_since,
             half_life,
@@ -1370,6 +1647,9 @@ class Memory:
             pressure_proximity=press_prox,
             intent_tags=rec.intent_tags,
             domain=domain,
+            memory_shape=resolve_memory_shape(
+                rec.metadata, rec.intent_tags, rec.compressed_fact
+            ),
         )
 
     def sync(
@@ -1590,7 +1870,7 @@ class Memory:
         self,
         text: str,
         *,
-        source: str = "chat",
+        source: str = "manual",
         tags: builtins.list[str] | None = None,
         p_magnitude: float = 50.0,
         t_persistence: float = 30.0,
@@ -1600,11 +1880,17 @@ class Memory:
         deadline: datetime | None = None,
         event_at: datetime | None = None,
         metadata: dict[str, Any] | None = None,
+        shape: str | None = None,
         idempotency_key: str | None = None,
     ) -> SignatureRecord:
         resolved_tags = tags or []
         domain = infer_domain(resolved_tags)
-        eff_spike = calculate_effective_spike(p_magnitude, t_persistence, phase_privilege)
+        meta = self._metadata_with_shape(text, resolved_tags, metadata, shape)
+        resolved_shape = resolve_memory_shape(meta, resolved_tags, text)
+        # Shape half-life must not sit behind a longer grace window (e.g. default
+        # t_persistence=30 would block ephemeral 2h decay for a month).
+        resolved_t = self._clamp_persistence_to_shape(t_persistence, resolved_shape)
+        eff_spike = calculate_effective_spike(p_magnitude, resolved_t, phase_privilege)
 
         # Companion parity: a future deadline without event_at still needs an
         # event timestamp for temporal-window recall.
@@ -1617,7 +1903,7 @@ class Memory:
             compressed_fact=text,
             source=source,
             p_magnitude=p_magnitude,
-            t_persistence=t_persistence,
+            t_persistence=resolved_t,
             phase_privilege=phase_privilege,
             effective_spike=eff_spike,
             intent_tags=resolved_tags,
@@ -1627,9 +1913,54 @@ class Memory:
             decay_rate=0.9,
             t_deadline=deadline,
             t_event_at=resolved_event,
-            metadata=metadata or {},
+            metadata=meta,
             idempotency_key=idempotency_key.strip() if idempotency_key else None,
         )
+
+    @staticmethod
+    def _validate_shape(shape: str) -> str:
+        if shape not in SHAPE_HALF_LIVES:
+            allowed = ", ".join(sorted(SHAPE_HALF_LIVES))
+            raise ValueError(f"Unknown memory shape '{shape}'. Expected one of: {allowed}")
+        return shape
+
+    @classmethod
+    def _clamp_persistence_to_shape(
+        cls,
+        t_persistence: float,
+        shape: str | None,
+    ) -> float:
+        """Keep shape half-lives usable despite the default 30-day grace window."""
+        if not shape:
+            return t_persistence
+        half_life = SHAPE_HALF_LIVES.get(shape)
+        if half_life is None or not math.isfinite(half_life):
+            return t_persistence
+        if shape == "ephemeral":
+            # Status-like memories must start decaying immediately; a grace equal
+            # to T½ would push the first half-life out to ~4 hours.
+            return 0.0
+        return min(float(t_persistence), float(half_life))
+
+    @classmethod
+    def _metadata_with_shape(
+        cls,
+        text: str,
+        tags: builtins.list[str],
+        metadata: dict[str, Any] | None,
+        shape: str | None,
+    ) -> dict[str, Any]:
+        """Merge explicit/inferred shape into metadata under ``memory_shape``."""
+        meta = dict(metadata or {})
+        if shape is not None:
+            meta[MEMORY_SHAPE_KEY] = cls._validate_shape(shape)
+        elif MEMORY_SHAPE_KEY not in meta:
+            inferred = infer_shape(tags, text)
+            if inferred is not None:
+                meta[MEMORY_SHAPE_KEY] = inferred
+        elif meta.get(MEMORY_SHAPE_KEY) is not None:
+            cls._validate_shape(str(meta[MEMORY_SHAPE_KEY]))
+        return meta
 
     def _build_update_fields(
         self,
@@ -1643,6 +1974,7 @@ class Memory:
         regime: str | None = None,
         source: str | None = None,
         metadata: dict[str, Any] | None = None,
+        shape: str | None = None,
         deadline: datetime | None = None,
         event_at: datetime | None = None,
         extra_fields: dict[str, Any] | None = None,
@@ -1673,8 +2005,22 @@ class Memory:
             fields["question_regime"] = regime
         if source is not None:
             fields["source"] = source
-        if metadata is not None:
-            fields["metadata"] = {**(rec.metadata or {}), **metadata}
+        if metadata is not None or shape is not None:
+            merged = {**(rec.metadata or {}), **(metadata or {})}
+            if shape is not None:
+                merged[MEMORY_SHAPE_KEY] = self._validate_shape(shape)
+            elif MEMORY_SHAPE_KEY in merged and merged[MEMORY_SHAPE_KEY] is not None:
+                self._validate_shape(str(merged[MEMORY_SHAPE_KEY]))
+            fields["metadata"] = merged
+            resolved_shape = resolve_memory_shape(
+                merged,
+                tags if tags is not None else rec.intent_tags,
+                text if text is not None else rec.compressed_fact,
+            )
+            current_t = fields.get("t_persistence", rec.t_persistence)
+            clamped_t = self._clamp_persistence_to_shape(current_t, resolved_shape)
+            if clamped_t != current_t:
+                fields["t_persistence"] = clamped_t
         if deadline is not None:
             fields["t_deadline"] = deadline
         if event_at is not None:
@@ -1722,6 +2068,7 @@ class Memory:
 
         source = fields.pop("source", None) if "source" in fields else None
         metadata = fields.pop("metadata", None) if "metadata" in fields else None
+        shape = fields.pop("shape", None) if "shape" in fields else None
 
         return self._build_update_fields(
             rec,
@@ -1733,6 +2080,7 @@ class Memory:
             regime=regime,
             source=source,
             metadata=metadata,
+            shape=shape,
             deadline=deadline,
             event_at=event_at,
             extra_fields=fields,

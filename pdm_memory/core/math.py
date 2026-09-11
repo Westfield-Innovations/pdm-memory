@@ -16,6 +16,7 @@ Formula reference (ONE canonical decay law):
 
   Grace: if days_since_created ≤ t_persistence → decay_factor = 0.
   Surviving fraction = (1 - decay_factor) = exp(-λ × t).
+  Half-life clock: memory_shape overrides domain when set; structural shape → T½ = ∞.
 
   Legacy power-law (p × decay_rate^days) is REMOVED — it double-penalized recall.
 """
@@ -24,6 +25,7 @@ from __future__ import annotations
 
 import math
 import warnings
+from typing import Any, Mapping
 
 # ---------------------------------------------------------------------------
 # Domain half-lives (ported from kernel.py DOMAIN_HALF_LIVES)
@@ -41,6 +43,18 @@ DOMAIN_HALF_LIVES: dict[str, float] = {
 
 DEFAULT_HALF_LIFE: float = 30.0
 
+# ---------------------------------------------------------------------------
+# Memory-shape half-lives (orthogonal to domain; shape wins when present)
+# ---------------------------------------------------------------------------
+
+MEMORY_SHAPE_KEY: str = "memory_shape"
+
+SHAPE_HALF_LIVES: dict[str, float] = {
+    "ephemeral": 2.0 / 24.0,  # 2 hours
+    "behavioral": 90.0,       # 90 days
+    "structural": math.inf,   # zero decay
+}
+
 # Pressure constants
 P_MAX: float = 100.0
 P_FLOOR: float = 0.0
@@ -51,10 +65,6 @@ DECAY_DELETE_THRESHOLD: float = 30.0
 # Kept for SignatureRecord/schema backward-compat only — NOT used by pressure decay.
 DEFAULT_DECAY_RATE: float = 0.9
 
-
-# ---------------------------------------------------------------------------
-# Task 1.3: Core formulas (Django-free)
-# ---------------------------------------------------------------------------
 
 
 def calculate_effective_spike(
@@ -78,8 +88,18 @@ def calculate_effective_spike(
     return min(P_MAX, max(P_FLOOR, raw))
 
 
-def resolve_half_life(domain: str | None) -> float:
-    """Map knowledge domain → half-life days (canonical decay clock)."""
+def resolve_half_life(
+    domain: str | None,
+    shape: str | None = None,
+) -> float:
+    """
+    Resolve the decay half-life in days.
+
+    ``shape`` (ephemeral / behavioral / structural) overrides ``domain`` when
+    recognised. Otherwise falls back to ``DOMAIN_HALF_LIVES`` / default.
+    """
+    if shape and shape in SHAPE_HALF_LIVES:
+        return SHAPE_HALF_LIVES[shape]
     if not domain:
         return DEFAULT_HALF_LIFE
     return DOMAIN_HALF_LIVES.get(domain, DEFAULT_HALF_LIFE)
@@ -100,15 +120,20 @@ def calculate_decay_factor(
     Grace window: if ``days_since_created`` is provided and
     ``days_since_created <= t_persistence``, returns 0.0 (no decay yet).
 
+    Infinite (or non-positive) half-life → 0.0 (no temporal decay).
+    Sub-day half-lives (e.g. ephemeral 2h) are supported as-is.
+
     A decay_factor close to 0 means the memory is fresh (little decay).
     A decay_factor close to 1 means the memory is very stale.
     """
     if days_since_created is not None and days_since_created <= max(0.0, t_persistence):
         return 0.0
 
+    if not math.isfinite(half_life) or half_life <= 0.0:
+        return 0.0
+
     days = max(0.0, float(days_since_retrieved))
-    half_life = max(0.1, half_life)
-    lam = math.log(2) / half_life
+    lam = math.log(2) / float(half_life)
     return 1.0 - math.exp(-lam * days)
 
 
@@ -335,7 +360,7 @@ def calculate_temporal_geometry(
 
 
 # ---------------------------------------------------------------------------
-# Domain / regime inference helpers (ported from kernel.py + TAS engine)
+# Domain / regime / shape inference helpers (ported from kernel.py + TAS engine)
 # ---------------------------------------------------------------------------
 
 
@@ -371,3 +396,90 @@ def infer_regime(tags: list[str]) -> str:
     if any(k in tag_str for k in ["patent", "ip", "monetize", "license"]):
         return "ip_monetize"
     return "neutral"
+
+
+def infer_shape(tags: list[str] | None = None, text: str = "") -> str | None:
+    """
+    Infer memory shape from tags and/or fact text.
+
+    Returns one of ``ephemeral`` / ``behavioral`` / ``structural``, or ``None``
+    when nothing matches (caller then uses domain half-life).
+    """
+    parts = list(tags or [])
+    if text:
+        parts.append(text)
+    if not parts:
+        return None
+    blob = " ".join(parts).lower()
+    if any(
+        k in blob
+        for k in (
+            "busy",
+            "status",
+            "mood",
+            "currently",
+            "right now",
+            "temporary",
+            "ephemeral",
+        )
+    ):
+        return "ephemeral"
+    if any(
+        k in blob
+        for k in (
+            "habit",
+            "usually",
+            "prefers",
+            "tends to",
+            "writes",
+            "behavioral",
+        )
+    ):
+        return "behavioral"
+    if any(
+        k in blob
+        for k in (
+            "born",
+            "lives in",
+            "from ",
+            "named",
+            "identity",
+            "always true",
+            "structural",
+        )
+    ):
+        return "structural"
+    return None
+
+
+def resolve_memory_shape(
+    metadata: Mapping[str, Any] | None = None,
+    tags: list[str] | None = None,
+    text: str = "",
+) -> str | None:
+    """
+    Resolve memory shape: explicit ``metadata[memory_shape]`` wins, else infer.
+
+    Unknown explicit values are ignored so callers fall back to domain half-life.
+    """
+    if metadata:
+        raw = metadata.get(MEMORY_SHAPE_KEY)
+        if isinstance(raw, str) and raw in SHAPE_HALF_LIVES:
+            return raw
+    return infer_shape(tags, text)
+
+
+def half_life_for_signature(
+    domain: str | None = None,
+    *,
+    intent_tags: list[str] | None = None,
+    metadata: Mapping[str, Any] | None = None,
+    text: str = "",
+) -> float:
+    """
+    Half-life days for a stored signature: shape overrides domain when present.
+    """
+    tags = list(intent_tags or [])
+    shape = resolve_memory_shape(metadata, tags, text)
+    domain_key = domain or infer_domain(tags)
+    return resolve_half_life(domain_key, shape=shape)

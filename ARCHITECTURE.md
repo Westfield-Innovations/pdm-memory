@@ -109,6 +109,18 @@ PDM класифікує знання на різні домени, кожен �
 | `structural` | 90.0 днів | Структурні моделі, архітектурні патерни |
 | `core_fact` | 365.0 днів | Загальні фундаментальні правила, факти |
 
+#### Періоди напіврозпаду за формою пам'яті (`memory_shape`):
+
+Ортогональна вісь до `domain`. Якщо в `metadata["memory_shape"]` задано shape, він **перекриває** доменний $T_{1/2}$:
+
+| Shape | $T_{1/2}$ | Приклад |
+| :--- | :--- | :--- |
+| `ephemeral` | 2 години | «user is busy» |
+| `behavioral` | 90 днів | «user writes code in Python» |
+| `structural` | $\infty$ (без згасання) | «user was born in Kyiv» |
+
+API: `mem.save(..., shape="ephemeral")`, live snapshot `mem.decay_at(memory_id)`, contrary evidence `mem.apply_contrary_evidence(target, evidence)`.
+
 ---
 
 ### 3.3. Коефіцієнт валідації (Validation Coefficient)

@@ -440,6 +440,143 @@ class TestMemoryDecay:
         assert after == before
 
 
+class TestShapeAwareScoring:
+    def test_explain_uses_ephemeral_half_life(self, mem):
+        from datetime import datetime, timedelta, timezone
+
+        from pdm_memory.core.math import MEMORY_SHAPE_KEY, SHAPE_HALF_LIVES
+
+        mid = mem.save(
+            "User is busy right now",
+            tags=["status", "calendar"],
+            p_magnitude=80,
+            t_persistence=0,
+            metadata={MEMORY_SHAPE_KEY: "ephemeral"},
+        )
+        past = datetime.now(tz=timezone.utc) - timedelta(
+            days=SHAPE_HALF_LIVES["ephemeral"]
+        )
+        mem._storage.update(mid, user="test_user", last_retrieved=past, created_at=past)
+        report = mem.explain(mid)
+        assert report.half_life_days == pytest.approx(2.0 / 24.0)
+        assert report.decay_factor == pytest.approx(0.5, abs=0.05)
+        assert report.memory_shape == "ephemeral"
+
+    def test_explain_structural_never_decays(self, mem):
+        from datetime import datetime, timedelta, timezone
+
+        from pdm_memory.core.math import MEMORY_SHAPE_KEY
+
+        mid = mem.save(
+            "User was born in Kyiv",
+            tags=["identity", "bio"],
+            p_magnitude=80,
+            t_persistence=0,
+            metadata={MEMORY_SHAPE_KEY: "structural"},
+        )
+        past = datetime.now(tz=timezone.utc) - timedelta(days=3650)
+        mem._storage.update(mid, user="test_user", last_retrieved=past, created_at=past)
+        report = mem.explain(mid)
+        assert report.decay_factor == pytest.approx(0.0)
+        assert report.p_effective > 0
+        assert report.memory_shape == "structural"
+
+    def test_ephemeral_fades_faster_than_structural(self, mem):
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(tz=timezone.utc)
+        age = timedelta(hours=4)
+
+        ephemeral_id = mem.save(
+            "User is busy with meetings",
+            tags=["status", "calendar", "availability"],
+            p_magnitude=80,
+            t_persistence=0,
+            shape="ephemeral",
+        )
+        structural_id = mem.save(
+            "User was born in Kyiv",
+            tags=["identity", "bio", "origin"],
+            p_magnitude=80,
+            t_persistence=0,
+            shape="structural",
+        )
+        past = now - age
+        mem._storage.update(
+            ephemeral_id, user="test_user", last_retrieved=past, created_at=past
+        )
+        mem._storage.update(
+            structural_id, user="test_user", last_retrieved=past, created_at=past
+        )
+
+        ephemeral = mem.decay_at(ephemeral_id, now=now)
+        structural = mem.decay_at(structural_id, now=now)
+        assert ephemeral.decay_factor > structural.decay_factor
+        assert structural.decay_factor == pytest.approx(0.0)
+        assert ephemeral.p_effective < structural.p_effective
+
+
+class TestSaveShapeAndDecaySnapshot:
+    def test_save_shape_persists_in_metadata(self, mem):
+        from pdm_memory.core.math import MEMORY_SHAPE_KEY
+
+        mid = mem.save(
+            "User is busy",
+            tags=["calendar"],
+            shape="ephemeral",
+        )
+        rec = mem._storage.get(mid, user="test_user")
+        assert rec.metadata[MEMORY_SHAPE_KEY] == "ephemeral"
+
+    def test_save_infers_shape_from_text(self, mem):
+        from pdm_memory.core.math import MEMORY_SHAPE_KEY
+
+        mid = mem.save("User was born in Kyiv", tags=["bio"])
+        rec = mem._storage.get(mid, user="test_user")
+        assert rec.metadata.get(MEMORY_SHAPE_KEY) == "structural"
+
+    def test_save_rejects_unknown_shape(self, mem):
+        with pytest.raises(ValueError, match="Unknown memory shape"):
+            mem.save("Fact", tags=["a", "b", "c"], shape="not-a-shape")
+
+    def test_update_shape(self, mem):
+        from pdm_memory.core.math import MEMORY_SHAPE_KEY
+
+        mid = mem.save("User likes tea", tags=["prefs", "drink", "habit"])
+        mem.update(mid, shape="behavioral")
+        rec = mem._storage.get(mid, user="test_user")
+        assert rec.metadata[MEMORY_SHAPE_KEY] == "behavioral"
+
+    def test_decay_at_returns_snapshot(self, mem):
+        import math
+        from datetime import datetime, timedelta, timezone
+
+        from pdm_memory.core.signature import DecaySnapshot
+
+        mid = mem.save(
+            "User was born in Kyiv",
+            tags=["bio"],
+            shape="structural",
+            t_persistence=0,
+        )
+        past = datetime.now(tz=timezone.utc) - timedelta(days=1000)
+        mem._storage.update(mid, user="test_user", last_retrieved=past, created_at=past)
+
+        snap = mem.decay_at(mid, now=datetime.now(tz=timezone.utc))
+        assert isinstance(snap, DecaySnapshot)
+        assert snap.memory_id == mid
+        assert snap.shape == "structural"
+        assert math.isinf(snap.half_life_days)
+        assert snap.decay_factor == 0.0
+
+    def test_decay_purge_still_returns_counts(self, mem):
+        mem.save("Keep me", tags=["a", "b", "c"], p_magnitude=80)
+        counts = mem.decay()
+        assert "deleted" in counts
+        assert "skipped" in counts
+        assert "decayed" in counts
+
+
 class TestMemoryExplain:
     def test_explain_returns_report(self, mem):
         mid = mem.save(

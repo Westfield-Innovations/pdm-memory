@@ -15,7 +15,7 @@ The public surface of the SDK:
     from pdm_memory import Memory
 
     mem = Memory(store="./my_app.db")
-    mem.save("User prefers metric units", source="chat")
+    mem.save("User prefers metric units", source="manual")
     hits = mem.recall("how should I format this?", k=5)
 
     from pdm_memory.integrations import wrap_openai, wrap_anthropic
@@ -24,7 +24,13 @@ See README.md for full documentation.
 """
 
 from pdm_memory.core.alignment import verify
-from pdm_memory.core.signature import DrawerInfo, MemoryHit
+from pdm_memory.core.math import MEMORY_SHAPE_KEY, SHAPE_HALF_LIVES
+from pdm_memory.core.signature import (
+    ContraryEvidenceResult,
+    DecaySnapshot,
+    DrawerInfo,
+    MemoryHit,
+)
 from pdm_memory.memory import Memory
 from pdm_memory.models import (
     AlignmentReport,
@@ -37,10 +43,14 @@ from pdm_memory.storage.factory import create_storage, register_storage
 __version__ = "0.2.4"
 __all__ = [
     "AlignmentReport",
+    "ContraryEvidenceResult",
+    "DecaySnapshot",
     "DrawerInfo",
+    "MEMORY_SHAPE_KEY",
     "Memory",
     "MemoryHit",
     "RelationshipChannelResolution",
+    "SHAPE_HALF_LIVES",
     "SurfaceReport",
     "TorsionReport",
     "__version__",

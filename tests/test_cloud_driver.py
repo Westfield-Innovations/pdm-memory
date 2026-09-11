@@ -56,7 +56,7 @@ class TestCloudPayloadRoundTrip:
         assert payload["domain"] == "reminder"
         assert payload["id"] == sig.id
         assert payload["decay_rate"] == 0.05  # clamped from 0.9
-        assert payload["source"] == "azus_chat"  # SDK "chat" mapped for Companion
+        assert payload["source"] == "manual"  # SDK "chat" → Companion manual
         assert payload["metadata"]["_pdm_sdk"]["client_id"] == sig.id
         assert payload["metadata"]["_pdm_sdk"]["decay_rate_sdk"] == 0.9
         assert payload["metadata"]["_pdm_sdk"]["source_sdk"] == "chat"

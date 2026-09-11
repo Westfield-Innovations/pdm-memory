@@ -24,6 +24,7 @@ from datetime import datetime
 from typing import Any
 
 from pdm_memory.auth.jwt_handler import JWTAuth
+from pdm_memory.core.math import MEMORY_SHAPE_KEY
 from pdm_memory.core.signature import DrawerInfo, SignatureRecord
 from pdm_memory.storage.base import BaseStorage, SaveBatchResult, UpdateBatchResult
 from pdm_memory.storage.errors import CloudNotFoundError, CloudStorageError
@@ -48,16 +49,18 @@ _API_INTENT_TAGS_MIN = 3
 _API_SOURCES = frozenset(
     {
         "azus_chat",
+        "companion_app",
         "junior_clipboard",
         "slack",
         "manual",
         "docvault",
         "operator_accumulation",
         "autonomous_web",
-        "companion_app",
+        "resonance_mesh",
+        "contrary_evidence",
     }
 )
-_API_DEFAULT_SOURCE = "azus_chat"
+_API_DEFAULT_SOURCE = "manual"
 # companion_api.pdm.signature_mutations.PATCHABLE_FIELDS — only these may appear
 # in PATCH / batch-update. Client-derived fields not on the allowlist (e.g.
 # effective_spike) are stripped; the API recomputes them server-side.
@@ -80,6 +83,7 @@ _API_PATCHABLE_FIELDS = frozenset(
         "is_complete",
         "validation_prediction_total",
         "validation_prediction_correct",
+        "metadata",
     }
 )
 _API_PATCH_DATETIME_FIELDS = frozenset(
@@ -883,7 +887,8 @@ class CloudDriver(BaseStorage):
         """Map SDK source to a Companion SOURCE_CHOICES value."""
         if source and source in _API_SOURCES:
             return source
-        # SDK legacy default "chat" and any unknown label → azus_chat
+        # SDK legacy "chat" / unknown labels → manual (not azus_chat —
+        # that label is only for real Companion chat provenance).
         return _API_DEFAULT_SOURCE
 
     @classmethod
@@ -913,7 +918,7 @@ class CloudDriver(BaseStorage):
         on our side.
 
         Validates Companion invariants (tags count, p_magnitude range) and
-        maps SDK source labels (e.g. chat) to azus_chat when needed.
+        maps unknown SDK source labels (e.g. chat) to manual when needed.
         """
         cls._validate_ingest_record(sig)
 
@@ -921,7 +926,7 @@ class CloudDriver(BaseStorage):
         if sig.idempotency_key:
             meta["_idempotency_key"] = sig.idempotency_key
         # Preserve SDK-only fields that the public response serializer may omit
-        meta["_pdm_sdk"] = {
+        sdk_bag: dict[str, Any] = {
             "client_id": sig.id,
             "domain": sig.domain,
             "validation_prediction_total": sig.validation_prediction_total,
@@ -934,6 +939,10 @@ class CloudDriver(BaseStorage):
             "t_event_at": cls._iso(sig.t_event_at),
             "source_sdk": sig.source,
         }
+        shape = meta.get(MEMORY_SHAPE_KEY)
+        if isinstance(shape, str) and shape:
+            sdk_bag[MEMORY_SHAPE_KEY] = shape
+        meta["_pdm_sdk"] = sdk_bag
 
         payload = {
             "id": sig.id,
@@ -1013,7 +1022,7 @@ class CloudDriver(BaseStorage):
         kwargs: dict[str, Any] = {
             "user": str(data.get("user", "default")),
             "compressed_fact": data.get("compressed_fact", ""),
-            "source": data.get("source", "chat"),
+            "source": data.get("source", "manual"),
             "p_magnitude": float(data.get("p_magnitude", 50.0)),
             "t_persistence": float(data.get("t_persistence", 30.0)),
             "phase_privilege": float(data.get("phase_privilege", 1.0)),
@@ -1069,4 +1078,12 @@ class CloudDriver(BaseStorage):
         }
         if record_id:
             kwargs["id"] = record_id
+        # Restore shape from SDK bag when top-level metadata was stripped.
+        out_meta = kwargs["metadata"]
+        if (
+            isinstance(out_meta, dict)
+            and MEMORY_SHAPE_KEY not in out_meta
+            and isinstance(sdk_bag.get(MEMORY_SHAPE_KEY), str)
+        ):
+            out_meta[MEMORY_SHAPE_KEY] = sdk_bag[MEMORY_SHAPE_KEY]
         return SignatureRecord(**kwargs)
