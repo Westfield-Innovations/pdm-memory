@@ -641,6 +641,82 @@ class CloudDriver(BaseStorage):
             )
         return RelationshipChannelResolution.from_payload(channel)
 
+    def state_at(
+        self,
+        field_id: str,
+        timestamp: datetime,
+        cursor: str | None = None,
+        limit: int | None = None,
+        envelope: bool = True,
+    ) -> Any:
+        """
+        A field's reconciled state at a past moment.
+
+        GET /api/v1/pdm/field-state/?field_id=&at_time=&cursor=&page_size=
+        """
+        return self._field_state(
+            field_id,
+            at_time=self._iso(timestamp),
+            cursor=cursor,
+            limit=limit,
+            envelope=envelope,
+        )
+
+    def current_state(
+        self,
+        field_id: str,
+        cursor: str | None = None,
+        limit: int | None = None,
+        envelope: bool = True,
+    ) -> Any:
+        """
+        A field's state now, answered from the server's clock.
+
+        GET /api/v1/pdm/field-state/?field_id= — same route, at_time omitted.
+        Sending our own "now" would name a moment the server reads as future
+        whenever this machine's clock runs ahead, and be refused for the skew.
+        """
+        return self._field_state(
+            field_id,
+            at_time=None,
+            cursor=cursor,
+            limit=limit,
+            envelope=envelope,
+        )
+
+    def _field_state(
+        self,
+        field_id: str,
+        at_time: str | None,
+        cursor: str | None,
+        limit: int | None,
+        envelope: bool,
+    ) -> Any:
+        from pdm_memory.models import FieldStateSnapshot
+
+        path = "/api/v1/pdm/field-state/"
+        params: dict[str, Any] = {
+            "field_id": field_id,
+            # Spelled out rather than left to bool serialisation: the server
+            # rejects anything outside its table instead of guessing.
+            "envelope": "true" if envelope else "false",
+        }
+        if at_time is not None:
+            params["at_time"] = at_time
+        if cursor:
+            params["cursor"] = cursor
+        if limit is not None:
+            params["page_size"] = limit
+
+        resp = self._get(path, params=params)
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise CloudStorageError(
+                f"Unexpected field-state body type: {type(data).__name__}",
+                path=path,
+            )
+        return FieldStateSnapshot.from_payload(data)
+
     # ------------------------------------------------------------------
     # HTTP helpers
     # ------------------------------------------------------------------

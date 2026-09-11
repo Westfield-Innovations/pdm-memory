@@ -188,6 +188,99 @@ class RelationshipChannelResolution:
 
 
 @dataclass(slots=True)
+class FieldStateSnapshot:
+    """
+    One bounded field's reconciled state at one moment, for one observer.
+
+    Populated from Companion ``GET /api/v1/pdm/field-state/``, which serves
+    both ``state_at`` and ``current_state``.
+
+    Every item in a tagged section carries its own ``state_type``, and
+    ``from_payload`` refuses a section where one does not — measured history
+    and projected state stay distinguishable per item, never by convention.
+
+    ``envelope_included`` is False when only the entities page was asked for.
+    ``as_dict`` then omits the envelope keys rather than emitting empty lists,
+    mirroring the server: ``[]`` read as "no relationships" would take a
+    page-2 response for a statement about the field.
+    """
+
+    field_id: str
+    at_time: str
+    state_type: str
+    entities: list[dict[str, Any]] = field(default_factory=list)
+    entities_next_cursor: str | None = None
+    envelope_included: bool = True
+    relationships: list[dict[str, Any]] = field(default_factory=list)
+    field_memberships: list[dict[str, Any]] = field(default_factory=list)
+    relationship_bandwidth: list[dict[str, Any]] = field(default_factory=list)
+    projection_branches: list[dict[str, Any]] = field(default_factory=list)
+    provenance: list[dict[str, Any]] = field(default_factory=list)
+    permission_view: dict[str, Any] = field(default_factory=dict)
+    truncated: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "field_id": self.field_id,
+            "at_time": self.at_time,
+            "state_type": self.state_type,
+            "entities": list(self.entities),
+            "entities_next_cursor": self.entities_next_cursor,
+            "envelope_included": self.envelope_included,
+        }
+        if not self.envelope_included:
+            return payload
+
+        payload.update(
+            {
+                "relationships": list(self.relationships),
+                "field_memberships": list(self.field_memberships),
+                "relationship_bandwidth": list(self.relationship_bandwidth),
+                "projection_branches": list(self.projection_branches),
+                "provenance": list(self.provenance),
+                "permission_view": dict(self.permission_view),
+                "truncated": list(self.truncated),
+            }
+        )
+        return payload
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> FieldStateSnapshot:
+        def section(name: str) -> list[dict[str, Any]]:
+            """Tagged section: provenance and permission_view are not items."""
+            rows = [dict(row) for row in payload.get(name) or []]
+            untagged = sum(1 for row in rows if not row.get("state_type"))
+            if untagged:
+                raise ValueError(
+                    f"{name} carries {untagged} item(s) with no state_type. "
+                    "An untagged item cannot be read as measured or projected."
+                )
+            return rows
+
+        return cls(
+            field_id=str(payload.get("field_id", "")),
+            at_time=str(payload.get("at_time", "")),
+            state_type=str(payload.get("state_type", "")),
+            entities=section("entities"),
+            entities_next_cursor=(
+                str(payload["entities_next_cursor"])
+                if payload.get("entities_next_cursor") is not None
+                else None
+            ),
+            # True only when the key is absent, as an older server would leave
+            # it; a server that says False means it.
+            envelope_included=bool(payload.get("envelope_included", True)),
+            relationships=section("relationships"),
+            field_memberships=section("field_memberships"),
+            relationship_bandwidth=section("relationship_bandwidth"),
+            projection_branches=section("projection_branches"),
+            provenance=[dict(row) for row in payload.get("provenance") or []],
+            permission_view=dict(payload.get("permission_view") or {}),
+            truncated=[str(name) for name in payload.get("truncated") or []],
+        )
+
+
+@dataclass(slots=True)
 class SurfaceReport:
     """
     Lite agent-loop snapshot: recall + torsion scan + alignment gate for one query.
