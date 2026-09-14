@@ -227,6 +227,109 @@ class TestAC2AppendOnly:
 
 
 # ---------------------------------------------------------------------------
+# §4.1 — source_actor_ids / owner_entity_id
+# ---------------------------------------------------------------------------
+
+
+class TestSourceActorsAndOwner:
+    def test_defaults_are_empty_not_invented(self, driver):
+        event_id = driver.save_source_event(make_event())
+        stored = driver.get_source_event(event_id)
+        assert stored.source_actor_ids == []
+        assert stored.owner_entity_id == ""
+
+    def test_both_are_stored_and_read_back(self, driver):
+        event_id = driver.save_source_event(
+            make_event(
+                source_actor_ids=["subject:7", "agent:azus"],
+                owner_entity_id="subject:7",
+            )
+        )
+        stored = driver.get_source_event(event_id)
+        assert stored.source_actor_ids == ["subject:7", "agent:azus"]
+        assert stored.owner_entity_id == "subject:7"
+
+    def test_neither_is_inside_the_content_hash(self, driver):
+        with_actor = driver.save_source_event(
+            make_event(source_actor_ids=["subject:7"], owner_entity_id="subject:7")
+        )
+        without_actor = driver.save_source_event(
+            make_event(source_actor_ids=["agent:azus"], owner_entity_id="agent:azus")
+        )
+        # Same (event_type, occurred_at, source_system, raw_reference) as the
+        # first call, differing only in actor/owner — the unique index on
+        # (user, content_hash) collapses them into the one event.
+        assert with_actor == without_actor
+        stored = driver.get_source_event(with_actor)
+        assert stored.source_actor_ids == ["subject:7"]
+
+    def test_raw_connection_cannot_move_the_actor_list(self, driver, db_path):
+        event_id = driver.save_source_event(make_event(source_actor_ids=["subject:7"]))
+
+        raw = sqlite3.connect(db_path)
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            raw.execute(
+                "UPDATE pdm_source_events SET source_actor_ids = ? WHERE id = ?",
+                (json.dumps(["agent:azus"]), event_id),
+            )
+        raw.close()
+
+    def test_raw_connection_cannot_move_the_owner(self, driver, db_path):
+        event_id = driver.save_source_event(make_event(owner_entity_id="subject:7"))
+
+        raw = sqlite3.connect(db_path)
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            raw.execute(
+                "UPDATE pdm_source_events SET owner_entity_id = ? WHERE id = ?",
+                ("subject:9", event_id),
+            )
+        raw.close()
+
+    def test_a_database_that_predates_these_columns_upgrades_cleanly(self, db_path):
+        """
+        A pdm_source_events table written before §4.1 existed has neither
+        column. The ALTER-TABLE-by-hand path (SQLite's ADD COLUMN has no IF
+        NOT EXISTS) must bring it up to date without disturbing what is
+        already there.
+        """
+        raw = sqlite3.connect(db_path)
+        raw.executescript(
+            """
+            CREATE TABLE pdm_source_events (
+                id TEXT PRIMARY KEY,
+                user TEXT NOT NULL DEFAULT 'default',
+                event_type TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                ingested_at TEXT NOT NULL,
+                source_system TEXT NOT NULL DEFAULT 'chat',
+                provenance TEXT NOT NULL DEFAULT '{}',
+                raw_reference TEXT NOT NULL DEFAULT '',
+                content_hash TEXT NOT NULL,
+                capture_authority_state TEXT NOT NULL DEFAULT 'unknown',
+                compliance_state TEXT NOT NULL DEFAULT 'unknown'
+            );
+            """
+        )
+        raw.execute(
+            "INSERT INTO pdm_source_events (id, event_type, occurred_at, "
+            "observed_at, ingested_at, content_hash) VALUES "
+            "('pre-existing', 'chat_message', 'x', 'x', 'x', 'hash')"
+        )
+        raw.commit()
+        raw.close()
+
+        upgraded = EventfulSQLiteDriver(db_path=db_path)
+        old = upgraded.get_source_event("pre-existing")
+        assert old.source_actor_ids == []
+        assert old.owner_entity_id == ""
+
+        new_id = upgraded.save_source_event(make_event(source_actor_ids=["subject:1"]))
+        assert upgraded.get_source_event(new_id).source_actor_ids == ["subject:1"]
+        upgraded.close()
+
+
+# ---------------------------------------------------------------------------
 # AC3 — entity ↔ signature relations, indexed and enforced
 # ---------------------------------------------------------------------------
 

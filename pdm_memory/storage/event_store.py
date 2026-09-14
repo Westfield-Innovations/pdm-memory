@@ -131,8 +131,9 @@ class EventStoreMixin:
             INSERT INTO pdm_source_events (
                 id, {user}, event_type, occurred_at, observed_at, ingested_at,
                 source_system, provenance, raw_reference, content_hash,
-                capture_authority_state, compliance_state
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                capture_authority_state, compliance_state,
+                source_actor_ids, owner_entity_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT DO NOTHING
             """,
             event_insert_row(event),

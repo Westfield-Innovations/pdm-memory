@@ -580,6 +580,8 @@ class TestMappersStayInStepWithTheRecords:
                     raw_reference="gmail:1",
                     capture_authority_state="granted",
                     compliance_state="reviewed",
+                    source_actor_ids=["subject:1"],
+                    owner_entity_id="subject:1",
                 ),
                 payload="hello",
             )

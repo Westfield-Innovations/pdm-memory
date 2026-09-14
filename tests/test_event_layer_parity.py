@@ -173,7 +173,7 @@ class TestDialectParity:
         )
         assert '"user"' in insert
         assert "?" not in insert
-        assert insert.count("%s") == 12
+        assert insert.count("%s") == 14
 
     def test_entity_creation_never_reads_a_row_positionally(self, pg_host):
         """

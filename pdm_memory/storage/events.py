@@ -220,6 +220,13 @@ class SourceEventRecord:
     capture_authority_state: str = "unknown"
     compliance_state: str = "unknown"
 
+    # Who was present ("subject:<id>" / "agent:<name>") and whose event this
+    # is, same identity space. Not part of content_hash — that identifies
+    # what happened, not who saw it — but frozen like everything else here:
+    # a fact about the event, not a later judgment about it.
+    source_actor_ids: list[str] = field(default_factory=list)
+    owner_entity_id: str = ""
+
     # Whether the caller told us when this happened, as opposed to us filling
     # the column in. Not persisted — it only decides what goes into the hash.
     occurred_at_known: bool = field(
@@ -499,7 +506,9 @@ CREATE TABLE IF NOT EXISTS pdm_source_events (
     raw_reference            TEXT NOT NULL DEFAULT '',
     content_hash             TEXT NOT NULL,
     capture_authority_state  TEXT NOT NULL DEFAULT 'unknown',
-    compliance_state         TEXT NOT NULL DEFAULT 'unknown'
+    compliance_state         TEXT NOT NULL DEFAULT 'unknown',
+    source_actor_ids         TEXT NOT NULL DEFAULT '[]',
+    owner_entity_id          TEXT NOT NULL DEFAULT ''
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pdm_events_user_hash
@@ -572,6 +581,13 @@ SIGNATURE_EVENT_COLUMNS: tuple[tuple[str, str], ...] = (
     ("primary_entity_id", "TEXT REFERENCES pdm_entities(id)"),
 )
 
+# Same treatment for a database whose pdm_source_events predates these two
+# columns: the CREATE TABLE above only reaches a fresh install.
+SOURCE_EVENT_ACTOR_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("source_actor_ids", "TEXT NOT NULL DEFAULT '[]'"),
+    ("owner_entity_id", "TEXT NOT NULL DEFAULT ''"),
+)
+
 SIGNATURE_EVENT_INDEXES_SQLITE = """
 CREATE INDEX IF NOT EXISTS idx_pdm_sig_source_event
     ON pdm_signatures (source_event_id);
@@ -600,6 +616,8 @@ _EVENT_FROZEN_COLUMNS = (
     "ingested_at",
     "source_system",
     "content_hash",
+    "source_actor_ids",
+    "owner_entity_id",
 )
 
 _MENTION_FROZEN_COLUMNS = (
@@ -665,6 +683,13 @@ def apply_event_migrations_sqlite(conn: Any) -> None:
         if column not in existing:
             conn.execute(f"ALTER TABLE pdm_signatures ADD COLUMN {column} {decl}")
 
+    existing_events = {
+        row[1] for row in conn.execute("PRAGMA table_info(pdm_source_events)")
+    }
+    for column, decl in SOURCE_EVENT_ACTOR_COLUMNS:
+        if column not in existing_events:
+            conn.execute(f"ALTER TABLE pdm_source_events ADD COLUMN {column} {decl}")
+
     conn.executescript(SIGNATURE_EVENT_INDEXES_SQLITE)
     conn.executescript(TRIGGERS_EVENTS_SQLITE)
     logger.debug("[PDM-Events] Evidence tables ready (sqlite)")
@@ -707,6 +732,8 @@ def event_from_row(row: Any) -> SourceEventRecord:
         content_hash=row["content_hash"],
         capture_authority_state=row["capture_authority_state"],
         compliance_state=row["compliance_state"],
+        source_actor_ids=json.loads(row["source_actor_ids"] or "[]"),
+        owner_entity_id=row["owner_entity_id"] or "",
     )
 
 
@@ -756,6 +783,8 @@ def event_insert_row(event: SourceEventRecord) -> tuple[Any, ...]:
         event.content_hash,
         event.capture_authority_state,
         event.compliance_state,
+        json.dumps(event.source_actor_ids),
+        event.owner_entity_id,
     )
 
 
@@ -814,7 +843,9 @@ CREATE TABLE IF NOT EXISTS pdm_source_events (
     raw_reference            TEXT NOT NULL DEFAULT '',
     content_hash             TEXT NOT NULL,
     capture_authority_state  TEXT NOT NULL DEFAULT 'unknown',
-    compliance_state         TEXT NOT NULL DEFAULT 'unknown'
+    compliance_state         TEXT NOT NULL DEFAULT 'unknown',
+    source_actor_ids         TEXT NOT NULL DEFAULT '[]',
+    owner_entity_id          TEXT NOT NULL DEFAULT ''
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pdm_events_user_hash
@@ -942,6 +973,11 @@ def apply_event_migrations_postgres(conn: Any) -> None:
     for column, decl in SIGNATURE_EVENT_COLUMNS:
         conn.execute(
             f"ALTER TABLE pdm_signatures ADD COLUMN IF NOT EXISTS {column} {decl}"
+        )
+
+    for column, decl in SOURCE_EVENT_ACTOR_COLUMNS:
+        conn.execute(
+            f"ALTER TABLE pdm_source_events ADD COLUMN IF NOT EXISTS {column} {decl}"
         )
 
     for statement in SIGNATURE_EVENT_INDEXES_POSTGRES.split(";"):
