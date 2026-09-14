@@ -211,9 +211,9 @@ def log(tmp_path: pathlib.Path):
 
 
 class TestEventLog:
-    def test_refuses_a_driver_without_events(self, tmp_path):
+    def test_refuses_a_driver_with_neither_events_nor_fields(self, tmp_path):
         mem = Memory(storage=SQLiteDriver(db_path=str(tmp_path / "plain.db")))
-        with pytest.raises(RuntimeError, match="does not carry source events"):
+        with pytest.raises(RuntimeError, match="carries neither source events nor field"):
             EventLog(mem)
         mem.close()
 

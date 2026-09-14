@@ -54,21 +54,34 @@ class EventLog:
     def __init__(self, memory: Any) -> None:
         """
         Args:
-            memory: A ``Memory`` whose storage carries events.
+            memory: A ``Memory`` whose storage carries events, fields, or both.
 
         Raises:
-            RuntimeError: The driver behind *memory* has no evidence layer —
-                said plainly here rather than as an ``AttributeError`` three
-                frames deeper.
+            RuntimeError: The driver behind *memory* carries neither — said
+                plainly here rather than as an ``AttributeError`` three frames
+                deeper.
+
+        A driver may carry one half without the other. ``CloudDriver`` files
+        and links over Companion's field/relationship routes but has no event
+        table of its own — a signature's provenance travels through
+        ``/pdm/ingest``'s own ``source_event`` block, not through this class —
+        so it supports fields and not events. Refusing construction here
+        whenever either half is missing would refuse the half that is present;
+        each event-only and field-only method below asks for its own half
+        instead, through ``_require_events()`` / ``_require_fields()``.
         """
         storage = getattr(memory, "_storage", None)
-        if not storage_supports_events(storage):
+        self._events_supported = storage_supports_events(storage)
+        self._fields_supported = bool(
+            hasattr(storage, "supports_fields") and storage.supports_fields()
+        )
+        if not self._events_supported and not self._fields_supported:
             driver = type(storage).__name__ if storage else "None"
             raise RuntimeError(
-                f"{driver} does not carry source events. Use "
-                "Memory(storage=EventfulSQLiteDriver(db_path=...)), or call "
-                "pdm_memory.storage.eventful_sqlite.enable_events() before "
-                "constructing Memory."
+                f"{driver} carries neither source events nor field "
+                "memberships. Use Memory(storage=EventfulSQLiteDriver(...)) "
+                "for the local evidence layer, or Memory(storage=CloudDriver"
+                "(...)) for fields and links over Companion."
             )
         self._memory = memory
         self._storage = storage
@@ -105,18 +118,23 @@ class EventLog:
 
     def record(self, event: SourceEventRecord, *, payload: str = "") -> str:
         """Store the event, or return the id of the one already storing it."""
+        self._require_events()
         return self._storage.save_source_event(event, payload=payload)
 
     def get(self, event_id: str) -> SourceEventRecord | None:
+        self._require_events()
         return self._storage.get_source_event(event_id)
 
     def find_by_hash(self, content_hash: str) -> SourceEventRecord | None:
+        self._require_events()
         return self._storage.find_event_by_hash(content_hash, user=self._user)
 
     def events(self, limit: int = 100) -> list[SourceEventRecord]:
+        self._require_events()
         return self._storage.list_source_events(user=self._user, limit=limit)
 
     def signatures_for(self, event_id: str) -> list[SignatureRecord]:
+        self._require_events()
         return self._storage.signatures_for_event(event_id, user=self._user)
 
     # ------------------------------------------------------------------
@@ -147,6 +165,7 @@ class EventLog:
         that were already on file under an earlier event — their provenance
         stays with the message that first carried them.
         """
+        self._require_events()
         # No probe before the write. save_source_event is idempotent on the
         # hash and reports on the record whether the store already held the
         # event, so asking first is a round trip spent learning what the write
@@ -227,6 +246,7 @@ class EventLog:
         later — the honest choice when the field is not known yet, since a
         resolution made without one is a guess wearing a provenance label.
         """
+        self._require_events()
         record = EntityMentionRecord(
             user=self._user,
             surface_form=surface_form,
@@ -254,12 +274,14 @@ class EventLog:
         That is what turns the disambiguation prompt into something that pays
         for itself instead of asking again next week.
         """
+        self._require_events()
         self._storage.resolve_mention(
             mention_id, entity_id=entity_id, method="user_confirmed", confidence=1.0
         )
 
     def pending(self, limit: int = 100) -> list[EntityMentionRecord]:
         """Mentions with no identity yet — the queue behind the prompt."""
+        self._require_events()
         return self._storage.unresolved_mentions(user=self._user, limit=limit)
 
     def check_integrity(self) -> "IntegrityReport":
@@ -269,22 +291,27 @@ class EventLog:
         Worth running after anything that wrote to the store outside the SDK —
         a restored backup, a manual fix, a migration from another tool.
         """
+        self._require_events()
         return self._storage.check_integrity(user=self._user)
 
     def entities(self, include_dissolved: bool = False) -> list[EntityRecord]:
+        self._require_events()
         return self._storage.list_entities(
             user=self._user, include_dissolved=include_dissolved
         )
 
     def entity(self, entity_id: str) -> EntityRecord | None:
+        self._require_events()
         return self._storage.get_entity(entity_id)
 
     def about(self, entity_id: str) -> list[SignatureRecord]:
         """Everything the store holds about one identity."""
+        self._require_events()
         return self._storage.signatures_for_entity(entity_id, user=self._user)
 
     def merge(self, keep_id: str, merge_id: str, *, method: str = "user_confirmed") -> None:
         """Two identities turned out to be one person. Reversible; see D6."""
+        self._require_events()
         self._storage.merge_entities(keep_id, merge_id, method=method)
 
     # ------------------------------------------------------------------
@@ -479,8 +506,19 @@ class EventLog:
         )
 
     def _require_fields(self) -> None:
-        if not hasattr(self._storage, "supports_fields"):
+        if not self._fields_supported:
             raise RuntimeError(
                 f"{type(self._storage).__name__} does not carry field "
-                "memberships. Use Memory(storage=EventfulSQLiteDriver(...))."
+                "memberships. Use Memory(storage=EventfulSQLiteDriver(...)) "
+                "or Memory(storage=CloudDriver(...))."
+            )
+
+    def _require_events(self) -> None:
+        if not self._events_supported:
+            raise RuntimeError(
+                f"{type(self._storage).__name__} does not carry source "
+                "events. Use Memory(storage=EventfulSQLiteDriver(...)); "
+                "CloudDriver carries fields and links but no event table of "
+                "its own — a signature's provenance travels through "
+                "/pdm/ingest's source_event block instead."
             )
