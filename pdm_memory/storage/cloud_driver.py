@@ -970,6 +970,41 @@ class CloudDriver(BaseStorage):
                 reachable.add(str(source))
         return reachable
 
+    def extract_signatures(
+        self,
+        event_id: str,
+        text: str | None = None,
+        *,
+        force: bool = False,
+        user: str = "default",
+    ) -> dict[str, Any]:
+        """
+        POST /api/v1/pdm/source-events/<event_id>/extract.
+
+        Not a wrapper around a local method the way the field/link calls
+        above are backed by a local table this driver also carries: this
+        driver has no event table of its own (see ``EventLog.__init__``'s
+        own docstring on why), so there is nothing to check locally before
+        the request. The server holds the event, checks *text* against its
+        own content_hash, and decides ``PAYLOAD_UNAVAILABLE`` /
+        ``PAYLOAD_MISMATCH`` — this call is a direct pass-through to that
+        decision, not a re-implementation of it.
+
+        Returns the server's own ``{"event_id", "signature_ids", "count"}``
+        as a plain dict, not ``list[SignatureRecord]``: this driver has no
+        local Signature rows to read the extracted facts back from, and
+        fetching each returned id individually would turn one call into
+        one-plus-N HTTP round trips for information the response already
+        carries.
+        """
+        payload: dict[str, Any] = {}
+        if text is not None:
+            payload["text"] = text
+        if force:
+            payload["force"] = True
+        resp = self._post(f"/api/v1/pdm/source-events/{event_id}/extract", payload)
+        return resp.json()
+
     def _paginate_field_rows(
         self,
         path: str,

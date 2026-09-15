@@ -85,6 +85,7 @@ class TestEventLogOverCloudDriver:
             lambda: log.entity("e-1"),
             lambda: log.about("e-1"),
             lambda: log.merge("e-1", "e-2"),
+            lambda: log.extract_signatures("e-1", "text"),
         ):
             with pytest.raises(RuntimeError, match="does not carry source events"):
                 call()
@@ -376,3 +377,72 @@ class TestRelated:
         # is exercised directly on the storage method it delegates to.
         result = _driver().related_entities("subject:1", relationship_type="manager")
         assert result == {"subject:2"}
+
+
+class TestExtractSignatures:
+    """
+    CloudDriver.extract_signatures — spec §2.3's cloud half.
+
+    Called directly on the driver, not through EventLog: this driver has no
+    local event table (see TestEventLogOverCloudDriver above), so there is
+    nothing for ``_require_events()`` to allow through. The server decides
+    everything that matters; this is a thin POST and a passed-through body.
+    """
+
+    @patch("httpx.post")
+    def test_posts_to_the_extract_route(self, mock_post):
+        mock_post.return_value = _resp(
+            200,
+            {"event_id": "e-1", "signature_ids": ["s-1"], "count": 1},
+        )
+
+        result = _driver().extract_signatures("e-1")
+
+        assert result == {"event_id": "e-1", "signature_ids": ["s-1"], "count": 1}
+        args, kwargs = mock_post.call_args
+        assert args[0] == "http://localhost:8000/api/v1/pdm/source-events/e-1/extract"
+        assert kwargs["json"] == {}
+
+    @patch("httpx.post")
+    def test_text_and_force_are_forwarded(self, mock_post):
+        mock_post.return_value = _resp(
+            200, {"event_id": "e-1", "signature_ids": [], "count": 0}
+        )
+
+        _driver().extract_signatures("e-1", "the message text", force=True)
+
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"] == {"text": "the message text", "force": True}
+
+    @patch("httpx.post")
+    def test_omitted_text_is_not_sent_as_null(self, mock_post):
+        mock_post.return_value = _resp(
+            200, {"event_id": "e-1", "signature_ids": [], "count": 0}
+        )
+
+        _driver().extract_signatures("e-1")
+
+        _, kwargs = mock_post.call_args
+        assert "text" not in kwargs["json"]
+
+    @patch("httpx.post")
+    def test_an_unknown_event_raises_not_found(self, mock_post):
+        mock_post.return_value = _resp(
+            404, {"error_code": "EVENT_NOT_FOUND", "detail": "no such event"}
+        )
+
+        with pytest.raises(CloudNotFoundError):
+            _driver().extract_signatures("no-such-event")
+
+    @patch("httpx.post")
+    def test_a_payload_mismatch_is_a_cloud_storage_error(self, mock_post):
+        from pdm_memory.storage.errors import CloudStorageError
+
+        mock_post.return_value = _resp(
+            422,
+            {"error_code": "PAYLOAD_MISMATCH", "detail": "not this event's content"},
+        )
+
+        with pytest.raises(CloudStorageError) as exc:
+            _driver().extract_signatures("e-1", "wrong text")
+        assert exc.value.status_code == 422

@@ -35,6 +35,7 @@ from datetime import datetime
 from typing import Any
 
 from pdm_memory.core.signature import SignatureRecord
+from pdm_memory.storage.event_hash import compute_content_hash
 from pdm_memory.storage.events import (
     EntityMentionRecord,
     IntegrityReport,
@@ -45,7 +46,20 @@ from pdm_memory.storage.events import (
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["EventLog"]
+__all__ = ["EventLog", "PayloadMismatch"]
+
+
+class PayloadMismatch(ValueError):
+    """
+    Raised by ``EventLog.extract_signatures`` when ``text`` is not the event.
+
+    The store never held the payload (see ``SourceEventRecord.
+    ensure_content_hash``'s own docstring), so proof that *text* is really
+    this event's content is a hash check, not a lookup. Building a signature
+    from text that fails it would attribute a fact to an event it was never
+    part of — the same integrity question ``ContentHashMismatch`` answers on
+    Companion's ingest side.
+    """
 
 
 class EventLog:
@@ -135,6 +149,97 @@ class EventLog:
 
     def signatures_for(self, event_id: str) -> list[SignatureRecord]:
         self._require_events()
+        return self._storage.signatures_for_event(event_id, user=self._user)
+
+    def extract_signatures(
+        self,
+        event_id: str,
+        text: str,
+        *,
+        llm_client: Any | None = None,
+        force: bool = False,
+    ) -> list[SignatureRecord]:
+        """
+        Turn one event's own text into a signature, checked and linked.
+
+        ``text`` is required. Unlike Companion's chat path, which can read a
+        ``chat_message`` event's own ``Message.content`` back, this store
+        never held the payload in the first place (see
+        ``SourceEventRecord.ensure_content_hash``) — there is nothing local
+        to resolve it from. The caller is whoever still holds the text: the
+        process that ingested it, a webhook replay, a backfill from an
+        export.
+
+        Checked against the event's own ``content_hash`` before anything is
+        built from it — text that does not hash to this event is not proven
+        to be what it claims, and a signature built from it would attribute
+        a fact to an event it was never part of. The check tries both with
+        and without ``occurred_at``, because whether the original recording
+        knew the timestamp or let it default is a fact this row does not
+        keep — only the resulting hash does — so it accepts whichever produced
+        the hash actually stored.
+
+        ``llm_client`` mirrors ``Memory.ingest``'s own parameter: given, it
+        wraps ``pdm_memory.ingest.auto_signature.AutoSignatureGenerator``
+        to compress *text* into a fact; omitted, *text* itself becomes the
+        signature verbatim — the same "raw text ingestion" fallback
+        ``Memory.ingest`` uses when it has no LLM client either.
+
+        Idempotent by default: an event that already has signatures returns
+        them rather than extracting a second one. ``force=True`` extracts
+        regardless, for a caller correcting a bad first pass.
+        """
+        self._require_events()
+        event = self._storage.get_source_event(event_id)
+        if event is None:
+            raise LookupError(f"no source event {event_id!r} for user {self._user!r}")
+
+        candidates = {
+            compute_content_hash(
+                event_type=event.event_type,
+                occurred_at=maybe_known,
+                source_system=event.source_system,
+                raw_reference=event.raw_reference,
+                payload=text,
+            )
+            for maybe_known in (event.occurred_at, None)
+        }
+        if event.content_hash not in candidates:
+            raise PayloadMismatch(
+                f"the text offered for source event {event_id} does not hash "
+                f"to the event's own content_hash ({event.content_hash}). It "
+                f"is not this event's content."
+            )
+
+        if not force:
+            existing = self._storage.signatures_for_event(event_id, user=self._user)
+            if existing:
+                return existing
+
+        if llm_client is not None:
+            from pdm_memory.ingest.auto_signature import AutoSignatureGenerator
+
+            result = AutoSignatureGenerator(llm_client).generate(text)
+            if result is None:
+                return []
+            compressed_fact = result.compressed_fact
+            tags = result.intent_tags
+            p_magnitude = result.p_magnitude
+        else:
+            compressed_fact = text.strip()[:500]
+            tags = []
+            p_magnitude = 50.0
+
+        if not compressed_fact:
+            return []
+
+        memory_id = self._memory.save(
+            compressed_fact, tags=tags, p_magnitude=p_magnitude
+        )
+        self._storage.link_signature(
+            memory_id, source_event_id=event_id, user=self._user
+        )
+
         return self._storage.signatures_for_event(event_id, user=self._user)
 
     # ------------------------------------------------------------------
