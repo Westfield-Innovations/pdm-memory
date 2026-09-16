@@ -15,9 +15,14 @@ ways, and the partial unique index refuses it.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from pdm_memory.models import Trajectory
 
 from pdm_memory.storage.event_hash import normalize_instant
 from pdm_memory.storage.events import utc_now
@@ -39,13 +44,52 @@ from pdm_memory.storage.fields import (
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["FieldStore"]
+__all__ = ["FieldStore", "TrajectoryCursorError"]
 
 # Inclusive at the closing instant, matching Companion's
 # ``valid_to__gte=at_time``. An exclusive end would put the boundary moment in
 # one field on the client and another on the server — a disagreement nobody
 # would think to look for.
 _LIVE = ", ".join(f"'{s}'" for s in sorted(LIVE_STATES))
+
+# trajectory()'s tie-break for two transitions sharing one instant — fixed and
+# arbitrary, the same way the Companion read model's own kind order is: it
+# only has to be stable across one cursor's lifetime, not meaningful.
+_TRAJECTORY_KIND_ORDER: dict[str, int] = {
+    "fact_filed": 0,
+    "fact_unfiled": 1,
+    "link_closed": 2,
+    "link_opened": 3,
+    "membership_closed": 4,
+    "membership_opened": 5,
+}
+
+_TRAJECTORY_SEPARATOR = "|"
+_TRAJECTORY_DEFAULT_PAGE_SIZE = 500
+
+
+class TrajectoryCursorError(ValueError):
+    """Raised when a trajectory cursor is malformed, truncated, or not ours."""
+
+
+def _encode_trajectory_cursor(*, at: str, kind: str, row_id: str) -> str:
+    raw = f"{at}{_TRAJECTORY_SEPARATOR}{kind}{_TRAJECTORY_SEPARATOR}{row_id}"
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+
+
+def _decode_trajectory_cursor(cursor: str) -> tuple[str, str, str]:
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
+        raise TrajectoryCursorError("Cursor is not readable.") from exc
+
+    parts = raw.split(_TRAJECTORY_SEPARATOR, 2)
+    if len(parts) != 3:
+        raise TrajectoryCursorError("Cursor is missing a component.")
+    at, kind, row_id = parts
+    if not at or kind not in _TRAJECTORY_KIND_ORDER or not row_id:
+        raise TrajectoryCursorError("Cursor carries an unreadable component.")
+    return at, kind, row_id
 
 
 def _settle_on_write(record: Any, end: str | None, *, entered_field: bool) -> None:
@@ -356,7 +400,9 @@ class FieldStore:
                 f"membership {membership_id!r} already ended at {row['valid_to']}"
             )
 
-        closing = normalize_instant(at) if at is not None else normalize_instant(utc_now())
+        closing = (
+            normalize_instant(at) if at is not None else normalize_instant(utc_now())
+        )
         if closing <= row["valid_from"]:
             raise ValueError(
                 f"cannot end a membership at {closing}, before it began "
@@ -451,7 +497,9 @@ class FieldStore:
                 f"relationship {relationship_id!r} already ended at {row['valid_to']}"
             )
 
-        closing = normalize_instant(at) if at is not None else normalize_instant(utc_now())
+        closing = (
+            normalize_instant(at) if at is not None else normalize_instant(utc_now())
+        )
         if closing <= row["valid_from"]:
             raise ValueError(
                 f"cannot end a relationship at {closing}, before it began "
@@ -517,12 +565,12 @@ class FieldStore:
         user: str = "default",
     ) -> list[FieldMembershipRecord]:
         """Every membership row for an entity — the history, not the snapshot."""
-        query = (
-            "SELECT * FROM pdm_field_memberships WHERE {user} = ? AND entity_id = ?"
-        )
+        query = "SELECT * FROM pdm_field_memberships WHERE {user} = ? AND entity_id = ?"
         if not include_ended:
             query += " AND valid_to IS NULL"
-        rows = self._run(query + " ORDER BY valid_from DESC, id", (user, entity_id)).fetchall()
+        rows = self._run(
+            query + " ORDER BY valid_from DESC, id", (user, entity_id)
+        ).fetchall()
         return [membership_from_row(row) for row in rows]
 
     def related_entities(
@@ -685,3 +733,321 @@ class FieldStore:
         for member in members:
             reachable |= self.related_entities(member, at, user=user)
         return members | reachable
+
+    # ------------------------------------------------------------------
+    # Trajectory — an ordered sequence of transitions (spec §7, §3)
+    # ------------------------------------------------------------------
+
+    def trajectory(
+        self,
+        subject_id: str,
+        start: datetime | str,
+        end: datetime | str,
+        *,
+        after: str | None = None,
+        limit: int | None = None,
+        user: str = "default",
+    ) -> Trajectory:
+        """
+        The ordered transitions for a field or entity, in ``[start, end)``.
+
+        Local-only counterpart to Companion's ``pdm.field_state.trajectory``,
+        and simpler than it in two ways worth naming rather than silently
+        matching:
+
+        No self-view refusal. Companion's version requires the caller's own
+        subject because one Django database holds many people's rows and a
+        cross-subject grant story would have to exist to look past that.
+        Here ``user`` already is the tenant boundary — a local store holds
+        one person's data — so there is no second subject to leak.
+
+        No ``grant_changed`` or ``projection_recorded`` / ``outcome_recorded``.
+        This store has no perspective-log or projection table to produce them
+        from; inventing local versions would be a claim about data this
+        process never captured. A cloud-backed ``Memory`` reaches the full
+        six-kind set through ``CloudDriver.trajectory`` instead.
+
+        Field ids match exactly, not by prefix. Every other query in this
+        file already treats ``field_id`` this way — there is no nested-field
+        convention locally to extend, only one to not invent here alone.
+        """
+        from pdm_memory.models import Trajectory, TrajectoryStep
+
+        start_s = normalize_instant(start)
+        end_s = normalize_instant(end)
+        if start_s >= end_s:
+            raise ValueError(f"start ({start_s}) must be before end ({end_s}).")
+
+        page_size = min(
+            int(limit or _TRAJECTORY_DEFAULT_PAGE_SIZE), _TRAJECTORY_DEFAULT_PAGE_SIZE
+        )
+        cursor = _decode_trajectory_cursor(after) if after else None
+
+        is_entity = subject_id.startswith(("subject:", "agent:"))
+
+        candidates: list[dict[str, Any]] = []
+        if is_entity:
+            candidates += self._trajectory_membership_steps(
+                entity_id=subject_id,
+                field_id=None,
+                user=user,
+                start=start_s,
+                end=end_s,
+                cursor=cursor,
+                page_size=page_size,
+            )
+            candidates += self._trajectory_link_steps(
+                entity_id=subject_id,
+                user=user,
+                start=start_s,
+                end=end_s,
+                cursor=cursor,
+                page_size=page_size,
+            )
+        else:
+            candidates += self._trajectory_membership_steps(
+                entity_id=None,
+                field_id=subject_id,
+                user=user,
+                start=start_s,
+                end=end_s,
+                cursor=cursor,
+                page_size=page_size,
+            )
+            candidates += self._trajectory_fact_steps(
+                field_id=subject_id,
+                user=user,
+                start=start_s,
+                end=end_s,
+                cursor=cursor,
+                page_size=page_size,
+            )
+
+        # No ref_id in the key: each source list already arrives ordered by
+        # (at, id) straight out of SQL, and Python's sort is stable, so ties
+        # on (at, kind) keep that order rather than being re-sorted by a
+        # string comparison a caller's own WHERE clause does not make.
+        candidates.sort(
+            key=lambda item: (item["at"], _TRAJECTORY_KIND_ORDER[item["kind"]])
+        )
+
+        has_more = len(candidates) > page_size
+        page = candidates[:page_size]
+
+        next_cursor = None
+        if has_more and page:
+            last = page[-1]
+            next_cursor = _encode_trajectory_cursor(
+                at=last["at"], kind=last["kind"], row_id=last["ref_id"]
+            )
+
+        return Trajectory(
+            subject_id=subject_id,
+            start=start_s,
+            end=end_s,
+            steps=[TrajectoryStep.from_payload(item) for item in page],
+            next_cursor=next_cursor,
+        )
+
+    def _trajectory_fetch(
+        self,
+        *,
+        table: str,
+        at_column: str,
+        kind: str,
+        extra_where: str,
+        extra_params: tuple[Any, ...],
+        start: str,
+        end: str,
+        cursor: tuple[str, str, str] | None,
+        page_size: int,
+        user: str,
+    ) -> list[Any]:
+        """
+        Up to ``page_size + 1`` rows of one ``(table, at-column)`` pair,
+        windowed to ``[start, end)`` and, when resuming, past ``cursor`` in
+        the merged stream's own ``(at, kind, id)`` order — pushed into the
+        query rather than filtered after the fact, so a later page costs the
+        same as the first one.
+        """
+        where = (
+            f"{{user}} = ? AND {extra_where} AND {at_column} >= ? AND {at_column} < ?"
+        )
+        params: list[Any] = [user, *extra_params, start, end]
+
+        if cursor is not None:
+            cursor_at, cursor_kind, cursor_id = cursor
+            this_order = _TRAJECTORY_KIND_ORDER[kind]
+            cursor_order = _TRAJECTORY_KIND_ORDER[cursor_kind]
+            if this_order > cursor_order:
+                where += f" AND {at_column} >= ?"
+                params.append(cursor_at)
+            elif this_order < cursor_order:
+                where += f" AND {at_column} > ?"
+                params.append(cursor_at)
+            else:
+                where += f" AND ({at_column} > ? OR ({at_column} = ? AND id > ?))"
+                params.extend([cursor_at, cursor_at, cursor_id])
+
+        rows = self._run(
+            f"SELECT * FROM {table} WHERE {where} ORDER BY {at_column}, id LIMIT ?",
+            (*params, page_size + 1),
+        ).fetchall()
+        return list(rows)
+
+    def _trajectory_membership_steps(
+        self,
+        *,
+        entity_id: str | None,
+        field_id: str | None,
+        user: str,
+        start: str,
+        end: str,
+        cursor: tuple[str, str, str] | None,
+        page_size: int,
+    ) -> list[dict[str, Any]]:
+        if entity_id is not None:
+            extra_where, extra_params = "entity_id = ?", (entity_id,)
+        else:
+            extra_where, extra_params = "field_id = ?", (normalize_field_id(field_id),)
+
+        steps: list[dict[str, Any]] = []
+        for kind, at_column, closed_only in (
+            ("membership_opened", "valid_from", False),
+            ("membership_closed", "valid_to", True),
+        ):
+            where = extra_where + (" AND valid_to IS NOT NULL" if closed_only else "")
+            rows = self._trajectory_fetch(
+                table="pdm_field_memberships",
+                at_column=at_column,
+                kind=kind,
+                extra_where=where,
+                extra_params=extra_params,
+                start=start,
+                end=end,
+                cursor=cursor,
+                page_size=page_size,
+                user=user,
+            )
+            for row in rows:
+                at = (
+                    row["valid_from"]
+                    if kind == "membership_opened"
+                    else row["valid_to"]
+                )
+                steps.append(
+                    {
+                        "at": at,
+                        "kind": kind,
+                        "ref_id": row["id"],
+                        "field_id": row["field_id"],
+                        "detail": {
+                            "entity_id": row["entity_id"],
+                            "field_id": row["field_id"],
+                            "role": row["role"],
+                            "state": row["state"],
+                        },
+                        "state_type": "measured",
+                    }
+                )
+        return steps
+
+    def _trajectory_fact_steps(
+        self,
+        *,
+        field_id: str,
+        user: str,
+        start: str,
+        end: str,
+        cursor: tuple[str, str, str] | None,
+        page_size: int,
+    ) -> list[dict[str, Any]]:
+        steps: list[dict[str, Any]] = []
+        for kind, at_column, closed_only in (
+            ("fact_filed", "valid_from", False),
+            ("fact_unfiled", "valid_to", True),
+        ):
+            where = "field_id = ?" + (
+                " AND valid_to IS NOT NULL" if closed_only else ""
+            )
+            rows = self._trajectory_fetch(
+                table="pdm_signature_field_memberships",
+                at_column=at_column,
+                kind=kind,
+                extra_where=where,
+                extra_params=(normalize_field_id(field_id),),
+                start=start,
+                end=end,
+                cursor=cursor,
+                page_size=page_size,
+                user=user,
+            )
+            for row in rows:
+                at = row["valid_from"] if kind == "fact_filed" else row["valid_to"]
+                steps.append(
+                    {
+                        "at": at,
+                        "kind": kind,
+                        "ref_id": row["id"],
+                        "field_id": row["field_id"],
+                        "detail": {
+                            "signature_id": row["signature_id"],
+                            "field_id": row["field_id"],
+                            "weight": row["weight"],
+                            "confidence": row["confidence"],
+                            "derived_by": row["derived_by"],
+                        },
+                        "state_type": "measured",
+                    }
+                )
+        return steps
+
+    def _trajectory_link_steps(
+        self,
+        *,
+        entity_id: str,
+        user: str,
+        start: str,
+        end: str,
+        cursor: tuple[str, str, str] | None,
+        page_size: int,
+    ) -> list[dict[str, Any]]:
+        steps: list[dict[str, Any]] = []
+        for kind, at_column, closed_only in (
+            ("link_opened", "valid_from", False),
+            ("link_closed", "valid_to", True),
+        ):
+            where = "(source_entity_id = ? OR target_entity_id = ?)" + (
+                " AND valid_to IS NOT NULL" if closed_only else ""
+            )
+            rows = self._trajectory_fetch(
+                table="pdm_relationships",
+                at_column=at_column,
+                kind=kind,
+                extra_where=where,
+                extra_params=(entity_id, entity_id),
+                start=start,
+                end=end,
+                cursor=cursor,
+                page_size=page_size,
+                user=user,
+            )
+            for row in rows:
+                at = row["valid_from"] if kind == "link_opened" else row["valid_to"]
+                steps.append(
+                    {
+                        "at": at,
+                        "kind": kind,
+                        "ref_id": row["id"],
+                        "field_id": "",
+                        "detail": {
+                            "source_entity_id": row["source_entity_id"],
+                            "target_entity_id": row["target_entity_id"],
+                            "relationship_type": row["relationship_type"],
+                            "directionality": row["directionality"],
+                            "derived_by": row["derived_by"],
+                        },
+                        "state_type": "measured",
+                    }
+                )
+        return steps

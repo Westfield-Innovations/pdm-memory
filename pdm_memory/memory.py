@@ -74,6 +74,7 @@ from pdm_memory.models import (
     RelationshipChannelResolution,
     SurfaceReport,
     TorsionReport,
+    Trajectory,
 )
 from pdm_memory.storage.base import BaseStorage
 from pdm_memory.types import (
@@ -1846,6 +1847,45 @@ class Memory:
             cursor=cursor,
             limit=limit,
             envelope=envelope,
+        )
+
+    def trajectory(
+        self,
+        subject_id: str,
+        start: datetime,
+        end: datetime,
+        *,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> Trajectory:
+        """
+        An ordered sequence of transitions for a field or entity, over
+        ``[start, end)`` (spec §7, §3).
+
+        Unlike :meth:`state_at` / :meth:`current_state`, this works against
+        either driver: the membership, fact, and link tables it reads already
+        exist locally (``storage.field_store.FieldStore``), so a local
+        ``Memory`` answers from its own database without needing the cloud.
+        A cloud-backed ``Memory`` reaches Companion's own
+        ``GET /api/v1/pdm/field-state/trajectory/`` instead — and only that
+        path can return ``grant_changed`` / ``projection_recorded`` /
+        ``outcome_recorded`` steps; see ``FieldStore.trajectory``'s own
+        docstring for why the local table set stops short of those.
+        """
+        trajectory_fn = getattr(self._storage, "trajectory", None)
+        if trajectory_fn is None:
+            raise RuntimeError(
+                f"{type(self._storage).__name__} does not support "
+                "trajectory(). Use Memory(storage=EventfulSQLiteDriver(...)) "
+                "or Memory(storage=CloudDriver(...))."
+            )
+        return trajectory_fn(
+            subject_id,
+            start,
+            end,
+            after=cursor,
+            limit=limit,
+            user=self._user,
         )
 
     def count(self) -> int:

@@ -414,7 +414,9 @@ class EventLog:
         self._require_events()
         return self._storage.signatures_for_entity(entity_id, user=self._user)
 
-    def merge(self, keep_id: str, merge_id: str, *, method: str = "user_confirmed") -> None:
+    def merge(
+        self, keep_id: str, merge_id: str, *, method: str = "user_confirmed"
+    ) -> None:
         """Two identities turned out to be one person. Reversible; see D6."""
         self._require_events()
         self._storage.merge_entities(keep_id, merge_id, method=method)
@@ -522,9 +524,7 @@ class EventLog:
             user=self._user,
         )
 
-    def unfile_fact(
-        self, membership_id: str, at: datetime | str | None = None
-    ) -> None:
+    def unfile_fact(self, membership_id: str, at: datetime | str | None = None) -> None:
         """Close a fact's membership in a field."""
         self._require_fields()
         self._storage.unfile_signature(membership_id, at, user=self._user)
@@ -546,12 +546,29 @@ class EventLog:
         self._require_fields()
         return self._storage.members_of(field_id, at, user=self._user)
 
-    def related(
-        self, entity_id: str, at: datetime | str | None = None
-    ) -> set[str]:
+    def related(self, entity_id: str, at: datetime | str | None = None) -> set[str]:
         """Entities a live link reaches from this one at *at*. One hop."""
         self._require_fields()
         return self._storage.related_entities(entity_id, at, user=self._user)
+
+    def trajectory(
+        self,
+        subject_id: str,
+        start: datetime,
+        end: datetime,
+        *,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> Any:
+        """
+        Alias for :meth:`Memory.trajectory` — see there for what it returns
+        and why, unlike the rest of this section, it works against a local
+        driver as well as a cloud one.
+        """
+        self._require_fields()
+        return self._memory.trajectory(
+            subject_id, start, end, cursor=cursor, limit=limit
+        )
 
     def recall(
         self,

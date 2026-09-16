@@ -692,6 +692,45 @@ class CloudDriver(BaseStorage):
             envelope=envelope,
         )
 
+    def trajectory(
+        self,
+        subject_id: str,
+        start: datetime,
+        end: datetime,
+        *,
+        after: str | None = None,
+        limit: int | None = None,
+        user: str = "default",
+    ) -> Any:
+        """
+        The ordered transitions for a field or entity over a time window.
+
+        GET /api/v1/pdm/field-state/trajectory/?subject_id=&start=&end=&cursor=&page_size=
+        Self-view only on the server today: an entity ``subject_id`` must be
+        the caller's own — see that endpoint's own docstring for why.
+        """
+        from pdm_memory.models import Trajectory
+
+        path = "/api/v1/pdm/field-state/trajectory/"
+        params: dict[str, Any] = {
+            "subject_id": subject_id,
+            "start": self._iso(start),
+            "end": self._iso(end),
+        }
+        if after:
+            params["cursor"] = after
+        if limit is not None:
+            params["page_size"] = limit
+
+        resp = self._get(path, params=params)
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise CloudStorageError(
+                f"Unexpected trajectory body type: {type(data).__name__}",
+                path=path,
+            )
+        return Trajectory.from_payload(data)
+
     # ------------------------------------------------------------------
     # Fields and links — who belongs where, and beside whom (TKT-102-B)
     # ------------------------------------------------------------------

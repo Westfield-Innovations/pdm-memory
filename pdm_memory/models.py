@@ -74,7 +74,11 @@ class AlignmentReport:
         }
 
     def render(self) -> str:
-        goals = "; ".join(self.conflicting_goals[:3]) if self.conflicting_goals else "(none)"
+        goals = (
+            "; ".join(self.conflicting_goals[:3])
+            if self.conflicting_goals
+            else "(none)"
+        )
         return (
             f"[{self.status}] score={self.score:.3f} "
             f"resonance={self.resonance:.3f} torsion={self.torsion:.3f}\n"
@@ -278,6 +282,105 @@ class FieldStateSnapshot:
             permission_view=dict(payload.get("permission_view") or {}),
             truncated=[str(name) for name in payload.get("truncated") or []],
         )
+
+
+@dataclass(slots=True)
+class TrajectoryStep:
+    """
+    One transition — a field entered, a fact filed, a link formed — from
+    ``Memory.trajectory`` (spec §7, §3).
+
+    Mirrors Companion's own item shape field for field: ``at``, ``kind``,
+    ``ref_id``, ``field_id``, ``detail``, ``state_type``. ``kind`` is one of
+    ``membership_opened`` / ``membership_closed`` / ``fact_filed`` /
+    ``fact_unfiled`` / ``link_opened`` / ``link_closed`` locally, plus
+    ``grant_changed`` / ``projection_recorded`` / ``outcome_recorded`` when
+    the trajectory came from the cloud — the local store has no perspective
+    log or projection table to produce the last three from, and inventing
+    them here would be a claim about data this process never held.
+    """
+
+    at: str
+    kind: str
+    ref_id: str
+    field_id: str
+    detail: dict[str, Any]
+    state_type: str
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> TrajectoryStep:
+        if not payload.get("state_type"):
+            raise ValueError(
+                "trajectory step carries no state_type — every item crossing "
+                "this boundary must declare whether it is measured or "
+                "projected."
+            )
+        return cls(
+            at=str(payload.get("at", "")),
+            kind=str(payload.get("kind", "")),
+            ref_id=str(payload.get("ref_id", "")),
+            field_id=str(payload.get("field_id", "")),
+            detail=dict(payload.get("detail") or {}),
+            state_type=str(payload["state_type"]),
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "at": self.at,
+            "kind": self.kind,
+            "ref_id": self.ref_id,
+            "field_id": self.field_id,
+            "detail": dict(self.detail),
+            "state_type": self.state_type,
+        }
+
+
+@dataclass(slots=True)
+class Trajectory:
+    """
+    One page of a subject's transitions, oldest first (spec §7, §3).
+
+    ``truncated`` is not a field the wire carries — a trajectory has exactly
+    one truncatable thing, the step list itself, and ``next_cursor`` already
+    says whether more remain. It is derived rather than duplicated so the two
+    can never disagree.
+    """
+
+    subject_id: str
+    start: str
+    end: str
+    steps: list[TrajectoryStep] = field(default_factory=list)
+    next_cursor: str | None = None
+
+    @property
+    def truncated(self) -> bool:
+        return self.next_cursor is not None
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> Trajectory:
+        return cls(
+            subject_id=str(payload.get("subject_id", "")),
+            start=str(payload.get("start", "")),
+            end=str(payload.get("end", "")),
+            steps=[
+                TrajectoryStep.from_payload(row) for row in payload.get("steps") or []
+            ],
+            next_cursor=(
+                str(payload["next_cursor"])
+                if payload.get("next_cursor") is not None
+                else None
+            ),
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "subject_id": self.subject_id,
+            "start": self.start,
+            "end": self.end,
+            "steps": [step.as_dict() for step in self.steps],
+            "next_cursor": self.next_cursor,
+            "truncated": self.truncated,
+        }
 
 
 @dataclass(slots=True)
