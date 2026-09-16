@@ -223,6 +223,58 @@ page = mem.current_state("westfield", cursor=state.entities_next_cursor, envelop
   unfiltered mode, and permission resolves against now — a revoked grant does
   not reopen last year.
 
+### Relationships
+
+`EventLog.link(...)` records that two entities stood in some relation; the
+methods below read and reinforce that link's channel over time.
+
+```python
+from pdm_memory import Memory
+from pdm_memory.event_log import EventLog
+
+mem = Memory(store="cloud", token="eyJ...")
+log = EventLog(mem)
+
+relationship_id = log.link("subject:1", "entity:abc-123", "colleague")
+
+# Point-in-time state of the pair — which links were live, which channel
+# measurements applied, and (only within the channel's own recency window)
+# the current resolution vector. at_time omitted means now.
+state = mem.relationship_state("subject:1", "entity:abc-123")
+state.relationships                    # the live/historical link rows for this pair
+state.channels                         # {domain: channel snapshot}, by domain
+state.current_resolution_by_domain     # None outside the recency window
+state.current_resolution_reason        # "past_moment" when it is None
+
+# Cite an existing fact as reinforcing or contrary evidence for the link's
+# channel. No bare number: the citation itself is the input.
+from pdm_memory.storage.fields import RelationshipRecord
+
+relationship = RelationshipRecord(id=relationship_id, source_entity_id="subject:1",
+                                   target_entity_id="entity:abc-123", relationship_type="colleague")
+log.reinforce(relationship, evidence="sig-1")            # or a SignatureRecord/SourceEventRecord
+log.apply_contrary_evidence(relationship, evidence="sig-2")
+```
+
+- **Cloud only**, same as Field State — `RelationshipChannel` and its
+  evidence log live only in Companion.
+- **Dispatch by target type**, not by guessing at a string. `reinforce`/
+  `apply_contrary_evidence` route to the relationship-evidence endpoint only
+  when *target* is a `RelationshipRecord`; a bare string id or a
+  `SignatureRecord` goes to the existing, unchanged `Memory.reinforce()` /
+  `Memory.apply_contrary_evidence()` — the same methods and behaviour as
+  before this feature existed.
+- **Resubmitting the same evidence is refused** (`CloudConflictError`,
+  `error_code="EVIDENCE_ALREADY_APPLIED"`), not silently counted twice.
+
+| This document's naming | SDK method |
+|---|---|
+| Point-in-time relationship state | `Memory.relationship_state(source, target, at_time=None, domain=None)` |
+| Reinforcing evidence, on a link | `EventLog.reinforce(relationship_record, evidence)` |
+| Contrary evidence, on a link | `EventLog.apply_contrary_evidence(relationship_record, evidence)` |
+| Reinforcing evidence, on a memory (unchanged) | `EventLog.reinforce(memory_id_or_record)` → `Memory.reinforce` |
+| Contrary evidence, on a memory (unchanged) | `EventLog.apply_contrary_evidence(memory_id_or_record, evidence)` → `Memory.apply_contrary_evidence` |
+
 ### Sync Local ↔ Cloud
 
 ```python

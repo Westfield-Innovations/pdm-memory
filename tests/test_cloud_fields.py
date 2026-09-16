@@ -19,9 +19,12 @@ import pytest
 
 from pdm_memory import Memory
 from pdm_memory.auth.jwt_handler import JWTAuth
+from pdm_memory.core.signature import SignatureRecord
 from pdm_memory.event_log import EventLog
 from pdm_memory.storage.cloud_driver import CloudDriver
 from pdm_memory.storage.errors import CloudConflictError, CloudNotFoundError
+from pdm_memory.storage.events import SourceEventRecord
+from pdm_memory.storage.fields import RelationshipRecord
 
 
 def _auth() -> JWTAuth:
@@ -289,6 +292,120 @@ class TestLinkAndEndLink:
         url, kwargs = mock_patch.call_args[0][0], mock_patch.call_args[1]
         assert url.endswith("/api/v1/pdm/relationships/rel-1")
         assert kwargs["json"]["valid_to"] == "2026-05-01T00:00:00+00:00"
+
+
+class TestRelationshipEvidence:
+    """
+    spec §4.4 — ``EventLog.reinforce``/``apply_contrary_evidence`` dispatch
+    by target type: a ``RelationshipRecord`` goes to the new evidence route,
+    anything else (a bare string id, or a ``SignatureRecord``) goes to the
+    existing, unchanged ``Memory.reinforce``/``apply_contrary_evidence``.
+    """
+
+    @patch("httpx.post")
+    def test_reinforcing_a_relationship_cites_a_signature_by_id(self, mock_post):
+        mock_post.return_value = _resp(
+            201, {"relationship_id": "rel-1", "kind": "reinforce", "domains": ["*"]}
+        )
+        relationship = RelationshipRecord(
+            id="rel-1",
+            source_entity_id="subject:1",
+            target_entity_id="entity:abc",
+            relationship_type="colleague",
+        )
+
+        result = _log().reinforce(relationship, "sig-1")
+
+        assert result["relationship_id"] == "rel-1"
+        url = mock_post.call_args[0][0]
+        assert url.endswith("/api/v1/pdm/relationships/rel-1/evidence")
+        body = mock_post.call_args[1]["json"]
+        assert body == {"kind": "reinforce", "signature_id": "sig-1"}
+
+    @patch("httpx.post")
+    def test_reinforcing_a_relationship_cites_a_signature_record(self, mock_post):
+        mock_post.return_value = _resp(201, {"domains": ["*"]})
+        relationship = RelationshipRecord(
+            id="rel-1",
+            source_entity_id="subject:1",
+            target_entity_id="entity:abc",
+            relationship_type="colleague",
+        )
+
+        _log().reinforce(relationship, SignatureRecord(id="sig-2"))
+
+        body = mock_post.call_args[1]["json"]
+        assert body == {"kind": "reinforce", "signature_id": "sig-2"}
+
+    @patch("httpx.post")
+    def test_contrary_evidence_on_a_relationship_cites_a_source_event(self, mock_post):
+        mock_post.return_value = _resp(201, {"domains": ["*"]})
+        relationship = RelationshipRecord(
+            id="rel-1",
+            source_entity_id="subject:1",
+            target_entity_id="entity:abc",
+            relationship_type="colleague",
+        )
+
+        _log().apply_contrary_evidence(relationship, SourceEventRecord(id="evt-1"))
+
+        url = mock_post.call_args[0][0]
+        assert url.endswith("/api/v1/pdm/relationships/rel-1/evidence")
+        body = mock_post.call_args[1]["json"]
+        assert body == {"kind": "contrary", "source_event_id": "evt-1"}
+
+    def test_relationship_evidence_with_no_citation_is_refused_locally(self):
+        relationship = RelationshipRecord(
+            id="rel-1",
+            source_entity_id="subject:1",
+            target_entity_id="entity:abc",
+            relationship_type="colleague",
+        )
+
+        with pytest.raises(ValueError, match="must cite an existing"):
+            _log().reinforce(relationship, None)
+
+    @patch("httpx.post")
+    def test_resubmitting_the_same_evidence_raises_the_specific_conflict(
+        self, mock_post
+    ):
+        mock_post.return_value = _resp(
+            409, {"error_code": "EVIDENCE_ALREADY_APPLIED"}
+        )
+        relationship = RelationshipRecord(
+            id="rel-1",
+            source_entity_id="subject:1",
+            target_entity_id="entity:abc",
+            relationship_type="colleague",
+        )
+
+        with pytest.raises(CloudConflictError) as exc:
+            _log().reinforce(relationship, "sig-1")
+        assert exc.value.error_code == "EVIDENCE_ALREADY_APPLIED"
+
+    def test_a_bare_string_target_is_read_as_a_memory_not_a_relationship(self):
+        # No relationship route is hit at all — dispatched straight to the
+        # existing, unchanged Memory.reinforce.
+        log = _log()
+        with patch.object(log._memory, "reinforce") as mock_reinforce:
+            log.reinforce("sig-1", "irrelevant-for-a-memory-target")
+
+        mock_reinforce.assert_called_once_with("sig-1", coupling_score=0.5)
+
+    def test_a_signature_record_target_dispatches_to_memory_apply_contrary(self):
+        log = _log()
+        sig = SignatureRecord(id="sig-1")
+        with patch.object(log._memory, "apply_contrary_evidence") as mock_apply:
+            log.apply_contrary_evidence(sig, "the new contrary fact")
+
+        mock_apply.assert_called_once_with(
+            sig,
+            "the new contrary fact",
+            coupling_score=0.5,
+            persist_evidence=True,
+            evidence_tags=None,
+            evidence_shape=None,
+        )
 
 
 class TestRelated:

@@ -192,6 +192,86 @@ class RelationshipChannelResolution:
 
 
 @dataclass(slots=True)
+class RelationshipState:
+    """
+    Point-in-time state of one relationship pair (spec §4.3): which links
+    were live, which channel measurements applied, and — only within the
+    channel's own recency window — the current resolution vector.
+
+    Populated from Companion ``GET /api/v1/pdm/relationships/state/``.
+    ``relationships`` and ``channels`` stay plain dicts rather than typed
+    records: unlike :class:`RelationshipChannelResolution`, this route's
+    per-domain shape (``bfr``, ``branches``, ``is_currently_blackout``, …)
+    is its own thing, not that dataclass's flat vector, and is not
+    established enough yet to freeze into a second one.
+
+    ``current_resolution_by_domain`` is ``None`` — not an empty dict — when
+    ``at_time`` fell outside the channel's recency window;
+    ``current_resolution_reason`` then explains why (``"past_moment"``).
+    Reading a resolution vector for a moment far enough in the past would
+    be a claim about what was true then when it is only ever a claim about
+    now — see the server route's own docstring.
+    """
+
+    source: str
+    target: str
+    domain: str
+    at_time: str
+    relationships: list[dict[str, Any]] = field(default_factory=list)
+    channels: dict[str, dict[str, Any]] = field(default_factory=dict)
+    current_resolution_by_domain: dict[str, dict[str, Any]] | None = None
+    current_resolution_reason: str | None = None
+    last_direct_measurement: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "target": self.target,
+            "domain": self.domain,
+            "at_time": self.at_time,
+            "relationships": list(self.relationships),
+            "channels": dict(self.channels),
+            "current_resolution_by_domain": (
+                dict(self.current_resolution_by_domain)
+                if self.current_resolution_by_domain is not None
+                else None
+            ),
+            "current_resolution_reason": self.current_resolution_reason,
+            "last_direct_measurement": self.last_direct_measurement,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> RelationshipState:
+        raw_resolution = payload.get("current_resolution_by_domain")
+        return cls(
+            source=str(payload.get("source", "")),
+            target=str(payload.get("target", "")),
+            domain=str(payload.get("domain", "*")),
+            at_time=str(payload.get("at_time", "")),
+            relationships=[dict(row) for row in payload.get("relationships") or []],
+            channels={
+                str(domain): dict(entry)
+                for domain, entry in (payload.get("channels") or {}).items()
+            },
+            current_resolution_by_domain=(
+                {str(domain): dict(entry) for domain, entry in raw_resolution.items()}
+                if raw_resolution is not None
+                else None
+            ),
+            current_resolution_reason=(
+                str(payload["current_resolution_reason"])
+                if payload.get("current_resolution_reason") is not None
+                else None
+            ),
+            last_direct_measurement=(
+                str(payload["last_direct_measurement"])
+                if payload.get("last_direct_measurement") is not None
+                else None
+            ),
+        )
+
+
+@dataclass(slots=True)
 class FieldStateSnapshot:
     """
     One bounded field's reconciled state at one moment, for one observer.

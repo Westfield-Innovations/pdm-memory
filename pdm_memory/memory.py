@@ -72,6 +72,7 @@ from pdm_memory.models import (
     FieldStateSnapshot,
     MemoryListPage,
     RelationshipChannelResolution,
+    RelationshipState,
     SurfaceReport,
     TorsionReport,
     Trajectory,
@@ -1793,6 +1794,34 @@ class Memory:
         return self._require_cloud("current_resolution").current_resolution(
             observer=observer,
             target=target,
+            domain=domain,
+        )
+
+    def relationship_state(
+        self,
+        source: str,
+        target: str,
+        at_time: datetime | None = None,
+        domain: str | None = None,
+    ) -> RelationshipState:
+        """
+        Point-in-time state of one relationship pair (spec §4.3, ecosystem /
+        cloud only).
+
+        Thin client over Companion ``GET /api/v1/pdm/relationships/state/``.
+        ``at_time`` omitted means now; ``domain`` omitted means every domain
+        (``"*"``). Returns which links were live, which channel measurements
+        applied, and — only within the channel's own recency window — the
+        current resolution vector; see :class:`RelationshipState` for the
+        full shape and why that vector is withheld outside the window.
+
+        Requires ``store="cloud"`` or a JWT ``token`` (and optional
+        ``cloud_url``) so the SDK can reach the Companion relationships API.
+        """
+        return self._require_cloud("relationship_state").relationship_state(
+            source,
+            target,
+            at_time=at_time,
             domain=domain,
         )
 

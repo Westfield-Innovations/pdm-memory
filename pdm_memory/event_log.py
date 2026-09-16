@@ -30,7 +30,7 @@ verbatim and this class becomes a two-line alias.
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any
 
@@ -38,11 +38,12 @@ from pdm_memory.core.signature import SignatureRecord
 from pdm_memory.storage.event_hash import compute_content_hash
 from pdm_memory.storage.events import (
     EntityMentionRecord,
-    IntegrityReport,
     EntityRecord,
+    IntegrityReport,
     SourceEventRecord,
     storage_supports_events,
 )
+from pdm_memory.storage.fields import RelationshipRecord
 
 logger = logging.getLogger(__name__)
 
@@ -389,7 +390,7 @@ class EventLog:
         self._require_events()
         return self._storage.unresolved_mentions(user=self._user, limit=limit)
 
-    def check_integrity(self) -> "IntegrityReport":
+    def check_integrity(self) -> IntegrityReport:
         """
         Report references that lead nowhere. Reads only; repairs nothing.
 
@@ -494,6 +495,128 @@ class EventLog:
         """Close a relationship."""
         self._require_fields()
         self._storage.end_relationship(relationship_id, at, user=self._user)
+
+    def reinforce(
+        self,
+        target: RelationshipRecord | SignatureRecord | str,
+        evidence: SignatureRecord | SourceEventRecord | str | None = None,
+        *,
+        coupling_score: float = 0.5,
+    ) -> Any:
+        """
+        Reinforce *target* — a relationship's channel (spec §4.4) when
+        *target* is a :class:`RelationshipRecord`, or a memory's pressure
+        (:meth:`Memory.reinforce`, unchanged) for anything else, including a
+        bare string id — the same convention
+        :meth:`Memory.apply_contrary_evidence` already uses for its own
+        ``target`` parameter, so an existing call site's string id keeps
+        meaning what it always meant.
+
+        ``evidence`` is required for a relationship target — the route it
+        dispatches to (spec §4.4) refuses a bare kind with nothing behind
+        it — and must be an existing :class:`SignatureRecord` (or its id) or
+        :class:`SourceEventRecord` (or its id). It has no meaning for a
+        memory target: :meth:`Memory.reinforce` reinforces from validation
+        counters, not from a cited fact, and does not accept one; passed
+        here for a memory target, it is simply not forwarded.
+
+        To target a relationship, pass the :class:`RelationshipRecord`
+        itself (e.g. from ``log.link(...)``'s return id wrapped by a lookup,
+        or one already held) — a bare string id is always read as a
+        signature id, never guessed at as a relationship's.
+        """
+        if isinstance(target, RelationshipRecord):
+            return self._apply_relationship_evidence(
+                target.id, kind="reinforce", evidence=evidence
+            )
+        memory_id = target if isinstance(target, str) else target.id
+        return self._memory.reinforce(memory_id, coupling_score=coupling_score)
+
+    def apply_contrary_evidence(
+        self,
+        target: RelationshipRecord | SignatureRecord | str,
+        evidence: SignatureRecord | SourceEventRecord | str | Mapping[str, Any],
+        *,
+        coupling_score: float = 0.5,
+        persist_evidence: bool = True,
+        evidence_tags: list[str] | None = None,
+        evidence_shape: str | None = None,
+    ) -> Any:
+        """
+        Apply contrary evidence to *target* — a relationship's channel
+        (spec §4.4) when *target* is a :class:`RelationshipRecord`, or a
+        memory's pressure (:meth:`Memory.apply_contrary_evidence`,
+        unchanged) for anything else, including a bare string id.
+
+        For a relationship target, ``evidence`` must cite an existing
+        :class:`SignatureRecord` (or its id) or :class:`SourceEventRecord`
+        (or its id) — the route it dispatches to (spec §4.4) refuses a bare
+        fact with nothing behind it, unlike the memory path below, which by
+        default *persists* ``evidence`` as a brand-new signature
+        (``persist_evidence=True``) rather than citing one that already
+        exists. ``coupling_score``/``persist_evidence``/``evidence_tags``/
+        ``evidence_shape`` are forwarded to :meth:`Memory.apply_contrary_evidence`
+        unchanged and have no effect on the relationship path.
+        """
+        if isinstance(target, RelationshipRecord):
+            return self._apply_relationship_evidence(
+                target.id, kind="contrary", evidence=evidence
+            )
+        return self._memory.apply_contrary_evidence(
+            target,
+            evidence,
+            coupling_score=coupling_score,
+            persist_evidence=persist_evidence,
+            evidence_tags=evidence_tags,
+            evidence_shape=evidence_shape,
+        )
+
+    def _apply_relationship_evidence(
+        self,
+        relationship_id: str,
+        *,
+        kind: str,
+        evidence: SignatureRecord | SourceEventRecord | str | Mapping[str, Any] | None,
+    ) -> Any:
+        """
+        POST .../relationships/<id>/evidence (spec §4.4) — cloud only.
+
+        ``RelationshipChannel`` and its evidence log live only in Companion;
+        a local driver has neither table, so this refuses cleanly rather
+        than pretending to apply evidence that would go nowhere.
+        """
+        from pdm_memory.storage.cloud_driver import CloudDriver
+
+        storage = self._storage
+        if not isinstance(storage, CloudDriver):
+            raise RuntimeError(
+                f"{type(storage).__name__} does not support relationship "
+                "evidence — RelationshipChannel and its evidence log live "
+                "only in Companion. Use Memory(storage=CloudDriver(...))."
+            )
+
+        signature_id: str | None = None
+        source_event_id: str | None = None
+        if isinstance(evidence, SignatureRecord):
+            signature_id = evidence.id
+        elif isinstance(evidence, SourceEventRecord):
+            source_event_id = evidence.id
+        elif isinstance(evidence, str) and evidence:
+            signature_id = evidence
+        else:
+            raise ValueError(
+                "Relationship evidence must cite an existing SignatureRecord "
+                "(or its id) or SourceEventRecord (or its id) — a bare kind "
+                f"with nothing behind it is not evidence. Got {evidence!r}."
+            )
+
+        return storage.apply_relationship_evidence(
+            relationship_id,
+            kind=kind,
+            signature_id=signature_id,
+            source_event_id=source_event_id,
+            user=self._user,
+        )
 
     def file_fact(
         self,

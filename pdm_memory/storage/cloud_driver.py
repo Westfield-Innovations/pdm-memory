@@ -649,6 +649,41 @@ class CloudDriver(BaseStorage):
             )
         return RelationshipChannelResolution.from_payload(channel)
 
+    def relationship_state(
+        self,
+        source: str,
+        target: str,
+        at_time: datetime | str | None = None,
+        domain: str | None = None,
+        *,
+        user: str = "default",
+    ) -> Any:
+        """
+        Point-in-time state of one relationship pair (spec §4.3).
+
+        GET /api/v1/pdm/relationships/state/?source=&target=&at=&domain=
+        ``at_time`` omitted asks for now; the server refuses one later than
+        its own clock (``AT_FUTURE``) rather than reading yours as authoritative.
+        """
+        from pdm_memory.models import RelationshipState
+
+        path = "/api/v1/pdm/relationships/state/"
+        params: dict[str, Any] = {"source": source, "target": target}
+        stamp = self._stamp(at_time)
+        if stamp is not None:
+            params["at"] = stamp
+        if domain is not None:
+            params["domain"] = domain
+
+        resp = self._get(path, params=params)
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise CloudStorageError(
+                f"Unexpected relationship state body type: {type(data).__name__}",
+                path=path,
+            )
+        return RelationshipState.from_payload(data)
+
     def state_at(
         self,
         field_id: str,
@@ -957,6 +992,38 @@ class CloudDriver(BaseStorage):
         if state:
             payload["state"] = state
         self._patch(f"/api/v1/pdm/relationships/{relationship_id}", payload)
+
+    def apply_relationship_evidence(
+        self,
+        relationship_id: str,
+        *,
+        kind: str,
+        signature_id: str | None = None,
+        source_event_id: str | None = None,
+        user: str = "default",
+    ) -> dict[str, Any]:
+        """
+        Cite an existing signature or source event as reinforcing or
+        contrary evidence toward one relationship's channel (spec §4.4).
+
+        POST /api/v1/pdm/relationships/<id>/evidence
+        Exactly one of *signature_id*/*source_event_id* is required — the
+        server refuses a bare kind with nothing behind it (400
+        ``NO_EVIDENCE_SOURCE``) and refuses both at once (400
+        ``AMBIGUOUS_EVIDENCE_SOURCE``). Resubmitting the same
+        (relationship, kind, citation) triple is refused with 409
+        ``EVIDENCE_ALREADY_APPLIED`` (surfaced as ``CloudConflictError``) —
+        it must not count the same evidence twice.
+        """
+        payload: dict[str, Any] = {"kind": kind}
+        if signature_id is not None:
+            payload["signature_id"] = signature_id
+        if source_event_id is not None:
+            payload["source_event_id"] = source_event_id
+        resp = self._post(
+            f"/api/v1/pdm/relationships/{relationship_id}/evidence", payload
+        )
+        return resp.json()
 
     def related_entities(
         self,
