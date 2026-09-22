@@ -125,10 +125,24 @@ class GeoPass:
     # GeoPass v0.2 §12
     # ------------------------------------------------------------------
 
-    def belongs(self, field_id: str, *, at: datetime | str | None = None) -> bool:
-        """Does the caller hold a live FieldMembership in ``field_id``?"""
+    def belongs(
+        self,
+        field_id: str,
+        *,
+        at: datetime | str | None = None,
+        known_at: datetime | str | None = None,
+    ) -> bool:
+        """
+        Does the caller hold a live FieldMembership in ``field_id``?
+
+        ``known_at`` answers from what was recorded by then, so an end
+        backdated past ``at`` but recorded later does not apply. Needs ``at``.
+        """
+        if known_at is not None and at is None:
+            raise ValueError("known_at requires at")
         data = self._get(
-            "/api/v1/pdm/geopass/belongs/", {"field_id": field_id, "at": _iso(at)}
+            "/api/v1/pdm/geopass/belongs/",
+            {"field_id": field_id, "at": _iso(at), "known_at": _iso(known_at)},
         )
         return bool(data["belongs"])
 

@@ -1,5 +1,6 @@
 """GeoPass SDK client — mocked cloud (spec §5.3)."""
 
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -60,6 +61,25 @@ class TestBelongsCanView:
         assert _geopass().belongs("engineering") is True
         params = mock_get.call_args.kwargs["params"]
         assert params == {"field_id": "engineering"}  # at=None dropped
+
+    @patch("httpx.get")
+    def test_belongs_sends_known_at_beside_at(self, mock_get):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"belongs": True}
+        mock_get.return_value = resp
+        at = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        known = datetime(2026, 9, 10, tzinfo=timezone.utc)
+
+        _geopass().belongs("engineering", at=at, known_at=known)
+
+        params = mock_get.call_args.kwargs["params"]
+        assert params["at"] == at.isoformat()
+        assert params["known_at"] == known.isoformat()
+
+    def test_belongs_refuses_known_at_without_at(self):
+        with pytest.raises(ValueError):
+            _geopass().belongs("engineering", known_at="2026-09-10T00:00:00+00:00")
 
     @patch("httpx.get")
     def test_can_false(self, mock_get):
