@@ -1184,6 +1184,60 @@ class CloudDriver(BaseStorage):
         resp = self._post(f"/api/v1/pdm/source-events/{event_id}/extract", payload)
         return resp.json()
 
+    def save_source_event(self, event: Any, *, payload: str = "") -> str:
+        """
+        POST /api/v1/pdm/source-events — record *event*, or find it.
+
+        The hash is computed here, by the SDK's own contract, and *payload* is
+        never sent: the server keeps no payload, and given one it rehashes
+        with ``occurred_at`` always included — which disagrees with a hash
+        that held a defaulted ``occurred_at`` out, refusing the event as a
+        mismatch. Sets ``event.id`` and ``event.was_deduplicated`` from the
+        server's answer, as the local drivers do.
+        """
+        event.ensure_content_hash(payload=payload)
+        block: dict[str, Any] = {
+            "event_type": event.event_type,
+            "occurred_at": self._iso(event.occurred_at),
+            "observed_at": self._iso(event.observed_at),
+            "source_system": event.source_system,
+            "raw_reference": event.raw_reference,
+            "provenance": dict(event.provenance or {}),
+            "content_hash": event.content_hash,
+            "capture_authority_state": event.capture_authority_state,
+            "compliance_state": event.compliance_state,
+            "source_actor_ids": list(event.source_actor_ids or []),
+        }
+        if event.owner_entity_id:
+            block["owner_entity_id"] = event.owner_entity_id
+
+        data = self._post("/api/v1/pdm/source-events", block).json()
+        event.id = str(data["id"])
+        event.was_deduplicated = bool(data.get("deduplicated"))
+        return event.id
+
+    def attach_signature(
+        self,
+        event_id: str,
+        signature_id: str,
+        *,
+        entities: builtins.list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """
+        POST /api/v1/pdm/source-events/<event_id>/signatures
+
+        Links *signature_id* to the event unless it already came from one
+        (``linked: false`` then, with the event it keeps), and records a
+        mention per entry in *entities*. Returns the server's
+        ``{signature_id, source_event_id, linked, mentions}``.
+        """
+        body: dict[str, Any] = {"signature_id": signature_id}
+        if entities:
+            body["entities"] = entities
+        return self._post(
+            f"/api/v1/pdm/source-events/{event_id}/signatures", body
+        ).json()
+
     def _paginate_field_rows(
         self,
         path: str,

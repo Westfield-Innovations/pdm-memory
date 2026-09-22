@@ -77,16 +77,20 @@ class EventLog:
                 deeper.
 
         A driver may carry one half without the other. ``CloudDriver`` files
-        and links over Companion's field/relationship routes but has no event
-        table of its own — a signature's provenance travels through
-        ``/pdm/ingest``'s own ``source_event`` block, not through this class —
-        so it supports fields and not events. Refusing construction here
-        whenever either half is missing would refuse the half that is present;
-        each event-only and field-only method below asks for its own half
-        instead, through ``_require_events()`` / ``_require_fields()``.
+        and links over Companion's field/relationship routes and can write
+        events there — ``record``, ``ingest`` and ``extract_signatures`` reach
+        Companion's own event routes — but keeps no event table to read back
+        from, so the read side (``get``, ``find_by_hash``, mentions, entities)
+        stays local-only. Refusing construction here whenever either half is
+        missing would refuse the half that is present; each event-only and
+        field-only method below asks for its own half instead, through
+        ``_require_events()`` / ``_require_fields()``.
         """
+        from pdm_memory.storage.cloud_driver import CloudDriver
+
         storage = getattr(memory, "_storage", None)
         self._events_supported = storage_supports_events(storage)
+        self._cloud_events = isinstance(storage, CloudDriver)
         self._fields_supported = bool(
             hasattr(storage, "supports_fields") and storage.supports_fields()
         )
@@ -133,7 +137,8 @@ class EventLog:
 
     def record(self, event: SourceEventRecord, *, payload: str = "") -> str:
         """Store the event, or return the id of the one already storing it."""
-        self._require_events()
+        if not self._cloud_events:
+            self._require_events()
         return self._storage.save_source_event(event, payload=payload)
 
     def get(self, event_id: str) -> SourceEventRecord | None:
@@ -189,7 +194,16 @@ class EventLog:
         Idempotent by default: an event that already has signatures returns
         them rather than extracting a second one. ``force=True`` extracts
         regardless, for a caller correcting a bad first pass.
+
+        Over a ``CloudDriver`` the server does the extraction with its own
+        model, so ``llm_client`` is refused rather than silently unused, and
+        its refusals arrive as the local ones do: ``PayloadMismatch`` for text
+        that is not the event, ``LookupError`` for an event that is not yours.
         """
+        if self._cloud_events:
+            return self._extract_in_cloud(
+                event_id, text, llm_client=llm_client, force=force
+            )
         self._require_events()
         event = self._storage.get_source_event(event_id)
         if event is None:
@@ -243,6 +257,41 @@ class EventLog:
 
         return self._storage.signatures_for_event(event_id, user=self._user)
 
+    def _extract_in_cloud(
+        self,
+        event_id: str,
+        text: str,
+        *,
+        llm_client: Any | None,
+        force: bool,
+    ) -> list[SignatureRecord]:
+        from pdm_memory.storage.errors import CloudNotFoundError, CloudStorageError
+
+        if llm_client is not None:
+            raise ValueError(
+                "extract_signatures over a CloudDriver is done by the server's "
+                "own model; llm_client would go unused."
+            )
+        try:
+            out = self._storage.extract_signatures(
+                event_id, text, force=force, user=self._user
+            )
+        except CloudNotFoundError as exc:
+            raise LookupError(
+                f"no source event {event_id!r} for user {self._user!r}"
+            ) from exc
+        except CloudStorageError as exc:
+            if getattr(exc, "status_code", None) == 422 and "PAYLOAD_MISMATCH" in str(
+                exc
+            ):
+                raise PayloadMismatch(str(exc)) from exc
+            raise
+        records = (
+            self._storage.get(sid, user=self._user)
+            for sid in out.get("signature_ids") or []
+        )
+        return [record for record in records if record is not None]
+
     # ------------------------------------------------------------------
     # The whole flow, in one call
     # ------------------------------------------------------------------
@@ -271,6 +320,10 @@ class EventLog:
         that were already on file under an earlier event — their provenance
         stays with the message that first carried them.
         """
+        if self._cloud_events:
+            return self._ingest_in_cloud(
+                event=event, facts=facts, payload=payload, field_id=field_id
+            )
         self._require_events()
         # No probe before the write. save_source_event is idempotent on the
         # hash and reports on the record whether the store already held the
@@ -319,6 +372,70 @@ class EventLog:
             # field for the mention; leaving the signature unfiled would mean
             # scoped recall fell back to the subject every time, which is the
             # weaker rule and not the one Companion uses.
+            if field_id:
+                self._storage.file_signature_in_field(
+                    memory_id, field_id, user=self._user
+                )
+
+        return {
+            "source_event_id": event_id,
+            "signature_ids": signature_ids,
+            "signatures_reused": reused,
+            "entity_ids": entity_ids,
+            "deduplicated": seen_before,
+        }
+
+    def _ingest_in_cloud(
+        self,
+        *,
+        event: SourceEventRecord,
+        facts: Sequence[dict[str, Any]],
+        payload: str,
+        field_id: str,
+    ) -> dict[str, Any]:
+        """
+        ``ingest`` over a CloudDriver: the same steps, with the server doing
+        the linking. A name in ``about`` travels as a mention payload on the
+        link call, since the cloud keeps no local entity table to resolve it
+        against.
+        """
+        event_id = self.record(event, payload=payload)
+        seen_before = event.was_deduplicated
+
+        signature_ids: list[str] = []
+        entity_ids: dict[str, str] = {}
+        reused = 0
+
+        for fact in facts:
+            spec = dict(fact)
+            text = spec.pop("text")
+            about = spec.pop("about", None)
+
+            memory_id = self._memory.save(text, **spec)
+            signature_ids.append(memory_id)
+
+            entities = []
+            if about:
+                mention: dict[str, Any] = {"surface_form": about}
+                if field_id:
+                    mention["field_id"] = field_id
+                entities.append(mention)
+
+            out = self._storage.attach_signature(event_id, memory_id, entities=entities)
+            if not out.get("linked"):
+                reused += 1
+            if about:
+                resolved = next(
+                    (
+                        m["entity_id"]
+                        for m in out.get("mentions") or []
+                        if m.get("entity_id")
+                    ),
+                    None,
+                )
+                if resolved:
+                    entity_ids[about] = resolved
+
             if field_id:
                 self._storage.file_signature_in_field(
                     memory_id, field_id, user=self._user
@@ -763,7 +880,7 @@ class EventLog:
             raise RuntimeError(
                 f"{type(self._storage).__name__} does not carry source "
                 "events. Use Memory(storage=EventfulSQLiteDriver(...)); "
-                "CloudDriver carries fields and links but no event table of "
-                "its own — a signature's provenance travels through "
-                "/pdm/ingest's source_event block instead."
+                "CloudDriver writes events (record, ingest, "
+                "extract_signatures) but keeps no event table to read them "
+                "back, so this call is local-only."
             )

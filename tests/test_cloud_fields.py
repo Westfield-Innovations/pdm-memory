@@ -2,12 +2,11 @@
 CloudDriver's field/relationship routes, and EventLog over a fields-only
 driver.
 
-CloudDriver carries fields and links over Companion's HTTP routes but no
-event table of its own — a signature's provenance travels through
-``/pdm/ingest``'s ``source_event`` block, not through this class. What matters
-here is the half EventLog now has to get right: a CloudDriver-backed EventLog
-can do everything the field methods promise and refuses, clearly, everything
-the event methods promise that it cannot.
+CloudDriver carries fields and links over Companion's HTTP routes, and writes
+events there too (tests/test_cloud_events.py), but keeps no event table to
+read back from. What matters here is the half EventLog has to get right: a
+CloudDriver-backed EventLog does everything the field methods promise and
+refuses, clearly, the event reads it cannot answer.
 """
 
 from __future__ import annotations
@@ -33,9 +32,7 @@ def _auth() -> JWTAuth:
     import time
 
     payload = (
-        base64.urlsafe_b64encode(
-            json.dumps({"exp": time.time() + 3600}).encode()
-        )
+        base64.urlsafe_b64encode(json.dumps({"exp": time.time() + 3600}).encode())
         .decode()
         .rstrip("=")
     )
@@ -64,18 +61,19 @@ class TestEventLogOverCloudDriver:
     def test_a_cloud_driver_constructs_an_event_log(self):
         _log()  # does not raise
 
-    def test_event_methods_are_refused(self):
+    def test_event_reads_are_refused(self):
+        # record / ingest / extract_signatures write through Companion's event
+        # routes (tests/test_cloud_events.py); there is no event table to read
+        # back, so the reads stay local-only.
         log = _log()
-        # event() only builds an unsaved record; nothing to refuse until a
-        # verb tries to reach the (absent) event table.
-        unsaved = log.event("chat_message")
-        with pytest.raises(RuntimeError, match="does not carry source events"):
-            log.record(unsaved)
-
-    def test_ingest_is_refused_before_any_write(self):
-        log = _log()
-        with pytest.raises(RuntimeError, match="does not carry source events"):
-            log.ingest(event=None, facts=[])
+        for call in (
+            lambda: log.get("e-1"),
+            lambda: log.find_by_hash("h"),
+            lambda: log.signatures_for("e-1"),
+            lambda: log.events(),
+        ):
+            with pytest.raises(RuntimeError, match="does not carry source events"):
+                call()
 
     def test_mention_confirm_and_entities_are_refused(self):
         log = _log()
@@ -88,7 +86,6 @@ class TestEventLogOverCloudDriver:
             lambda: log.entity("e-1"),
             lambda: log.about("e-1"),
             lambda: log.merge("e-1", "e-2"),
-            lambda: log.extract_signatures("e-1", "text"),
         ):
             with pytest.raises(RuntimeError, match="does not carry source events"):
                 call()
@@ -160,9 +157,7 @@ class TestFileAndUnfileFact:
 
     @patch("httpx.post")
     def test_filing_the_same_field_twice_raises_the_specific_conflict(self, mock_post):
-        mock_post.return_value = _resp(
-            409, {"error_code": "MEMBERSHIP_REFUSED"}
-        )
+        mock_post.return_value = _resp(409, {"error_code": "MEMBERSHIP_REFUSED"})
 
         with pytest.raises(CloudConflictError) as exc:
             _log().file_fact("sig-1", "westfield")
@@ -369,9 +364,7 @@ class TestRelationshipEvidence:
     def test_resubmitting_the_same_evidence_raises_the_specific_conflict(
         self, mock_post
     ):
-        mock_post.return_value = _resp(
-            409, {"error_code": "EVIDENCE_ALREADY_APPLIED"}
-        )
+        mock_post.return_value = _resp(409, {"error_code": "EVIDENCE_ALREADY_APPLIED"})
         relationship = RelationshipRecord(
             id="rel-1",
             source_entity_id="subject:1",
