@@ -71,6 +71,8 @@ from pdm_memory.models import (
     AlignmentReport,
     FieldStateSnapshot,
     MemoryListPage,
+    ProjectionFan,
+    RecordedProjection,
     RelationshipChannelResolution,
     RelationshipState,
     SurfaceReport,
@@ -1915,6 +1917,72 @@ class Memory:
             after=cursor,
             limit=limit,
             user=self._user,
+        )
+
+    def project(
+        self,
+        *,
+        horizon_days: int | None = None,
+        record: bool = False,
+    ) -> ProjectionFan:
+        """
+        The caller's forward fan — spec §7's ``project`` (ecosystem / cloud only).
+
+        Thin client over Companion ``POST /api/v1/pdm/field-state/projection/``.
+        Every branch is ``state_type="projected"`` and arrives as a
+        :class:`ProjectionFan`, a type unrelated to :class:`FieldStateSnapshot`.
+
+        §7 names ``project(field_id, horizon, constraints)``. There is no
+        ``field_id`` here because the fan is built per domain off the
+        observer's own channel, not per field, and the server takes none —
+        accepting one would mean silently ignoring it. ``horizon_days`` is the
+        only constraint the server honours, so it is a keyword rather than a
+        dict whose other keys would go nowhere.
+
+        ``record=True`` persists the fan so it can later be settled with
+        :meth:`record_outcome`; see :class:`ProjectionFan` for why
+        ``projection_ids`` can be empty on a same-day repeat.
+        """
+        return self._require_cloud("project").project(
+            horizon_days=horizon_days, record=record
+        )
+
+    def projection(self, projection_id: str) -> RecordedProjection:
+        """
+        One recorded projection branch, with its outcome once settled
+        (ecosystem / cloud only). Someone else's projection reads as not found.
+        """
+        return self._require_cloud("projection").projection(projection_id)
+
+    def record_outcome(
+        self,
+        projection_id: str,
+        observed_at: datetime | str,
+        connection_geometry: str,
+        meaning_propagation: str,
+        model_update: str = "",
+    ) -> RecordedProjection:
+        """
+        Settle a recorded projection against what actually happened (spec
+        §13, ecosystem / cloud only).
+
+        ``connection_geometry`` and ``meaning_propagation`` are each
+        ``"correct"``, ``"partial"`` or ``"incorrect"``. ``timing`` is not a
+        parameter: the server derives early / within / late from
+        ``observed_at`` against the projection's own window.
+
+        A projection settles once: a second outcome raises
+        ``CloudConflictError`` (``error_code="ALREADY_SETTLED"``), one observed
+        before the projection was made raises ``CloudStorageError`` with
+        ``status_code=422``, and an unknown or foreign id raises
+        ``CloudNotFoundError``.
+        """
+        return self._require_cloud("record_outcome").record_outcome(
+            projection_id,
+            observed_at=observed_at,
+            connection_geometry=connection_geometry,
+            meaning_propagation=meaning_propagation,
+            model_update=model_update,
         )
 
     def count(self) -> int:

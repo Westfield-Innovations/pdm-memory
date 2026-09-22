@@ -275,6 +275,53 @@ log.apply_contrary_evidence(relationship, evidence="sig-2")
 | Reinforcing evidence, on a memory (unchanged) | `EventLog.reinforce(memory_id_or_record)` → `Memory.reinforce` |
 | Contrary evidence, on a memory (unchanged) | `EventLog.apply_contrary_evidence(memory_id_or_record, evidence)` → `Memory.apply_contrary_evidence` |
 
+### Projections
+
+A forward fan of where your channel is heading, and — once time has passed —
+how it turned out.
+
+```python
+from datetime import datetime, timezone
+
+fan = mem.project()                     # the fan now; nothing is written
+fan = mem.project(horizon_days=30)      # narrower window, clamped to the server's reach
+fan = mem.project(record=True)          # persist it so it can be scored later
+
+for branch in fan.branches:
+    branch.state_type                   # always "projected"
+    branch.confidence_band["weight"]    # this branch's share of the fan
+    branch.timing_range                 # {"start", "end"} — a window, never a point
+    branch.invalidation_conditions      # what would make it wrong
+
+# Later: settle one recorded branch against what actually happened.
+settled = mem.record_outcome(
+    fan.projection_ids[0],
+    observed_at=datetime.now(timezone.utc),
+    connection_geometry="correct",      # "correct" | "partial" | "incorrect"
+    meaning_propagation="partial",
+)
+settled.outcome.timing                  # "early" | "within" | "late" — derived by the server
+
+mem.projection(settled.id)              # read it back, with its outcome
+```
+
+- **Cloud only.** The fan is built from the observer's channel, which lives
+  in Companion.
+- **A different type from a field state.** `ProjectionFan` and
+  `RecordedProjection` share no base class with `FieldStateSnapshot`, and a
+  payload whose items do not say `state_type="projected"` is refused rather
+  than typed as a projection.
+- **Not field-scoped.** Spec §7 names `project(field_id, horizon,
+  constraints)`; the fan is built per domain, not per field, so there is no
+  `field_id` to pass, and `horizon_days` is the one constraint the server honours.
+- **Recorded once a day.** With `record=True`, `projection_ids` is empty on a
+  repeat the same UTC day — that fan is already on file.
+- **Settles once.** A second outcome raises `CloudConflictError`
+  (`error_code="ALREADY_SETTLED"`); an outcome observed before the projection
+  was made raises `CloudStorageError` with `status_code=422`; someone else's
+  projection reads as `CloudNotFoundError`. `timing` is never sent — the
+  server derives it from `observed_at`.
+
 ### Sync Local ↔ Cloud
 
 ```python

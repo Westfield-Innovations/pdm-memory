@@ -463,6 +463,230 @@ class Trajectory:
         }
 
 
+def _require_projected(payload: dict[str, Any], what: str) -> str:
+    """
+    §13 asks for a projection to stay distinct from measured history
+    "visibly and programmatically": a payload that does not say
+    ``projected`` is refused rather than typed as a projection anyway.
+    """
+    state_type = payload.get("state_type")
+    if state_type != "projected":
+        raise ValueError(
+            f"{what} arrived with state_type={state_type!r}; a projection "
+            "that does not declare itself projected cannot be told apart "
+            "from measured history."
+        )
+    return state_type
+
+
+@dataclass(slots=True)
+class ProjectionBranch:
+    """
+    One branch of a forward fan (spec §4.6), mirroring Companion's item.
+
+    ``confidence_band`` carries ``weight`` (this branch's share of the fan),
+    ``confidence``, ``bfr`` and ``is_currently_blackout``; ``timing_range``
+    is always a window, never a point. ``ghost_nodes`` is empty on every
+    server today — nothing derives projected entities, by design.
+    """
+
+    branch_id: str
+    domain: str
+    kind: str
+    horizon_days: int
+    base_state_version: str
+    confidence_band: dict[str, Any]
+    timing_range: dict[str, Any]
+    invalidation_conditions: list[str]
+    ghost_nodes: list[dict[str, Any]]
+    ghost_relationships: list[dict[str, Any]]
+    state_type: str
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> ProjectionBranch:
+        return cls(
+            branch_id=str(payload.get("branch_id", "")),
+            domain=str(payload.get("domain", "")),
+            kind=str(payload.get("kind", "")),
+            horizon_days=int(payload.get("horizon_days") or 0),
+            base_state_version=str(payload.get("base_state_version") or ""),
+            confidence_band=dict(payload.get("confidence_band") or {}),
+            timing_range=dict(payload.get("timing_range") or {}),
+            invalidation_conditions=[
+                str(c) for c in payload.get("invalidation_conditions") or []
+            ],
+            ghost_nodes=[dict(n) for n in payload.get("ghost_nodes") or []],
+            ghost_relationships=[
+                dict(r) for r in payload.get("ghost_relationships") or []
+            ],
+            state_type=_require_projected(payload, "projection branch"),
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "branch_id": self.branch_id,
+            "domain": self.domain,
+            "kind": self.kind,
+            "horizon_days": self.horizon_days,
+            "base_state_version": self.base_state_version,
+            "confidence_band": dict(self.confidence_band),
+            "timing_range": dict(self.timing_range),
+            "invalidation_conditions": list(self.invalidation_conditions),
+            "ghost_nodes": [dict(n) for n in self.ghost_nodes],
+            "ghost_relationships": [dict(r) for r in self.ghost_relationships],
+            "state_type": self.state_type,
+        }
+
+
+@dataclass(slots=True)
+class ProjectionFan:
+    """
+    The caller's forward fan from ``Memory.project`` (spec §7).
+
+    A separate type from ``FieldStateSnapshot`` on purpose, sharing no base
+    class: ``isinstance`` alone tells a projection from a measured state.
+
+    ``projection_ids`` lists the rows this call wrote. With ``record=True``
+    it can still be empty: the server records one fan per subject, domain
+    and kind per UTC day, and a repeat the same day writes nothing.
+    """
+
+    branches: list[ProjectionBranch] = field(default_factory=list)
+    record: bool = False
+    projection_ids: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> ProjectionFan:
+        return cls(
+            branches=[
+                ProjectionBranch.from_payload(b) for b in payload.get("branches") or []
+            ],
+            record=bool(payload.get("record", False)),
+            projection_ids=[str(i) for i in payload.get("projection_ids") or []],
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "branches": [b.as_dict() for b in self.branches],
+            "record": self.record,
+            "projection_ids": list(self.projection_ids),
+        }
+
+
+@dataclass(slots=True)
+class ProjectionOutcomeRecord:
+    """
+    What actually happened, set against a recorded projection (spec §13).
+
+    ``timing`` (``early`` / ``within`` / ``late``) is derived by the server
+    from ``observed_at`` against the projection's own window — never sent.
+    """
+
+    id: str
+    observed_at: str
+    recorded_at: str
+    timing: str
+    connection_geometry: str
+    meaning_propagation: str
+    model_update: str
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> ProjectionOutcomeRecord:
+        return cls(
+            id=str(payload.get("id", "")),
+            observed_at=str(payload.get("observed_at", "")),
+            recorded_at=str(payload.get("recorded_at", "")),
+            timing=str(payload.get("timing", "")),
+            connection_geometry=str(payload.get("connection_geometry", "")),
+            meaning_propagation=str(payload.get("meaning_propagation", "")),
+            model_update=str(payload.get("model_update") or ""),
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "observed_at": self.observed_at,
+            "recorded_at": self.recorded_at,
+            "timing": self.timing,
+            "connection_geometry": self.connection_geometry,
+            "meaning_propagation": self.meaning_propagation,
+            "model_update": self.model_update,
+        }
+
+
+@dataclass(slots=True)
+class RecordedProjection:
+    """
+    One persisted projection branch, with its outcome once settled.
+
+    From ``Memory.projection`` and ``Memory.record_outcome``. ``outcome`` is
+    None until something records what happened; a projection settles once.
+    """
+
+    id: str
+    subject_ref: str
+    domain: str
+    branch_kind: str
+    weight: float
+    confidence: float | None
+    bfr: float | None
+    projected_at: str
+    horizon_start: str
+    horizon_end: str
+    invalidation_conditions: list[str]
+    base_state_version: str
+    state_type: str
+    outcome: ProjectionOutcomeRecord | None = None
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> RecordedProjection:
+        outcome = payload.get("outcome")
+        return cls(
+            id=str(payload.get("id", "")),
+            subject_ref=str(payload.get("subject_ref", "")),
+            domain=str(payload.get("domain", "")),
+            branch_kind=str(payload.get("branch_kind", "")),
+            weight=float(payload.get("weight") or 0.0),
+            confidence=(
+                float(payload["confidence"])
+                if payload.get("confidence") is not None
+                else None
+            ),
+            bfr=float(payload["bfr"]) if payload.get("bfr") is not None else None,
+            projected_at=str(payload.get("projected_at", "")),
+            horizon_start=str(payload.get("horizon_start", "")),
+            horizon_end=str(payload.get("horizon_end", "")),
+            invalidation_conditions=[
+                str(c) for c in payload.get("invalidation_conditions") or []
+            ],
+            base_state_version=str(payload.get("base_state_version") or ""),
+            state_type=_require_projected(payload, "recorded projection"),
+            outcome=(
+                ProjectionOutcomeRecord.from_payload(outcome)
+                if isinstance(outcome, dict)
+                else None
+            ),
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "subject_ref": self.subject_ref,
+            "domain": self.domain,
+            "branch_kind": self.branch_kind,
+            "weight": self.weight,
+            "confidence": self.confidence,
+            "bfr": self.bfr,
+            "projected_at": self.projected_at,
+            "horizon_start": self.horizon_start,
+            "horizon_end": self.horizon_end,
+            "invalidation_conditions": list(self.invalidation_conditions),
+            "base_state_version": self.base_state_version,
+            "state_type": self.state_type,
+            "outcome": self.outcome.as_dict() if self.outcome else None,
+        }
+
+
 @dataclass(slots=True)
 class SurfaceReport:
     """

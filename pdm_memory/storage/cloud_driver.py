@@ -767,6 +767,79 @@ class CloudDriver(BaseStorage):
         return Trajectory.from_payload(data)
 
     # ------------------------------------------------------------------
+    # Projections — the forward fan and its settlement (spec §4.6, §13)
+    # ------------------------------------------------------------------
+
+    def project(self, *, horizon_days: int | None = None, record: bool = False) -> Any:
+        """
+        POST /api/v1/pdm/field-state/projection/
+
+        The caller's own fan. ``horizon_days`` narrows the window and is
+        clamped to the server's reach; ``record=True`` persists it.
+        """
+        from pdm_memory.models import ProjectionFan
+
+        path = "/api/v1/pdm/field-state/projection/"
+        payload: dict[str, Any] = {"record": bool(record)}
+        if horizon_days is not None:
+            payload["horizon_days"] = horizon_days
+
+        data = self._post(path, payload).json()
+        if not isinstance(data, dict):
+            raise CloudStorageError(
+                f"Unexpected projection body type: {type(data).__name__}",
+                path=path,
+            )
+        return ProjectionFan.from_payload(data)
+
+    def projection(self, projection_id: str) -> Any:
+        """GET /api/v1/pdm/projections/<id> — one recorded branch, with its outcome."""
+        from pdm_memory.models import RecordedProjection
+
+        path = f"/api/v1/pdm/projections/{projection_id}"
+        data = self._get(path).json()
+        if not isinstance(data, dict):
+            raise CloudStorageError(
+                f"Unexpected projection body type: {type(data).__name__}",
+                path=path,
+            )
+        return RecordedProjection.from_payload(data)
+
+    def record_outcome(
+        self,
+        projection_id: str,
+        *,
+        observed_at: datetime | str,
+        connection_geometry: str,
+        meaning_propagation: str,
+        model_update: str = "",
+    ) -> Any:
+        """
+        POST /api/v1/pdm/projections/<id>/outcome
+
+        No ``timing``: the server derives it from ``observed_at`` against the
+        projection's own window and refuses to take it from the caller.
+        """
+        from pdm_memory.models import RecordedProjection
+
+        path = f"/api/v1/pdm/projections/{projection_id}/outcome"
+        data = self._post(
+            path,
+            {
+                "observed_at": self._stamp(observed_at),
+                "connection_geometry": connection_geometry,
+                "meaning_propagation": meaning_propagation,
+                "model_update": model_update,
+            },
+        ).json()
+        if not isinstance(data, dict):
+            raise CloudStorageError(
+                f"Unexpected outcome body type: {type(data).__name__}",
+                path=path,
+            )
+        return RecordedProjection.from_payload(data)
+
+    # ------------------------------------------------------------------
     # Fields and links — who belongs where, and beside whom (TKT-102-B)
     # ------------------------------------------------------------------
 
