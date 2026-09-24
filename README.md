@@ -56,7 +56,7 @@ pip install "pdm-memory[all]"
 from pdm_memory import Memory
 
 # One line to start. The .db file is created automatically.
-mem = Memory(store="./my_app_memory.db")
+mem = Memory(store="./my_app_memory.db", user="alice")
 
 # Write: PDM assigns pressure and stores a signature.
 # Optional shape: ephemeral (2h) / behavioral (90d) / structural (∞).
@@ -99,7 +99,7 @@ print(f"Decayed: {counts['decayed']}, Deleted: {counts['deleted']}")
 Store only SHA-256 hashes of memory text — the content never touches disk:
 
 ```python
-mem = Memory(store="./private.db", store_raw=False)
+mem = Memory(store="./private.db", user="alice", store_raw=False)
 ```
 
 ---
@@ -143,7 +143,7 @@ access_token = data["tokens"]["access"]
 refresh_token = data["tokens"]["refresh"]
 ```
 
-Use the returned JWTs directly with `Memory(store="cloud", ...)`:
+Use the returned JWTs directly with `Memory(store="cloud", user=..., ...)`:
 
 ### Connect to the Cloud
 
@@ -232,7 +232,7 @@ methods below read and reinforce that link's channel over time.
 from pdm_memory import Memory
 from pdm_memory.event_log import EventLog
 
-mem = Memory(store="cloud", token="eyJ...")
+mem = Memory(store="cloud", user="alice", token="eyJ...")
 log = EventLog(mem)
 
 relationship_id = log.link("subject:1", "entity:abc-123", "colleague")
@@ -326,7 +326,7 @@ mem.projection(settled.id)              # read it back, with its outcome
 
 ```python
 # Start with a local store
-local_mem = Memory(store="./local.db")
+local_mem = Memory(store="./local.db", user="alice")
 local_mem.save("Local preference", tags=["pref", "local", "test"])
 
 # Push local memories to cloud
@@ -369,7 +369,7 @@ The wrapper is the demo; the primitives are the product. Most developers start h
 from pdm_memory import Memory
 from pdm_memory.integrations import wrap_openai
 
-mem = Memory(store="./my_app.db")
+mem = Memory(store="./my_app.db", user="alice")
 client = wrap_openai(api_key="sk-...", memory=mem)
 
 # Memory is handled completely invisibly:
@@ -440,7 +440,7 @@ When goals already live in a PDM store, `Memory.verify_alignment()` is the same 
 ```python
 from pdm_memory import Memory
 
-mem = Memory(store="./agent.db")
+mem = Memory(store="./agent.db", user="alice")
 
 # Goal signatures live in stewardship / foundational drawers.
 mem.save(
@@ -564,7 +564,7 @@ Inline smoke test:
 ```bash
 python -c "
 from pdm_memory import Memory
-mem = Memory(store='./demo.db')
+mem = Memory(store='./demo.db', user='alice')
 mem.save('User prefers metric units and short answers', source='demo',
          tags=['units', 'formatting', 'preferences'], p_magnitude=85)
 for h in mem.recall('how should I format the answer?', k=3):
@@ -717,7 +717,9 @@ Store-free Goal-Anchor Alignment. Pass a proposed action and one or more rule st
 
 Use `report.is_safe_to_act` (True only when `status == "ALIGNED"`) before triggering ACT.
 
-### `Memory(store, user, token, refresh_token, cloud_url, store_raw)`
+### `Memory(store, *, user, token, refresh_token, cloud_url, store_raw)`
+
+`user` is required and keyword-only. Against a cloud store it must be the username the token belongs to: the server takes the owner from the token and refuses a payload naming anyone else.
 
 | Method | Description |
 |--------|-------------|
