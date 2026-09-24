@@ -173,7 +173,7 @@ class TestDialectParity:
         )
         assert '"user"' in insert
         assert "?" not in insert
-        assert insert.count("%s") == 12
+        assert insert.count("%s") == 14
 
     def test_entity_creation_never_reads_a_row_positionally(self, pg_host):
         """
@@ -205,15 +205,15 @@ class TestDialectParity:
 
 @pytest.fixture()
 def log(tmp_path: pathlib.Path):
-    mem = Memory(storage=EventfulSQLiteDriver(db_path=str(tmp_path / "log.db")))
+    mem = Memory(storage=EventfulSQLiteDriver(db_path=str(tmp_path / "log.db")), user="default")
     yield EventLog(mem)
     mem.close()
 
 
 class TestEventLog:
-    def test_refuses_a_driver_without_events(self, tmp_path):
-        mem = Memory(storage=SQLiteDriver(db_path=str(tmp_path / "plain.db")))
-        with pytest.raises(RuntimeError, match="does not carry source events"):
+    def test_refuses_a_driver_with_neither_events_nor_fields(self, tmp_path):
+        mem = Memory(storage=SQLiteDriver(db_path=str(tmp_path / "plain.db")), user="default")
+        with pytest.raises(RuntimeError, match="carries neither source events nor field"):
             EventLog(mem)
         mem.close()
 

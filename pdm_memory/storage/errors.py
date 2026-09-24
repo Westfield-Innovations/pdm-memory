@@ -24,3 +24,27 @@ class CloudStorageError(RuntimeError):
 
 class CloudNotFoundError(CloudStorageError):
     """Resource does not exist (HTTP 404). ``get()`` maps this to ``None``."""
+
+
+class CloudConflictError(CloudStorageError):
+    """
+    The server refused a write because a live row already occupies its scope
+    (HTTP 409) — a second open membership, filing or link where at most one
+    may be live at a time.
+
+    ``error_code`` carries the server's own code (``MEMBERSHIP_REFUSED``,
+    ``RELATIONSHIP_REFUSED``, ``MEMBERSHIP_ALREADY_CLOSED``, …) when the body
+    supplied one, so a caller can react to which conflict this was rather than
+    parsing prose out of the message.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str | None = None,
+        status_code: int = 409,
+        path: str | None = None,
+    ) -> None:
+        super().__init__(message, status_code=status_code, path=path)
+        self.error_code = error_code

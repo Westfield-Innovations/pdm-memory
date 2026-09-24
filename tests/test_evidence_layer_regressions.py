@@ -27,7 +27,7 @@ def driver(tmp_path):
 
 @pytest.fixture()
 def log(tmp_path):
-    mem = Memory(storage=EventfulSQLiteDriver(db_path=str(tmp_path / "log.db")))
+    mem = Memory(storage=EventfulSQLiteDriver(db_path=str(tmp_path / "log.db")), user="default")
     yield EventLog(mem)
     mem.close()
 
@@ -580,6 +580,8 @@ class TestMappersStayInStepWithTheRecords:
                     raw_reference="gmail:1",
                     capture_authority_state="granted",
                     compliance_state="reviewed",
+                    source_actor_ids=["subject:1"],
+                    owner_entity_id="subject:1",
                 ),
                 payload="hello",
             )

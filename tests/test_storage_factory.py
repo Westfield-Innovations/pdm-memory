@@ -83,7 +83,7 @@ class TestStorageFactory:
 
     def test_memory_rejects_invalid_storage(self):
         with pytest.raises(TypeError, match="BaseStorage"):
-            Memory(storage=object())  # type: ignore[arg-type]
+            Memory(storage=object(), user="default")  # type: ignore[arg-type]
 
     def test_cloud_requires_token(self):
         with pytest.raises(ValueError, match="token"):

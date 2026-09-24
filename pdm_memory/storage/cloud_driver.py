@@ -20,14 +20,18 @@ from __future__ import annotations
 import builtins
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from pdm_memory.auth.jwt_handler import JWTAuth
 from pdm_memory.core.math import MEMORY_SHAPE_KEY
 from pdm_memory.core.signature import DrawerInfo, SignatureRecord
 from pdm_memory.storage.base import BaseStorage, SaveBatchResult, UpdateBatchResult
-from pdm_memory.storage.errors import CloudNotFoundError, CloudStorageError
+from pdm_memory.storage.errors import (
+    CloudConflictError,
+    CloudNotFoundError,
+    CloudStorageError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -645,6 +649,41 @@ class CloudDriver(BaseStorage):
             )
         return RelationshipChannelResolution.from_payload(channel)
 
+    def relationship_state(
+        self,
+        source: str,
+        target: str,
+        at_time: datetime | str | None = None,
+        domain: str | None = None,
+        *,
+        user: str = "default",
+    ) -> Any:
+        """
+        Point-in-time state of one relationship pair (spec §4.3).
+
+        GET /api/v1/pdm/relationships/state/?source=&target=&at=&domain=
+        ``at_time`` omitted asks for now; the server refuses one later than
+        its own clock (``AT_FUTURE``) rather than reading yours as authoritative.
+        """
+        from pdm_memory.models import RelationshipState
+
+        path = "/api/v1/pdm/relationships/state/"
+        params: dict[str, Any] = {"source": source, "target": target}
+        stamp = self._stamp(at_time)
+        if stamp is not None:
+            params["at"] = stamp
+        if domain is not None:
+            params["domain"] = domain
+
+        resp = self._get(path, params=params)
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise CloudStorageError(
+                f"Unexpected relationship state body type: {type(data).__name__}",
+                path=path,
+            )
+        return RelationshipState.from_payload(data)
+
     def state_at(
         self,
         field_id: str,
@@ -687,6 +726,567 @@ class CloudDriver(BaseStorage):
             limit=limit,
             envelope=envelope,
         )
+
+    def trajectory(
+        self,
+        subject_id: str,
+        start: datetime,
+        end: datetime,
+        *,
+        after: str | None = None,
+        limit: int | None = None,
+        user: str = "default",
+    ) -> Any:
+        """
+        The ordered transitions for a field or entity over a time window.
+
+        GET /api/v1/pdm/field-state/trajectory/?subject_id=&start=&end=&cursor=&page_size=
+        Self-view only on the server today: an entity ``subject_id`` must be
+        the caller's own — see that endpoint's own docstring for why.
+        """
+        from pdm_memory.models import Trajectory
+
+        path = "/api/v1/pdm/field-state/trajectory/"
+        params: dict[str, Any] = {
+            "subject_id": subject_id,
+            "start": self._iso(start),
+            "end": self._iso(end),
+        }
+        if after:
+            params["cursor"] = after
+        if limit is not None:
+            params["page_size"] = limit
+
+        resp = self._get(path, params=params)
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise CloudStorageError(
+                f"Unexpected trajectory body type: {type(data).__name__}",
+                path=path,
+            )
+        return Trajectory.from_payload(data)
+
+    # ------------------------------------------------------------------
+    # Projections — the forward fan and its settlement (spec §4.6, §13)
+    # ------------------------------------------------------------------
+
+    def project(self, *, horizon_days: int | None = None, record: bool = False) -> Any:
+        """
+        POST /api/v1/pdm/field-state/projection/
+
+        The caller's own fan. ``horizon_days`` narrows the window and is
+        clamped to the server's reach; ``record=True`` persists it.
+        """
+        from pdm_memory.models import ProjectionFan
+
+        path = "/api/v1/pdm/field-state/projection/"
+        payload: dict[str, Any] = {"record": bool(record)}
+        if horizon_days is not None:
+            payload["horizon_days"] = horizon_days
+
+        data = self._post(path, payload).json()
+        if not isinstance(data, dict):
+            raise CloudStorageError(
+                f"Unexpected projection body type: {type(data).__name__}",
+                path=path,
+            )
+        return ProjectionFan.from_payload(data)
+
+    def projection(self, projection_id: str) -> Any:
+        """GET /api/v1/pdm/projections/<id> — one recorded branch, with its outcome."""
+        from pdm_memory.models import RecordedProjection
+
+        path = f"/api/v1/pdm/projections/{projection_id}"
+        data = self._get(path).json()
+        if not isinstance(data, dict):
+            raise CloudStorageError(
+                f"Unexpected projection body type: {type(data).__name__}",
+                path=path,
+            )
+        return RecordedProjection.from_payload(data)
+
+    def record_outcome(
+        self,
+        projection_id: str,
+        *,
+        observed_at: datetime | str,
+        connection_geometry: str,
+        meaning_propagation: str,
+        model_update: str = "",
+    ) -> Any:
+        """
+        POST /api/v1/pdm/projections/<id>/outcome
+
+        No ``timing``: the server derives it from ``observed_at`` against the
+        projection's own window and refuses to take it from the caller.
+        """
+        from pdm_memory.models import RecordedProjection
+
+        path = f"/api/v1/pdm/projections/{projection_id}/outcome"
+        data = self._post(
+            path,
+            {
+                "observed_at": self._stamp(observed_at),
+                "connection_geometry": connection_geometry,
+                "meaning_propagation": meaning_propagation,
+                "model_update": model_update,
+            },
+        ).json()
+        if not isinstance(data, dict):
+            raise CloudStorageError(
+                f"Unexpected outcome body type: {type(data).__name__}",
+                path=path,
+            )
+        return RecordedProjection.from_payload(data)
+
+    # ------------------------------------------------------------------
+    # Fields and links — who belongs where, and beside whom (TKT-102-B)
+    # ------------------------------------------------------------------
+
+    def supports_fields(self) -> bool:
+        return True
+
+    @staticmethod
+    def _stamp(value: datetime | str | None) -> str | None:
+        """
+        ``valid_from`` / ``valid_to`` / ``at`` arrive as ``datetime | str | None``
+        on the ``EventLog`` surface — unlike ``_iso``, which only ever sees a
+        ``datetime`` — so a caller passing an already-ISO string is not forced
+        through a parse just to be reserialised.
+        """
+        if value is None:
+            return None
+        return value.isoformat() if isinstance(value, datetime) else str(value)
+
+    def add_field_membership(
+        self,
+        entity_id: str,
+        field_id: str,
+        valid_from: datetime | str | None = None,
+        valid_to: datetime | str | None = None,
+        *,
+        role: str = "",
+        derived_by: str = "sdk",
+        user: str = "default",
+    ) -> str:
+        """
+        POST /api/v1/pdm/field-memberships.
+
+        The server accepts only the caller's own subject as ``entity_id`` —
+        recording someone else's membership is an authority event, not a
+        declaration — so this succeeds only when *entity_id* names the
+        token's own subject. ``derived_by`` has no field on this route; the
+        server always treats a self-declared membership as the caller's own.
+        """
+        payload: dict[str, Any] = {"entity_id": entity_id, "field_id": field_id}
+        if role:
+            payload["role"] = role
+        stamp = self._stamp(valid_from)
+        if stamp is not None:
+            payload["valid_from"] = stamp
+        stamp = self._stamp(valid_to)
+        if stamp is not None:
+            payload["valid_to"] = stamp
+        resp = self._post("/api/v1/pdm/field-memberships", payload)
+        return str(resp.json()["id"])
+
+    def end_field_membership(
+        self,
+        membership_id: str,
+        at: datetime | str | None = None,
+        *,
+        state: str = "expired",
+        user: str = "default",
+    ) -> None:
+        """
+        No route. Companion deliberately exposes no HTTP surface for closing a
+        ``FieldMembership`` — closing one is an authority event
+        (``employment_end``, ``role_change``, …), applied through
+        ``pdm.services.authority.apply()`` server-side, not a declaration a
+        client can make for itself. Use the local drivers, or close it through
+        Companion's own authority-event path.
+        """
+        raise NotImplementedError(
+            "end_field_membership has no cloud route — closing a FieldMembership "
+            "is an authority event on the server, not something this client can "
+            "declare. See Companion's pdm.services.authority."
+        )
+
+    def file_signature_in_field(
+        self,
+        signature_id: str,
+        field_id: str,
+        valid_from: datetime | str | None = None,
+        valid_to: datetime | str | None = None,
+        *,
+        weight: float = 1.0,
+        confidence: float = 1.0,
+        derived_by: str = "sdk",
+        user: str = "default",
+    ) -> str:
+        """POST /api/v1/pdm/signature-field-memberships."""
+        payload: dict[str, Any] = {
+            "signature_id": signature_id,
+            "field_id": field_id,
+            "weight": weight,
+            "confidence": confidence,
+            "derived_by": derived_by,
+        }
+        stamp = self._stamp(valid_from)
+        if stamp is not None:
+            payload["valid_from"] = stamp
+        stamp = self._stamp(valid_to)
+        if stamp is not None:
+            payload["valid_to"] = stamp
+        resp = self._post("/api/v1/pdm/signature-field-memberships", payload)
+        return str(resp.json()["id"])
+
+    def unfile_signature(
+        self,
+        membership_id: str,
+        at: datetime | str | None = None,
+        *,
+        user: str = "default",
+    ) -> None:
+        """
+        PATCH /api/v1/pdm/signature-field-memberships/<id>.
+
+        ``at`` defaults to now, same as the local drivers — the server's own
+        serializer requires ``valid_to`` in the body, so an omitted ``at`` has
+        to be resolved before the request rather than left for the server to
+        fill in.
+        """
+        payload = {"valid_to": self._stamp(at) or self._stamp(datetime.now(timezone.utc))}
+        self._patch(
+            f"/api/v1/pdm/signature-field-memberships/{membership_id}", payload
+        )
+
+    def signature_fields(
+        self,
+        signature_id: str,
+        at: datetime | str | None = None,
+        *,
+        user: str = "default",
+    ) -> builtins.list[str]:
+        """GET /api/v1/pdm/signature-field-memberships?signature_id=&at=."""
+        rows = self._paginate_field_rows(
+            "/api/v1/pdm/signature-field-memberships",
+            key="signature_field_memberships",
+            params={"signature_id": signature_id},
+            at=at,
+        )
+        return sorted({str(row["field_id"]) for row in rows if "field_id" in row})
+
+    def fields_of(
+        self,
+        entity_id: str,
+        at: datetime | str | None = None,
+        *,
+        user: str = "default",
+    ) -> builtins.list[str]:
+        """
+        GET /api/v1/pdm/field-memberships?entity_id=&at=.
+
+        Answers only for the caller's own subject: Companion refuses
+        ``entity_id`` naming anyone else with ``ENTITY_NOT_ACCEPTED`` rather
+        than answering with someone else's memberships.
+        """
+        rows = self._paginate_field_rows(
+            "/api/v1/pdm/field-memberships",
+            key="field_memberships",
+            params={"entity_id": entity_id},
+            at=at,
+        )
+        return sorted({str(row["field_id"]) for row in rows if "field_id" in row})
+
+    def members_of(
+        self,
+        field_id: str,
+        at: datetime | str | None = None,
+        *,
+        user: str = "default",
+    ) -> builtins.list[str]:
+        """
+        No route. ``GET .../field-memberships`` answers only the caller's own
+        record, deliberately: a field has a roster nowhere in Companion's API,
+        and "who else is in this field" needs an authorisation model this
+        route does not carry. See ``ARCH-REG-006``'s open gap on the point.
+        """
+        raise NotImplementedError(
+            "members_of has no cloud route — GET .../field-memberships answers "
+            "only the caller's own membership, never a field's roster."
+        )
+
+    def link(
+        self,
+        source_entity_id: str,
+        target_entity_id: str,
+        relationship_type: str,
+        directionality: str = "directed",
+        valid_from: datetime | str | None = None,
+        valid_to: datetime | str | None = None,
+        *,
+        state: str = "active",
+        derived_by: str = "sdk",
+        user: str = "default",
+    ) -> str:
+        """POST /api/v1/pdm/relationships."""
+        payload: dict[str, Any] = {
+            "source_entity_id": source_entity_id,
+            "target_entity_id": target_entity_id,
+            "relationship_type": relationship_type,
+            "directionality": directionality,
+            "derived_by": derived_by,
+        }
+        stamp = self._stamp(valid_from)
+        if stamp is not None:
+            payload["valid_from"] = stamp
+        stamp = self._stamp(valid_to)
+        if stamp is not None:
+            payload["valid_to"] = stamp
+        resp = self._post("/api/v1/pdm/relationships", payload)
+        return str(resp.json()["id"])
+
+    def end_relationship(
+        self,
+        relationship_id: str,
+        at: datetime | str | None = None,
+        *,
+        state: str = "expired",
+        user: str = "default",
+    ) -> None:
+        """
+        PATCH /api/v1/pdm/relationships/<id>. ``at`` defaults to now — see
+        ``unfile_signature`` on why that has to happen client-side.
+        """
+        payload: dict[str, Any] = {
+            "valid_to": self._stamp(at) or self._stamp(datetime.now(timezone.utc))
+        }
+        if state:
+            payload["state"] = state
+        self._patch(f"/api/v1/pdm/relationships/{relationship_id}", payload)
+
+    def apply_relationship_evidence(
+        self,
+        relationship_id: str,
+        *,
+        kind: str,
+        signature_id: str | None = None,
+        source_event_id: str | None = None,
+        user: str = "default",
+    ) -> dict[str, Any]:
+        """
+        Cite an existing signature or source event as reinforcing or
+        contrary evidence toward one relationship's channel (spec §4.4).
+
+        POST /api/v1/pdm/relationships/<id>/evidence
+        Exactly one of *signature_id*/*source_event_id* is required — the
+        server refuses a bare kind with nothing behind it (400
+        ``NO_EVIDENCE_SOURCE``) and refuses both at once (400
+        ``AMBIGUOUS_EVIDENCE_SOURCE``). Resubmitting the same
+        (relationship, kind, citation) triple is refused with 409
+        ``EVIDENCE_ALREADY_APPLIED`` (surfaced as ``CloudConflictError``) —
+        it must not count the same evidence twice.
+        """
+        payload: dict[str, Any] = {"kind": kind}
+        if signature_id is not None:
+            payload["signature_id"] = signature_id
+        if source_event_id is not None:
+            payload["source_event_id"] = source_event_id
+        resp = self._post(
+            f"/api/v1/pdm/relationships/{relationship_id}/evidence", payload
+        )
+        return resp.json()
+
+    def related_entities(
+        self,
+        entity_id: str,
+        at: datetime | str | None = None,
+        *,
+        relationship_type: str | None = None,
+        user: str = "default",
+    ) -> set[str]:
+        """
+        Entities reachable from *entity_id* by a live link at *at*, over
+        ``GET /api/v1/pdm/relationships?entity_id=&at=``.
+
+        One hop, matching the local drivers: a directed link is followed one
+        way, a symmetric one both ways, and neither is chased past its own
+        far end.
+
+        Scoped to the account behind the token, not to *entity_id* — the route
+        answers "links this account recorded", and ``entity_id`` only narrows
+        further within those. A relationship one account recorded about a pair
+        is invisible to the other party's own token unless *they* recorded it
+        too, even when they are the far end of it — ``Relationship.user`` on
+        the server is "whose record this is", not "who is a party to it".
+        This differs from the local drivers, where one ``Memory`` speaks for
+        one account and every row it can see is already its own. Confirmed
+        against a live server: two real accounts, one directed and one
+        symmetric link, the symmetric one reachable from both only because
+        each side happened to record its own.
+        """
+        rows = self._paginate_field_rows(
+            "/api/v1/pdm/relationships",
+            key="relationships",
+            params={"entity_id": entity_id},
+            at=at,
+        )
+        reachable: set[str] = set()
+        for row in rows:
+            kind = row.get("relationship_type")
+            if relationship_type and kind != relationship_type:
+                continue
+            source = row.get("source_entity_id")
+            target = row.get("target_entity_id")
+            if source == entity_id and target:
+                reachable.add(str(target))
+            elif (
+                target == entity_id
+                and source
+                and row.get("directionality") == "symmetric"
+            ):
+                reachable.add(str(source))
+        return reachable
+
+    def extract_signatures(
+        self,
+        event_id: str,
+        text: str | None = None,
+        *,
+        force: bool = False,
+        user: str = "default",
+    ) -> dict[str, Any]:
+        """
+        POST /api/v1/pdm/source-events/<event_id>/extract.
+
+        Not a wrapper around a local method the way the field/link calls
+        above are backed by a local table this driver also carries: this
+        driver has no event table of its own (see ``EventLog.__init__``'s
+        own docstring on why), so there is nothing to check locally before
+        the request. The server holds the event, checks *text* against its
+        own content_hash, and decides ``PAYLOAD_UNAVAILABLE`` /
+        ``PAYLOAD_MISMATCH`` — this call is a direct pass-through to that
+        decision, not a re-implementation of it.
+
+        Returns the server's own ``{"event_id", "signature_ids", "count"}``
+        as a plain dict, not ``list[SignatureRecord]``: this driver has no
+        local Signature rows to read the extracted facts back from, and
+        fetching each returned id individually would turn one call into
+        one-plus-N HTTP round trips for information the response already
+        carries.
+        """
+        payload: dict[str, Any] = {}
+        if text is not None:
+            payload["text"] = text
+        if force:
+            payload["force"] = True
+        resp = self._post(f"/api/v1/pdm/source-events/{event_id}/extract", payload)
+        return resp.json()
+
+    def save_source_event(self, event: Any, *, payload: str = "") -> str:
+        """
+        POST /api/v1/pdm/source-events — record *event*, or find it.
+
+        The hash is computed here, by the SDK's own contract, and *payload* is
+        never sent: the server keeps no payload, and given one it rehashes
+        with ``occurred_at`` always included — which disagrees with a hash
+        that held a defaulted ``occurred_at`` out, refusing the event as a
+        mismatch. Sets ``event.id`` and ``event.was_deduplicated`` from the
+        server's answer, as the local drivers do.
+        """
+        event.ensure_content_hash(payload=payload)
+        block: dict[str, Any] = {
+            "event_type": event.event_type,
+            "occurred_at": self._iso(event.occurred_at),
+            "observed_at": self._iso(event.observed_at),
+            "source_system": event.source_system,
+            "raw_reference": event.raw_reference,
+            "provenance": dict(event.provenance or {}),
+            "content_hash": event.content_hash,
+            "capture_authority_state": event.capture_authority_state,
+            "compliance_state": event.compliance_state,
+            "source_actor_ids": list(event.source_actor_ids or []),
+        }
+        if event.owner_entity_id:
+            block["owner_entity_id"] = event.owner_entity_id
+
+        data = self._post("/api/v1/pdm/source-events", block).json()
+        event.id = str(data["id"])
+        event.was_deduplicated = bool(data.get("deduplicated"))
+        return event.id
+
+    def attach_signature(
+        self,
+        event_id: str,
+        signature_id: str,
+        *,
+        entities: builtins.list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """
+        POST /api/v1/pdm/source-events/<event_id>/signatures
+
+        Links *signature_id* to the event unless it already came from one
+        (``linked: false`` then, with the event it keeps), and records a
+        mention per entry in *entities*. Returns the server's
+        ``{signature_id, source_event_id, linked, mentions}``.
+        """
+        body: dict[str, Any] = {"signature_id": signature_id}
+        if entities:
+            body["entities"] = entities
+        return self._post(
+            f"/api/v1/pdm/source-events/{event_id}/signatures", body
+        ).json()
+
+    def _paginate_field_rows(
+        self,
+        path: str,
+        *,
+        key: str,
+        params: dict[str, Any],
+        at: datetime | str | None,
+        page_size: int = _API_PAGE_MAX,
+        max_pages: int = 100,
+    ) -> builtins.list[dict[str, Any]]:
+        """
+        Walk one of the field/relationship list routes to exhaustion.
+
+        Shared by every read in this section: all three share one cursor
+        convention (``cursor_id`` in, ``next_cursor_id`` out) and one page
+        cap. ``max_pages`` is a caller-can't-loop-forever backstop, not a
+        limit these tables are expected to reach — a subject's own field
+        history is not the growth axis the substrate spec's "bounded query"
+        invariant is about.
+        """
+        stamp = self._stamp(at)
+        query = dict(params)
+        query["page_size"] = page_size
+        if stamp is not None:
+            query["at"] = stamp
+
+        rows: builtins.list[dict[str, Any]] = []
+        cursor: str | None = None
+        for _ in range(max_pages):
+            page_params = dict(query)
+            if cursor:
+                page_params["cursor_id"] = cursor
+            resp = self._get(path, params=page_params)
+            data = resp.json()
+            if not isinstance(data, dict):
+                raise CloudStorageError(
+                    f"Unexpected {path} body type: {type(data).__name__}",
+                    path=path,
+                )
+            items = data.get(key)
+            if not isinstance(items, list):
+                raise CloudStorageError(
+                    f"{path} response missing {key!r} list", path=path
+                )
+            rows.extend(item for item in items if isinstance(item, dict))
+            cursor = data.get("next_cursor_id")
+            if not cursor:
+                break
+        return rows
 
     def _field_state(
         self,
@@ -847,6 +1447,24 @@ class CloudDriver(BaseStorage):
             raise CloudNotFoundError(
                 f"Cloud resource not found: {path}",
                 status_code=404,
+                path=path,
+            )
+        if status == 409:
+            # The field/relationship routes answer a conflict with a JSON body
+            # carrying error_code (MEMBERSHIP_REFUSED, RELATIONSHIP_REFUSED,
+            # MEMBERSHIP_ALREADY_CLOSED, …) — surfaced on the exception rather
+            # than left for a caller to parse out of prose.
+            error_code = None
+            try:
+                body = resp.json()
+                if isinstance(body, dict):
+                    error_code = body.get("error_code")
+            except Exception as err:
+                logger.debug("[PDM-Cloud] error reading conflict body: %s", err)
+            raise CloudConflictError(
+                f"Cloud HTTP 409 for {path}"
+                + (f" ({error_code})" if error_code else ""),
+                error_code=error_code,
                 path=path,
             )
         if status is not None and status >= 400:

@@ -24,7 +24,7 @@ def driver(tmp_path):
 
 @pytest.fixture()
 def log(tmp_path):
-    mem = Memory(storage=EventfulSQLiteDriver(db_path=str(tmp_path / "l.db")))
+    mem = Memory(storage=EventfulSQLiteDriver(db_path=str(tmp_path / "l.db")), user="default")
     yield EventLog(mem)
     mem.close()
 
@@ -236,7 +236,7 @@ class TestFinding5ProvenanceCrossesTheSync:
         from pdm_memory.sync import MemorySync
 
         left, right = self._pair(tmp_path)
-        mem = Memory(storage=left)
+        mem = Memory(storage=left, user="default")
         log = EventLog(mem)
         result = log.ingest(
             event=log.event(raw_reference="chat:123:msg:456", source_system="azus_chat"),
@@ -280,7 +280,7 @@ class TestFinding5ProvenanceCrossesTheSync:
         # Give the right store an event of its own first, so the ids diverge.
         right.save_source_event(SourceEventRecord(raw_reference="other"), payload="other")
 
-        mem = Memory(storage=left)
+        mem = Memory(storage=left, user="default")
         log = EventLog(mem)
         log.ingest(
             event=log.event(raw_reference="chat:1"),
@@ -305,7 +305,7 @@ class TestFinding5ProvenanceCrossesTheSync:
         from pdm_memory.storage.event_sync import EventSync
 
         left, right = self._pair(tmp_path)
-        mem = Memory(storage=left)
+        mem = Memory(storage=left, user="default")
         log = EventLog(mem)
         log.ingest(
             event=log.event(raw_reference="chat:1"),

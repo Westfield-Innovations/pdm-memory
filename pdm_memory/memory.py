@@ -71,9 +71,13 @@ from pdm_memory.models import (
     AlignmentReport,
     FieldStateSnapshot,
     MemoryListPage,
+    ProjectionFan,
+    RecordedProjection,
     RelationshipChannelResolution,
+    RelationshipState,
     SurfaceReport,
     TorsionReport,
+    Trajectory,
 )
 from pdm_memory.storage.base import BaseStorage
 from pdm_memory.types import (
@@ -95,7 +99,14 @@ class Memory:
     Args:
         store:       SQLite path/URL, PostgreSQL DSN, ``"cloud"``, or a custom URL
                      registered via :func:`pdm_memory.storage.register_storage`.
-        user:        User identifier to scope all memories (default "default").
+        user:        User identifier to scope all memories. Required, and
+                     keyword-only: against a cloud store it must be the
+                     username the API token belongs to, because the server
+                     takes the owner from the token and refuses a payload
+                     that names anyone else. A default here was worse than
+                     no value — it silently wrote every caller's memories
+                     under one shared identity, and now it would simply be
+                     rejected.
         token:       JWT access token (required when store="cloud").
         refresh_token: JWT refresh token for automatic renewal (cloud only).
         cloud_url:   AZUS Companion API base URL (cloud only).
@@ -109,7 +120,8 @@ class Memory:
     def __init__(
         self,
         store: str = "./pdm_memory.db",
-        user: str = "default",
+        *,
+        user: str,
         token: str | None = None,
         refresh_token: str | None = None,
         cloud_url: str = "https://api.azus.ai",
@@ -198,7 +210,12 @@ class Memory:
             raise ValueError(
                 f"{prefix}_STORE environment variable is required for Memory.from_env()"
             )
-        user = os.environ.get(f"{prefix}_USER", "default")
+        user = os.environ.get(f"{prefix}_USER")
+        if not user:
+            raise ValueError(
+                f"{prefix}_USER environment variable is required for "
+                f"Memory.from_env()"
+            )
         token = os.environ.get(f"{prefix}_TOKEN")
         refresh_token = os.environ.get(f"{prefix}_REFRESH_TOKEN")
         cloud_url = os.environ.get(f"{prefix}_CLOUD_URL", "https://api.azus.ai")
@@ -1795,6 +1812,34 @@ class Memory:
             domain=domain,
         )
 
+    def relationship_state(
+        self,
+        source: str,
+        target: str,
+        at_time: datetime | None = None,
+        domain: str | None = None,
+    ) -> RelationshipState:
+        """
+        Point-in-time state of one relationship pair (spec §4.3, ecosystem /
+        cloud only).
+
+        Thin client over Companion ``GET /api/v1/pdm/relationships/state/``.
+        ``at_time`` omitted means now; ``domain`` omitted means every domain
+        (``"*"``). Returns which links were live, which channel measurements
+        applied, and — only within the channel's own recency window — the
+        current resolution vector; see :class:`RelationshipState` for the
+        full shape and why that vector is withheld outside the window.
+
+        Requires ``store="cloud"`` or a JWT ``token`` (and optional
+        ``cloud_url``) so the SDK can reach the Companion relationships API.
+        """
+        return self._require_cloud("relationship_state").relationship_state(
+            source,
+            target,
+            at_time=at_time,
+            domain=domain,
+        )
+
     def state_at(
         self,
         field_id: str,
@@ -1846,6 +1891,111 @@ class Memory:
             cursor=cursor,
             limit=limit,
             envelope=envelope,
+        )
+
+    def trajectory(
+        self,
+        subject_id: str,
+        start: datetime,
+        end: datetime,
+        *,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> Trajectory:
+        """
+        An ordered sequence of transitions for a field or entity, over
+        ``[start, end)`` (spec §7, §3).
+
+        Unlike :meth:`state_at` / :meth:`current_state`, this works against
+        either driver: the membership, fact, and link tables it reads already
+        exist locally (``storage.field_store.FieldStore``), so a local
+        ``Memory`` answers from its own database without needing the cloud.
+        A cloud-backed ``Memory`` reaches Companion's own
+        ``GET /api/v1/pdm/field-state/trajectory/`` instead — and only that
+        path can return ``grant_changed`` / ``projection_recorded`` /
+        ``outcome_recorded`` steps; see ``FieldStore.trajectory``'s own
+        docstring for why the local table set stops short of those.
+        """
+        trajectory_fn = getattr(self._storage, "trajectory", None)
+        if trajectory_fn is None:
+            raise RuntimeError(
+                f"{type(self._storage).__name__} does not support "
+                "trajectory(). Use Memory(storage=EventfulSQLiteDriver(...)) "
+                "or Memory(storage=CloudDriver(...))."
+            )
+        return trajectory_fn(
+            subject_id,
+            start,
+            end,
+            after=cursor,
+            limit=limit,
+            user=self._user,
+        )
+
+    def project(
+        self,
+        *,
+        horizon_days: int | None = None,
+        record: bool = False,
+    ) -> ProjectionFan:
+        """
+        The caller's forward fan — spec §7's ``project`` (ecosystem / cloud only).
+
+        Thin client over Companion ``POST /api/v1/pdm/field-state/projection/``.
+        Every branch is ``state_type="projected"`` and arrives as a
+        :class:`ProjectionFan`, a type unrelated to :class:`FieldStateSnapshot`.
+
+        §7 names ``project(field_id, horizon, constraints)``. There is no
+        ``field_id`` here because the fan is built per domain off the
+        observer's own channel, not per field, and the server takes none —
+        accepting one would mean silently ignoring it. ``horizon_days`` is the
+        only constraint the server honours, so it is a keyword rather than a
+        dict whose other keys would go nowhere.
+
+        ``record=True`` persists the fan so it can later be settled with
+        :meth:`record_outcome`; see :class:`ProjectionFan` for why
+        ``projection_ids`` can be empty on a same-day repeat.
+        """
+        return self._require_cloud("project").project(
+            horizon_days=horizon_days, record=record
+        )
+
+    def projection(self, projection_id: str) -> RecordedProjection:
+        """
+        One recorded projection branch, with its outcome once settled
+        (ecosystem / cloud only). Someone else's projection reads as not found.
+        """
+        return self._require_cloud("projection").projection(projection_id)
+
+    def record_outcome(
+        self,
+        projection_id: str,
+        observed_at: datetime | str,
+        connection_geometry: str,
+        meaning_propagation: str,
+        model_update: str = "",
+    ) -> RecordedProjection:
+        """
+        Settle a recorded projection against what actually happened (spec
+        §13, ecosystem / cloud only).
+
+        ``connection_geometry`` and ``meaning_propagation`` are each
+        ``"correct"``, ``"partial"`` or ``"incorrect"``. ``timing`` is not a
+        parameter: the server derives early / within / late from
+        ``observed_at`` against the projection's own window.
+
+        A projection settles once: a second outcome raises
+        ``CloudConflictError`` (``error_code="ALREADY_SETTLED"``), one observed
+        before the projection was made raises ``CloudStorageError`` with
+        ``status_code=422``, and an unknown or foreign id raises
+        ``CloudNotFoundError``.
+        """
+        return self._require_cloud("record_outcome").record_outcome(
+            projection_id,
+            observed_at=observed_at,
+            connection_geometry=connection_geometry,
+            meaning_propagation=meaning_propagation,
+            model_update=model_update,
         )
 
     def count(self) -> int:

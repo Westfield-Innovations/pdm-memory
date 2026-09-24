@@ -176,12 +176,12 @@ class TestCloudDriverFieldState:
 
 class TestMemoryFieldState:
     def test_state_at_local_only_raises(self, tmp_path):
-        mem = Memory(store=str(tmp_path / "local.db"))
+        mem = Memory(store=str(tmp_path / "local.db"), user="default")
         with pytest.raises(RuntimeError, match="state_at requires ecosystem/cloud"):
             mem.state_at("westfield", datetime(2026, 3, 1, tzinfo=timezone.utc))
 
     def test_current_state_local_only_raises(self, tmp_path):
-        mem = Memory(store=str(tmp_path / "local.db"))
+        mem = Memory(store=str(tmp_path / "local.db"), user="default")
         with pytest.raises(
             RuntimeError, match="current_state requires ecosystem/cloud"
         ):
@@ -195,7 +195,7 @@ class TestMemoryFieldState:
         with patch.object(driver, "state_at", return_value=expected) as mock_fn:
             mem = Memory(
                 store="cloud", token=auth.token, cloud_url="http://localhost:8000"
-            )
+, user="default")
             mem._storage = driver
             mem._cloud_driver = driver
             result = mem.state_at("westfield", moment, limit=10)
@@ -211,7 +211,7 @@ class TestMemoryFieldState:
         with patch.object(driver, "current_state", return_value=expected) as mock_fn:
             mem = Memory(
                 store="cloud", token=auth.token, cloud_url="http://localhost:8000"
-            )
+, user="default")
             mem._storage = driver
             mem._cloud_driver = driver
             result = mem.current_state("westfield", envelope=False)

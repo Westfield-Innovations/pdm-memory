@@ -34,12 +34,32 @@ import sys
 # ---------------------------------------------------------------------------
 
 
+
+def _require_user(args: argparse.Namespace) -> str:
+    """
+    The identity a store is opened under, or a clean refusal.
+
+    Enforced here rather than by argparse so that the commands which never
+    open a store — `verify --goal` is the only one today — are not made to
+    supply an identity they have no use for. Everything that does open one
+    must name it: a store scoped to a guessed user is how one person's
+    memories end up filed under another's.
+    """
+    user = getattr(args, "user", None)
+    if not user:
+        raise SystemExit(
+            "error: --user is required for this command. It scopes the store, "
+            "and against a cloud store it must match the username the token "
+            "belongs to."
+        )
+    return user
+
 def cmd_list(args: argparse.Namespace) -> None:
     from pdm_memory import Memory
 
-    with Memory(store=args.store, user=args.user) as mem:
+    with Memory(store=args.store, user=_require_user(args)) as mem:
         records = mem._storage.list(
-            user=args.user,
+            user=_require_user(args),
             limit=args.limit,
             min_pressure=args.min_pressure,
             drawer=args.drawer or None,
@@ -63,7 +83,7 @@ def cmd_list(args: argparse.Namespace) -> None:
 def cmd_explain(args: argparse.Namespace) -> None:
     from pdm_memory import Memory
 
-    with Memory(store=args.store, user=args.user) as mem:
+    with Memory(store=args.store, user=_require_user(args)) as mem:
         try:
             report = mem.explain(args.memory_id, query=args.query or None)
             print(report.render())
@@ -75,7 +95,7 @@ def cmd_explain(args: argparse.Namespace) -> None:
 def cmd_decay(args: argparse.Namespace) -> None:
     from pdm_memory import Memory
 
-    with Memory(store=args.store, user=args.user) as mem:
+    with Memory(store=args.store, user=_require_user(args)) as mem:
         counts = mem.decay(dry_run=args.dry_run)
         mode = " [DRY RUN — no changes written]" if args.dry_run else ""
         print(f"Decay complete{mode}:")
@@ -87,10 +107,10 @@ def cmd_decay(args: argparse.Namespace) -> None:
 def cmd_stats(args: argparse.Namespace) -> None:
     from pdm_memory import Memory
 
-    with Memory(store=args.store, user=args.user) as mem:
+    with Memory(store=args.store, user=_require_user(args)) as mem:
         total = mem.count()
         drawers = mem.list_drawers()
-        records = mem._storage.list(user=args.user, limit=10_000)
+        records = mem._storage.list(user=_require_user(args), limit=10_000)
 
         if records:
             pressures = [r.p_magnitude for r in records]
@@ -114,7 +134,7 @@ def cmd_stats(args: argparse.Namespace) -> None:
 def cmd_drawers(args: argparse.Namespace) -> None:
     from pdm_memory import Memory
 
-    with Memory(store=args.store, user=args.user) as mem:
+    with Memory(store=args.store, user=_require_user(args)) as mem:
         drawers = mem.list_drawers()
         if not drawers:
             print("No drawers found.")
@@ -128,7 +148,7 @@ def cmd_drawers(args: argparse.Namespace) -> None:
 def cmd_search(args: argparse.Namespace) -> None:
     from pdm_memory import Memory
 
-    with Memory(store=args.store, user=args.user) as mem:
+    with Memory(store=args.store, user=_require_user(args)) as mem:
         hits = mem.recall(
             args.query,
             k=args.limit,
@@ -156,7 +176,7 @@ def cmd_export(args: argparse.Namespace) -> None:
     from pdm_memory import Memory
     from pdm_memory.io import export_signatures_csv
 
-    with Memory(store=args.store, user=args.user) as mem:
+    with Memory(store=args.store, user=_require_user(args)) as mem:
         if args.format == "csv":
             count = export_signatures_csv(mem, args.out)
         else:
@@ -167,7 +187,7 @@ def cmd_export(args: argparse.Namespace) -> None:
 def cmd_import(args: argparse.Namespace) -> None:
     from pdm_memory import Memory
 
-    with Memory(store=args.store, user=args.user) as mem:
+    with Memory(store=args.store, user=_require_user(args)) as mem:
         counts = mem.import_json(args.path, skip_duplicates=not args.allow_duplicates)
     print(
         f"Import complete: saved={counts['saved']} "
@@ -178,7 +198,7 @@ def cmd_import(args: argparse.Namespace) -> None:
 def cmd_detect_torsion(args: argparse.Namespace) -> None:
     from pdm_memory import Memory
 
-    with Memory(store=args.store, user=args.user) as mem:
+    with Memory(store=args.store, user=_require_user(args)) as mem:
         reports = mem.detect_torsion(
             drawer=args.drawer or None,
             threshold=args.threshold,
@@ -196,7 +216,7 @@ def cmd_heal(args: argparse.Namespace) -> None:
     """Full-store audit: detect torsion, auto-reconcile high-confidence pairs, decay."""
     from pdm_memory import Memory
 
-    with Memory(store=args.store, user=args.user) as mem:
+    with Memory(store=args.store, user=_require_user(args)) as mem:
         summary = mem.audit_and_heal(
             torsion_threshold=args.threshold,
             auto_reconcile_threshold=args.auto_reconcile_threshold,
@@ -236,7 +256,7 @@ def cmd_verify(args: argparse.Namespace) -> None:
     else:
         from pdm_memory import Memory
 
-        with Memory(store=args.store, user=args.user) as mem:
+        with Memory(store=args.store, user=_require_user(args)) as mem:
             report = mem.verify_alignment(
                 args.intent,
                 min_pressure=args.min_pressure,
@@ -260,7 +280,7 @@ def cmd_sync(args: argparse.Namespace) -> None:
         print("Error: --token is required for sync.", file=sys.stderr)
         sys.exit(1)
 
-    with Memory(store=args.store, user=args.user) as mem:
+    with Memory(store=args.store, user=_require_user(args)) as mem:
         report = mem.sync(
             direction=args.direction,
             cloud_url=args.cloud_url,
@@ -286,7 +306,7 @@ def cmd_ui(args: argparse.Namespace) -> None:
 
     run_server(
         store=args.store,
-        user=args.user,
+        user=_require_user(args),
         host=args.host,
         port=args.port,
         open_browser=not args.no_browser,
@@ -310,8 +330,13 @@ def main() -> None:
         help="Store path or URL: ./app.db, sqlite:///, postgresql://… (default: ./pdm_memory.db)"
     )
     parser.add_argument(
-        "--user", default="default",
-        help="User identifier to scope queries (default: default)"
+        "--user", default=None,
+        help=(
+            "User identifier to scope queries. Required for every command "
+            "that opens a store; against a cloud store it must match the "
+            "username the token belongs to. Not required by `verify --goal`, "
+            "which checks an intent against a rule and never opens one."
+        )
     )
 
     # Parent parser for subparsers to inherit store/user without overriding with defaults

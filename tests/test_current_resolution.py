@@ -93,7 +93,7 @@ class TestCloudDriverCurrentResolution:
 
 class TestMemoryCurrentResolution:
     def test_local_only_raises(self, tmp_path):
-        mem = Memory(store=str(tmp_path / "local.db"))
+        mem = Memory(store=str(tmp_path / "local.db"), user="default")
         with pytest.raises(RuntimeError, match="ecosystem/cloud"):
             mem.current_resolution()
 
@@ -102,7 +102,7 @@ class TestMemoryCurrentResolution:
         driver = CloudDriver(auth=auth, base_url="http://localhost:8000")
         expected = RelationshipChannelResolution.from_payload(_channel_payload())
         with patch.object(driver, "current_resolution", return_value=expected) as mock_fn:
-            mem = Memory(store="cloud", token=auth.token, cloud_url="http://localhost:8000")
+            mem = Memory(store="cloud", token=auth.token, cloud_url="http://localhost:8000", user="default")
             # Replace storage with our patched driver
             mem._storage = driver
             mem._cloud_driver = driver

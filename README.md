@@ -56,7 +56,7 @@ pip install "pdm-memory[all]"
 from pdm_memory import Memory
 
 # One line to start. The .db file is created automatically.
-mem = Memory(store="./my_app_memory.db")
+mem = Memory(store="./my_app_memory.db", user="alice")
 
 # Write: PDM assigns pressure and stores a signature.
 # Optional shape: ephemeral (2h) / behavioral (90d) / structural (∞).
@@ -99,7 +99,7 @@ print(f"Decayed: {counts['decayed']}, Deleted: {counts['deleted']}")
 Store only SHA-256 hashes of memory text — the content never touches disk:
 
 ```python
-mem = Memory(store="./private.db", store_raw=False)
+mem = Memory(store="./private.db", user="alice", store_raw=False)
 ```
 
 ---
@@ -143,7 +143,7 @@ access_token = data["tokens"]["access"]
 refresh_token = data["tokens"]["refresh"]
 ```
 
-Use the returned JWTs directly with `Memory(store="cloud", ...)`:
+Use the returned JWTs directly with `Memory(store="cloud", user=..., ...)`:
 
 ### Connect to the Cloud
 
@@ -223,11 +223,110 @@ page = mem.current_state("westfield", cursor=state.entities_next_cursor, envelop
   unfiltered mode, and permission resolves against now — a revoked grant does
   not reopen last year.
 
+### Relationships
+
+`EventLog.link(...)` records that two entities stood in some relation; the
+methods below read and reinforce that link's channel over time.
+
+```python
+from pdm_memory import Memory
+from pdm_memory.event_log import EventLog
+
+mem = Memory(store="cloud", user="alice", token="eyJ...")
+log = EventLog(mem)
+
+relationship_id = log.link("subject:1", "entity:abc-123", "colleague")
+
+# Point-in-time state of the pair — which links were live, which channel
+# measurements applied, and (only within the channel's own recency window)
+# the current resolution vector. at_time omitted means now.
+state = mem.relationship_state("subject:1", "entity:abc-123")
+state.relationships                    # the live/historical link rows for this pair
+state.channels                         # {domain: channel snapshot}, by domain
+state.current_resolution_by_domain     # None outside the recency window
+state.current_resolution_reason        # "past_moment" when it is None
+
+# Cite an existing fact as reinforcing or contrary evidence for the link's
+# channel. No bare number: the citation itself is the input.
+from pdm_memory.storage.fields import RelationshipRecord
+
+relationship = RelationshipRecord(id=relationship_id, source_entity_id="subject:1",
+                                   target_entity_id="entity:abc-123", relationship_type="colleague")
+log.reinforce(relationship, evidence="sig-1")            # or a SignatureRecord/SourceEventRecord
+log.apply_contrary_evidence(relationship, evidence="sig-2")
+```
+
+- **Cloud only**, same as Field State — `RelationshipChannel` and its
+  evidence log live only in Companion.
+- **Dispatch by target type**, not by guessing at a string. `reinforce`/
+  `apply_contrary_evidence` route to the relationship-evidence endpoint only
+  when *target* is a `RelationshipRecord`; a bare string id or a
+  `SignatureRecord` goes to the existing, unchanged `Memory.reinforce()` /
+  `Memory.apply_contrary_evidence()` — the same methods and behaviour as
+  before this feature existed.
+- **Resubmitting the same evidence is refused** (`CloudConflictError`,
+  `error_code="EVIDENCE_ALREADY_APPLIED"`), not silently counted twice.
+
+| This document's naming | SDK method |
+|---|---|
+| Point-in-time relationship state | `Memory.relationship_state(source, target, at_time=None, domain=None)` |
+| Reinforcing evidence, on a link | `EventLog.reinforce(relationship_record, evidence)` |
+| Contrary evidence, on a link | `EventLog.apply_contrary_evidence(relationship_record, evidence)` |
+| Reinforcing evidence, on a memory (unchanged) | `EventLog.reinforce(memory_id_or_record)` → `Memory.reinforce` |
+| Contrary evidence, on a memory (unchanged) | `EventLog.apply_contrary_evidence(memory_id_or_record, evidence)` → `Memory.apply_contrary_evidence` |
+
+### Projections
+
+A forward fan of where your channel is heading, and — once time has passed —
+how it turned out.
+
+```python
+from datetime import datetime, timezone
+
+fan = mem.project()                     # the fan now; nothing is written
+fan = mem.project(horizon_days=30)      # narrower window, clamped to the server's reach
+fan = mem.project(record=True)          # persist it so it can be scored later
+
+for branch in fan.branches:
+    branch.state_type                   # always "projected"
+    branch.confidence_band["weight"]    # this branch's share of the fan
+    branch.timing_range                 # {"start", "end"} — a window, never a point
+    branch.invalidation_conditions      # what would make it wrong
+
+# Later: settle one recorded branch against what actually happened.
+settled = mem.record_outcome(
+    fan.projection_ids[0],
+    observed_at=datetime.now(timezone.utc),
+    connection_geometry="correct",      # "correct" | "partial" | "incorrect"
+    meaning_propagation="partial",
+)
+settled.outcome.timing                  # "early" | "within" | "late" — derived by the server
+
+mem.projection(settled.id)              # read it back, with its outcome
+```
+
+- **Cloud only.** The fan is built from the observer's channel, which lives
+  in Companion.
+- **A different type from a field state.** `ProjectionFan` and
+  `RecordedProjection` share no base class with `FieldStateSnapshot`, and a
+  payload whose items do not say `state_type="projected"` is refused rather
+  than typed as a projection.
+- **Not field-scoped.** Spec §7 names `project(field_id, horizon,
+  constraints)`; the fan is built per domain, not per field, so there is no
+  `field_id` to pass, and `horizon_days` is the one constraint the server honours.
+- **Recorded once a day.** With `record=True`, `projection_ids` is empty on a
+  repeat the same UTC day — that fan is already on file.
+- **Settles once.** A second outcome raises `CloudConflictError`
+  (`error_code="ALREADY_SETTLED"`); an outcome observed before the projection
+  was made raises `CloudStorageError` with `status_code=422`; someone else's
+  projection reads as `CloudNotFoundError`. `timing` is never sent — the
+  server derives it from `observed_at`.
+
 ### Sync Local ↔ Cloud
 
 ```python
 # Start with a local store
-local_mem = Memory(store="./local.db")
+local_mem = Memory(store="./local.db", user="alice")
 local_mem.save("Local preference", tags=["pref", "local", "test"])
 
 # Push local memories to cloud
@@ -270,7 +369,7 @@ The wrapper is the demo; the primitives are the product. Most developers start h
 from pdm_memory import Memory
 from pdm_memory.integrations import wrap_openai
 
-mem = Memory(store="./my_app.db")
+mem = Memory(store="./my_app.db", user="alice")
 client = wrap_openai(api_key="sk-...", memory=mem)
 
 # Memory is handled completely invisibly:
@@ -341,7 +440,7 @@ When goals already live in a PDM store, `Memory.verify_alignment()` is the same 
 ```python
 from pdm_memory import Memory
 
-mem = Memory(store="./agent.db")
+mem = Memory(store="./agent.db", user="alice")
 
 # Goal signatures live in stewardship / foundational drawers.
 mem.save(
@@ -465,7 +564,7 @@ Inline smoke test:
 ```bash
 python -c "
 from pdm_memory import Memory
-mem = Memory(store='./demo.db')
+mem = Memory(store='./demo.db', user='alice')
 mem.save('User prefers metric units and short answers', source='demo',
          tags=['units', 'formatting', 'preferences'], p_magnitude=85)
 for h in mem.recall('how should I format the answer?', k=3):
@@ -618,7 +717,9 @@ Store-free Goal-Anchor Alignment. Pass a proposed action and one or more rule st
 
 Use `report.is_safe_to_act` (True only when `status == "ALIGNED"`) before triggering ACT.
 
-### `Memory(store, user, token, refresh_token, cloud_url, store_raw)`
+### `Memory(store, *, user, token, refresh_token, cloud_url, store_raw)`
+
+`user` is required and keyword-only. Against a cloud store it must be the username the token belongs to: the server takes the owner from the token and refuses a payload naming anyone else.
 
 | Method | Description |
 |--------|-------------|

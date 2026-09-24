@@ -61,7 +61,13 @@ jobs:
       - name: Smoke-test CLI
         run: |
           pdm-cli --help
-          pdm-cli stats --store /tmp/ci_test.db
+          # --user is required by every command that opens a store.
+          pdm-cli --user ci stats --store /tmp/ci_test.db
+          # And refused, loudly, when it is missing — the point of requiring it.
+          if pdm-cli stats --store /tmp/ci_test.db 2>/dev/null; then
+            echo "CLI opened a store without --user" >&2
+            exit 1
+          fi
 
       - name: Upload coverage report
         if: matrix.python-version == '3.11'

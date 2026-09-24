@@ -266,7 +266,7 @@ class TestGAAMemoryAndCLI:
             patch(
                 "sys.argv",
                 [
-                    "pdm-cli",
+                    "pdm-cli", "--user", "default",
                     "--store",
                     db,
                     "verify",

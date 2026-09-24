@@ -427,8 +427,8 @@ SDK містить консольну утиліту `pdm-cli` для діагн
 ```
 
 ### 7.2. CLI команди:
-*   `pdm-cli list-memories --store <path>`: виводить список усіх спогадів із зазначенням тиску, тегів та тексту.
-*   `pdm-cli explain <id> --store <path> --query "<text>"`: показує математичний звіт та зв'язок для конкретного запиту.
-*   `pdm-cli decay --store <path> [--dry-run]`: примусово запускає очистку бази від застарілих спогадів із тиском нижче 30.0.
-*   `pdm-cli stats --store <path>`: виводить агреговану статистику по шухлядах (drawers), середньому, мінімальному та максимальному тиску в системі.
-*   `pdm-cli sync --store <path> --token <jwt> --direction <push/pull/bidirectional>`: запускає синхронізацію з AZUS Cloud через термінал.
+*   `pdm-cli --user <name> list-memories --store <path>`: виводить список усіх спогадів із зазначенням тиску, тегів та тексту.
+*   `pdm-cli --user <name> explain <id> --store <path> --query "<text>"`: показує математичний звіт та зв'язок для конкретного запиту.
+*   `pdm-cli --user <name> decay --store <path> [--dry-run]`: примусово запускає очистку бази від застарілих спогадів із тиском нижче 30.0.
+*   `pdm-cli --user <name> stats --store <path>`: виводить агреговану статистику по шухлядах (drawers), середньому, мінімальному та максимальному тиску в системі.
+*   `pdm-cli --user <name> sync --store <path> --token <jwt> --direction <push/pull/bidirectional>`: запускає синхронізацію з AZUS Cloud через термінал.
