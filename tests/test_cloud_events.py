@@ -46,7 +46,7 @@ def driver() -> CloudDriver:
 
 @pytest.fixture
 def log(driver) -> EventLog:
-    return EventLog(Memory(storage=driver))
+    return EventLog(Memory(storage=driver, user="default"))
 
 
 class TestRecord:

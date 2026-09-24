@@ -265,14 +265,14 @@ class TestMemoryProjection:
         ],
     )
     def test_local_only_raises(self, tmp_path, call, name):
-        mem = Memory(store=str(tmp_path / "local.db"))
+        mem = Memory(store=str(tmp_path / "local.db"), user="default")
         with pytest.raises(RuntimeError, match=f"{name} requires ecosystem/cloud"):
             call(mem)
 
     def _cloud_memory(self, driver):
         mem = Memory(
             store="cloud", token=driver._auth.token, cloud_url="http://localhost:8000"
-        )
+, user="default")
         mem._storage = driver
         mem._cloud_driver = driver
         return mem

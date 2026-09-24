@@ -205,14 +205,14 @@ class TestDialectParity:
 
 @pytest.fixture()
 def log(tmp_path: pathlib.Path):
-    mem = Memory(storage=EventfulSQLiteDriver(db_path=str(tmp_path / "log.db")))
+    mem = Memory(storage=EventfulSQLiteDriver(db_path=str(tmp_path / "log.db")), user="default")
     yield EventLog(mem)
     mem.close()
 
 
 class TestEventLog:
     def test_refuses_a_driver_with_neither_events_nor_fields(self, tmp_path):
-        mem = Memory(storage=SQLiteDriver(db_path=str(tmp_path / "plain.db")))
+        mem = Memory(storage=SQLiteDriver(db_path=str(tmp_path / "plain.db")), user="default")
         with pytest.raises(RuntimeError, match="carries neither source events nor field"):
             EventLog(mem)
         mem.close()

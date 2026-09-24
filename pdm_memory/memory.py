@@ -99,7 +99,14 @@ class Memory:
     Args:
         store:       SQLite path/URL, PostgreSQL DSN, ``"cloud"``, or a custom URL
                      registered via :func:`pdm_memory.storage.register_storage`.
-        user:        User identifier to scope all memories (default "default").
+        user:        User identifier to scope all memories. Required, and
+                     keyword-only: against a cloud store it must be the
+                     username the API token belongs to, because the server
+                     takes the owner from the token and refuses a payload
+                     that names anyone else. A default here was worse than
+                     no value — it silently wrote every caller's memories
+                     under one shared identity, and now it would simply be
+                     rejected.
         token:       JWT access token (required when store="cloud").
         refresh_token: JWT refresh token for automatic renewal (cloud only).
         cloud_url:   AZUS Companion API base URL (cloud only).
@@ -113,7 +120,8 @@ class Memory:
     def __init__(
         self,
         store: str = "./pdm_memory.db",
-        user: str = "default",
+        *,
+        user: str,
         token: str | None = None,
         refresh_token: str | None = None,
         cloud_url: str = "https://api.azus.ai",
@@ -202,7 +210,12 @@ class Memory:
             raise ValueError(
                 f"{prefix}_STORE environment variable is required for Memory.from_env()"
             )
-        user = os.environ.get(f"{prefix}_USER", "default")
+        user = os.environ.get(f"{prefix}_USER")
+        if not user:
+            raise ValueError(
+                f"{prefix}_USER environment variable is required for "
+                f"Memory.from_env()"
+            )
         token = os.environ.get(f"{prefix}_TOKEN")
         refresh_token = os.environ.get(f"{prefix}_REFRESH_TOKEN")
         cloud_url = os.environ.get(f"{prefix}_CLOUD_URL", "https://api.azus.ai")

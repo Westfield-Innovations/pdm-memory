@@ -26,7 +26,7 @@ OCTOBER = datetime(2026, 10, 1, tzinfo=timezone.utc)
 
 @pytest.fixture()
 def log(tmp_path):
-    mem = Memory(storage=EventfulSQLiteDriver(db_path=str(tmp_path / "f.db")))
+    mem = Memory(storage=EventfulSQLiteDriver(db_path=str(tmp_path / "f.db")), user="default")
     yield EventLog(mem)
     mem.close()
 

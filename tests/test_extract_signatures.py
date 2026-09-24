@@ -36,7 +36,7 @@ def _openai_client(content: str) -> MagicMock:
 
 @pytest.fixture()
 def log(tmp_path):
-    mem = Memory(storage=EventfulSQLiteDriver(db_path=str(tmp_path / "l.db")))
+    mem = Memory(storage=EventfulSQLiteDriver(db_path=str(tmp_path / "l.db")), user="default")
     yield EventLog(mem)
     mem.close()
 

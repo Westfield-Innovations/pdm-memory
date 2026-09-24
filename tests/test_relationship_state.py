@@ -166,7 +166,7 @@ class TestCloudDriverRelationshipState:
 
 class TestMemoryRelationshipState:
     def test_local_only_raises(self, tmp_path):
-        mem = Memory(store=str(tmp_path / "local.db"))
+        mem = Memory(store=str(tmp_path / "local.db"), user="default")
         with pytest.raises(RuntimeError, match="ecosystem/cloud"):
             mem.relationship_state("subject:1", "entity:abc")
 
@@ -179,7 +179,7 @@ class TestMemoryRelationshipState:
         ) as mock_fn:
             mem = Memory(
                 store="cloud", token=auth.token, cloud_url="http://localhost:8000"
-            )
+, user="default")
             mem._storage = driver
             mem._cloud_driver = driver
             result = mem.relationship_state(

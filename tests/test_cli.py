@@ -8,7 +8,12 @@ def run_cli(args: list) -> tuple[str, int]:
     """Run CLI and capture stdout output."""
     from pdm_memory.tools.cli import main
     captured = StringIO()
-    with patch("sys.argv", ["pdm-cli"] + args), patch("sys.stdout", captured):
+    # --user is required by the CLI now; the helper supplies the identity
+    # these tests already ran under. A test naming its own --user still
+    # wins, since argparse takes the last value.
+    with patch("sys.argv", ["pdm-cli", "--user", "default"] + args), patch(
+        "sys.stdout", captured
+    ):
         try:
             main()
             return captured.getvalue(), 0

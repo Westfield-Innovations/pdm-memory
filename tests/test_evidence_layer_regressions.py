@@ -27,7 +27,7 @@ def driver(tmp_path):
 
 @pytest.fixture()
 def log(tmp_path):
-    mem = Memory(storage=EventfulSQLiteDriver(db_path=str(tmp_path / "log.db")))
+    mem = Memory(storage=EventfulSQLiteDriver(db_path=str(tmp_path / "log.db")), user="default")
     yield EventLog(mem)
     mem.close()
 

@@ -549,7 +549,7 @@ class TestOptionalCapability:
     def test_memory_accepts_an_injected_eventful_driver(self, db_path):
         """The documented injection path: no frozen module is touched."""
         drv = EventfulSQLiteDriver(db_path=db_path)
-        mem = Memory(storage=drv)
+        mem = Memory(storage=drv, user="default")
         mem.save("Orion release moved to Friday", tags=["orion", "release", "date"])
 
         event_id = drv.save_source_event(make_event())

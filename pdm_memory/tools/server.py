@@ -138,7 +138,8 @@ def _node_payload(
 
 def create_app(
     store: str = "./pdm_memory.db",
-    user: str = "default",
+    *,
+    user: str,
 ) -> FastAPI:
     """
     Build the Explorer FastAPI app bound to a local (or cloud) store.
@@ -354,11 +355,11 @@ def create_app(
 
 def run_server(
     store: str = "./pdm_memory.db",
-    user: str = "default",
+    *,
+    user: str,
     host: str = "127.0.0.1",
     port: int = 8080,
     open_browser: bool = True,
-    *,
     allow_remote: bool = False,
 ) -> None:
     """Start uvicorn and optionally open the system browser."""

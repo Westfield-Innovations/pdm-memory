@@ -44,7 +44,7 @@ def _driver() -> CloudDriver:
 
 
 def _log() -> EventLog:
-    return EventLog(Memory(storage=_driver()))
+    return EventLog(Memory(storage=_driver(), user="default"))
 
 
 def _resp(status_code: int, body: dict | list, text: str = ""):

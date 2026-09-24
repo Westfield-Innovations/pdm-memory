@@ -104,7 +104,10 @@ class EventLog:
             )
         self._memory = memory
         self._storage = storage
-        self._user = getattr(memory, "_user", "default")
+        # No fallback. `Memory` requires `user`, so an object without one is
+        # not a Memory, and quietly filing its events under a shared
+        # "default" identity is the failure this whole change removes.
+        self._user = memory._user
 
     # ------------------------------------------------------------------
     # Events
