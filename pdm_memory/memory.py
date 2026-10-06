@@ -261,7 +261,9 @@ class Memory:
             text:           The memory content (max 500 chars recommended).
             source:         Origin label: "manual", "azus_chat", "csv", etc.
                             Use ``azus_chat`` only for Companion chat extract.
-            tags:           Intent tags (3+ recommended for best retrieval).
+            tags:           Intent tags (3+ recommended for best retrieval;
+                            a cloud store requires at least 3 and raises
+                            ``ValueError`` before sending otherwise).
             p_magnitude:    Initial pressure / importance (0–100).
             t_persistence:  Days this memory stays relevant before decaying.
             drawer:         Category drawer name (e.g. "preferences", "facts").

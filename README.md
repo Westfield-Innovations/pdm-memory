@@ -166,6 +166,8 @@ mem.save(
     p_magnitude=70,
     dedupe=True,
 )
+# A cloud store requires at least 3 tags per memory (ValueError before any
+# request otherwise); a local store accepts fewer.
 # Exact-once create on retries: pass idempotency_key=...
 hits = mem.recall("what timezone are they in?")
 
