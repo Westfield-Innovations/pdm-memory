@@ -119,3 +119,26 @@ class TestApplyContraryEvidence:
         assert after.p_magnitude < before
         assert after.validation_prediction_total == 1
         assert after.validation_prediction_correct == 0
+
+    def test_refused_evidence_save_leaves_target_untouched(self, mem, monkeypatch):
+        """A store that refuses the evidence must not leave the target penalised."""
+        mid = mem.save("Atomic claim", tags=["a", "b", "c"], p_magnitude=70)
+        before = mem._storage.get(mid, user="test_user")
+
+        def refuse(*args, **kwargs):
+            raise ValueError("Companion ingest requires at least 3 intent_tags (got 0).")
+
+        monkeypatch.setattr(mem._storage, "save", refuse)
+        with pytest.raises(ValueError, match="intent_tags"):
+            mem.apply_contrary_evidence(mid, "Opposite claim")
+
+        after = mem._storage.get(mid, user="test_user")
+        assert after.p_magnitude == before.p_magnitude
+        assert after.validation_prediction_total == before.validation_prediction_total
+
+    def test_empty_evidence_leaves_target_untouched(self, mem):
+        mid = mem.save("Atomic claim 2", tags=["a", "b", "c"], p_magnitude=70)
+        before = mem._storage.get(mid, user="test_user").p_magnitude
+        with pytest.raises(ValueError):
+            mem.apply_contrary_evidence(mid, "  ")
+        assert mem._storage.get(mid, user="test_user").p_magnitude == before

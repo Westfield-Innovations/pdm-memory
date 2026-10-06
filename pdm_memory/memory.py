@@ -968,16 +968,8 @@ class Memory:
             rec.validation_prediction_total,
         )
 
-        updated = self._apply_prediction_miss(
-            rec, coupling_score=coupling_score, touch=False
-        )
-        v_after = calculate_v(
-            updated.validation_prediction_correct,
-            updated.validation_prediction_total,
-        )
-        snap = self.decay_at(updated)
-        p_effective_after = snap.p_effective
-
+        # Persist the evidence first: a save the store refuses must not leave
+        # the target already penalised.
         evidence_id: str | None = None
         if persist_evidence:
             text, tags, meta, shape = self._normalize_contrary_evidence(
@@ -994,6 +986,16 @@ class Memory:
                 source="contrary_evidence",
                 dedupe=False,
             )
+
+        updated = self._apply_prediction_miss(
+            rec, coupling_score=coupling_score, touch=False
+        )
+        v_after = calculate_v(
+            updated.validation_prediction_correct,
+            updated.validation_prediction_total,
+        )
+        snap = self.decay_at(updated)
+        p_effective_after = snap.p_effective
 
         logger.info(
             "[PDM] apply_contrary_evidence(target=%s) P=%.1f→%.1f V=%.4f→%.4f evidence=%s",
