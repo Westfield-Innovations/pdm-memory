@@ -49,6 +49,10 @@ _API_URGENCY_MAX = 10.0
 _API_P_MAGNITUDE_MIN = 50.0
 _API_P_MAGNITUDE_MAX = 100.0
 _API_INTENT_TAGS_MIN = 3
+
+# The server builds the signature while the request waits (6-14 s observed), so
+# the default request timeout would give up on work the server then finishes.
+_EXTRACT_TIMEOUT = 60.0
 # companion Signature.SOURCE_CHOICES
 _API_SOURCES = frozenset(
     {
@@ -1181,7 +1185,11 @@ class CloudDriver(BaseStorage):
             payload["text"] = text
         if force:
             payload["force"] = True
-        resp = self._post(f"/api/v1/pdm/source-events/{event_id}/extract", payload)
+        resp = self._post(
+            f"/api/v1/pdm/source-events/{event_id}/extract",
+            payload,
+            timeout=max(self._timeout, _EXTRACT_TIMEOUT),
+        )
         return resp.json()
 
     def save_source_event(self, event: Any, *, payload: str = "") -> str:
@@ -1325,7 +1333,7 @@ class CloudDriver(BaseStorage):
     # HTTP helpers
     # ------------------------------------------------------------------
 
-    def _post(self, path: str, payload: dict):
+    def _post(self, path: str, payload: dict, *, timeout: float | None = None):
         import httpx
 
         self._auth.ensure_fresh()
@@ -1334,7 +1342,7 @@ class CloudDriver(BaseStorage):
                 f"{self._base_url}{path}",
                 json=payload,
                 headers=self._auth.headers(),
-                timeout=self._timeout,
+                timeout=self._timeout if timeout is None else timeout,
             )
         except httpx.HTTPError as exc:
             raise CloudStorageError(f"Cloud POST failed: {exc}", path=path) from exc

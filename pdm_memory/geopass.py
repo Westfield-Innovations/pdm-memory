@@ -177,7 +177,15 @@ class GeoPass:
         purpose: str | None = None,
         at: datetime | str | None = None,
     ) -> str:
-        """The minimum of ``requested_detail`` and what the caller may see."""
+        """
+        The minimum of ``requested_detail`` and what the caller may see.
+
+        The detail ladder depends on the target. A PDM signature or domain
+        answers on ``none`` < ``conclusion`` < ``full``; a document answers on
+        ``none`` < ``existence`` < ``summary`` < ``redacted`` < ``full``. A level
+        the target's ladder does not have is not an error: it resolves to
+        ``none``.
+        """
         data = self._get(
             "/api/v1/pdm/geopass/view/",
             {
@@ -199,7 +207,13 @@ class GeoPass:
         interval: tuple[datetime | str | None, datetime | str | None] | None = None,
         reason: str = "",
     ) -> GeoPassGrant:
-        """Create a PDM grant. The caller is always the grantor (server-side token)."""
+        """
+        Create a PDM grant. The caller is always the grantor (server-side token).
+
+        ``target`` must be a signature the caller owns, not a field or ``"*"``:
+        the server refuses anything else with ``CloudConflictError``
+        (``GRANT_REFUSED``), as it does an unknown operation.
+        """
         payload: dict[str, Any] = {
             "observer": observer,
             "operation": operation,

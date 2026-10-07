@@ -127,6 +127,8 @@ class TestIngest:
             ]
         )
         driver.file_signature_in_field = MagicMock(return_value="sfm-1")
+        driver.find_by_hash = MagicMock(return_value=None)
+        driver.signature_fields = MagicMock(return_value=[])
 
     def test_one_event_many_signatures(self, log, driver):
         self._wire(driver)
@@ -152,11 +154,46 @@ class TestIngest:
 
     def test_a_fact_already_on_another_event_counts_as_reused(self, log, driver):
         self._wire(driver, linked=(False, True))
+        driver.find_by_hash = MagicMock(side_effect=[object(), None])
         with patch.object(log._memory, "save", side_effect=["sig-1", "sig-2"]):
             out = log.ingest(
                 event=log.event("chat_message"), facts=[{"text": "A"}, {"text": "B"}]
             )
         assert out["signatures_reused"] == 1
+
+    def test_a_new_fact_is_not_reused_when_save_already_gave_it_provenance(
+        self, log, driver
+    ):
+        # On a real cloud store ``save`` attaches its own provenance, so the
+        # server answers ``linked=False`` even for a fact nobody had before.
+        self._wire(driver, linked=(False,))
+        with patch.object(log._memory, "save", side_effect=["sig-1"]):
+            out = log.ingest(event=log.event("chat_message"), facts=[{"text": "A"}])
+        assert out["signatures_reused"] == 0
+
+    def test_repeating_an_ingest_does_not_refile_the_fact(self, log, driver):
+        self._wire(driver, linked=(False,))
+        driver.signature_fields = MagicMock(return_value=["westfield"])
+        with patch.object(log._memory, "save", side_effect=["sig-1"]):
+            log.ingest(
+                event=log.event("chat_message"),
+                facts=[{"text": "A"}],
+                field_id="westfield",
+            )
+        driver.file_signature_in_field.assert_not_called()
+
+    def test_a_fact_filed_in_another_field_is_still_filed_here(self, log, driver):
+        self._wire(driver, linked=(False,))
+        driver.signature_fields = MagicMock(return_value=["elsewhere"])
+        with patch.object(log._memory, "save", side_effect=["sig-1"]):
+            log.ingest(
+                event=log.event("chat_message"),
+                facts=[{"text": "A"}],
+                field_id="westfield",
+            )
+        driver.file_signature_in_field.assert_called_once_with(
+            "sig-1", "westfield", user=log._user
+        )
 
     def test_about_travels_as_a_mention_and_field_id_files_the_fact(self, log, driver):
         self._wire(
@@ -201,6 +238,18 @@ class TestExtractSignatures:
 
         extract.assert_called_once_with("ev-1", TEXT, force=True, user=log._user)
         assert out == [record]
+
+    def test_waits_longer_than_the_default_request_timeout(self, driver):
+        # The server builds the signature while the request waits; giving up at
+        # the default 15 s abandons work it then finishes.
+        with patch("httpx.post", return_value=_resp(200, {"count": 0})) as post:
+            driver.extract_signatures("ev-1", TEXT)
+        assert post.call_args.kwargs["timeout"] >= 60.0
+
+    def test_other_posts_keep_the_default_timeout(self, driver):
+        with patch("httpx.post", return_value=_resp(200, {})) as post:
+            driver._post("/api/v1/pdm/anything", {})
+        assert post.call_args.kwargs["timeout"] == driver._timeout
 
     def test_an_llm_client_is_refused_not_ignored(self, log):
         with pytest.raises(ValueError, match="server"):
