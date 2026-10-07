@@ -239,6 +239,18 @@ class TestExtractSignatures:
         extract.assert_called_once_with("ev-1", TEXT, force=True, user=log._user)
         assert out == [record]
 
+    def test_waits_longer_than_the_default_request_timeout(self, driver):
+        # The server builds the signature while the request waits; giving up at
+        # the default 15 s abandons work it then finishes.
+        with patch("httpx.post", return_value=_resp(200, {"count": 0})) as post:
+            driver.extract_signatures("ev-1", TEXT)
+        assert post.call_args.kwargs["timeout"] >= 60.0
+
+    def test_other_posts_keep_the_default_timeout(self, driver):
+        with patch("httpx.post", return_value=_resp(200, {})) as post:
+            driver._post("/api/v1/pdm/anything", {})
+        assert post.call_args.kwargs["timeout"] == driver._timeout
+
     def test_an_llm_client_is_refused_not_ignored(self, log):
         with pytest.raises(ValueError, match="server"):
             log.extract_signatures("ev-1", TEXT, llm_client=object())
