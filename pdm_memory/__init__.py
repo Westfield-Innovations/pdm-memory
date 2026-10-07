@@ -40,7 +40,7 @@ from pdm_memory.models import (
 )
 from pdm_memory.storage.factory import create_storage, register_storage
 
-__version__ = "0.2.4"
+__version__ = "0.2.5"
 __all__ = [
     "AlignmentReport",
     "ContraryEvidenceResult",
