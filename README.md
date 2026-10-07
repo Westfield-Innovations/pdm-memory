@@ -203,7 +203,8 @@ state = mem.state_at("westfield", datetime(2026, 3, 1, 12, tzinfo=timezone.utc))
 
 state.field_memberships   # standing in the field, with the intervals it held
 state.relationships       # edges, each with how current its channel reads
-state.entities            # what this observer may reveal, one keyset page
+state.entities            # signatures filed in this field, plus any filed nowhere; what this
+                          # observer may reveal, one keyset page
 
 # Nested fields match by prefix: "westfield" covers "westfield/dqs".
 state = mem.current_state("westfield/dqs")

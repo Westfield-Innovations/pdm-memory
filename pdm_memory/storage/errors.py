@@ -35,7 +35,9 @@ class CloudConflictError(CloudStorageError):
     ``error_code`` carries the server's own code (``MEMBERSHIP_REFUSED``,
     ``RELATIONSHIP_REFUSED``, ``MEMBERSHIP_ALREADY_CLOSED``, …) when the body
     supplied one, so a caller can react to which conflict this was rather than
-    parsing prose out of the message.
+    parsing prose out of the message. ``detail`` is the server's own reason in
+    words (why a grant was refused, which rule a link broke) and is also part
+    of the message, so a bare code is no longer all a person sees.
     """
 
     def __init__(
@@ -45,6 +47,8 @@ class CloudConflictError(CloudStorageError):
         error_code: str | None = None,
         status_code: int = 409,
         path: str | None = None,
+        detail: str | None = None,
     ) -> None:
         super().__init__(message, status_code=status_code, path=path)
         self.error_code = error_code
+        self.detail = detail

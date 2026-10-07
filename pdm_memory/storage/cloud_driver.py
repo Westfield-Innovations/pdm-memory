@@ -477,8 +477,14 @@ class CloudDriver(BaseStorage):
         self.update(memory_id, user=user, is_deleted=True)
 
     def hard_delete(self, memory_id: str, user: str = "default") -> None:
-        """DELETE /api/v1/pdm/signatures/<id> — permanent removal."""
-        self._delete(f"/api/v1/pdm/signatures/{memory_id}")
+        """
+        DELETE /api/v1/pdm/signatures/<id>?permanent=true — permanent removal.
+
+        Without the flag the same route only marks the row deleted, so the
+        flag is what makes this the explicit request the server requires. A
+        server that predates the flag ignores it and marks the row.
+        """
+        self._delete(f"/api/v1/pdm/signatures/{memory_id}?permanent=true")
 
     def list(
         self,
@@ -1463,17 +1469,22 @@ class CloudDriver(BaseStorage):
             # MEMBERSHIP_ALREADY_CLOSED, …) — surfaced on the exception rather
             # than left for a caller to parse out of prose.
             error_code = None
+            detail = None
             try:
                 body = resp.json()
                 if isinstance(body, dict):
                     error_code = body.get("error_code")
+                    raw_detail = body.get("detail")
+                    detail = str(raw_detail) if raw_detail else None
             except Exception as err:
                 logger.debug("[PDM-Cloud] error reading conflict body: %s", err)
             raise CloudConflictError(
                 f"Cloud HTTP 409 for {path}"
-                + (f" ({error_code})" if error_code else ""),
+                + (f" ({error_code})" if error_code else "")
+                + (f": {detail[:300]}" if detail else ""),
                 error_code=error_code,
                 path=path,
+                detail=detail,
             )
         if status is not None and status >= 400:
             detail = ""

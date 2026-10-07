@@ -341,8 +341,18 @@ class TestCloudFailFast:
         _driver().hard_delete(mid)
         mock_delete.assert_called_once()
         url = mock_delete.call_args.args[0]
-        assert url.endswith(f"/api/v1/pdm/signatures/{mid}")
-        assert not url.endswith("/")
+        assert url.endswith(f"/api/v1/pdm/signatures/{mid}?permanent=true")
+
+    @patch("httpx.patch")
+    def test_soft_delete_does_not_ask_for_permanent_removal(self, mock_patch):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {}
+        mock_patch.return_value = mock_resp
+
+        _driver().delete("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+
+        assert "permanent" not in mock_patch.call_args.args[0]
 
     @patch("httpx.get")
     def test_list_drawers_parses_companion_drawers_key(self, mock_get):

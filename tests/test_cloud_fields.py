@@ -136,6 +136,31 @@ class TestAddFieldMembership:
         assert exc.value.error_code == "MEMBERSHIP_REFUSED"
         assert exc.value.status_code == 409
 
+    @patch("httpx.post")
+    def test_the_servers_reason_is_in_the_message_and_on_the_exception(
+        self, mock_post
+    ):
+        mock_post.return_value = _resp(
+            409, {"error_code": "MEMBERSHIP_REFUSED", "detail": "already live"}
+        )
+
+        with pytest.raises(CloudConflictError) as exc:
+            _log().add_field_membership("subject:1", "westfield")
+
+        assert exc.value.detail == "already live"
+        assert "MEMBERSHIP_REFUSED" in str(exc.value)
+        assert "already live" in str(exc.value)
+
+    @patch("httpx.post")
+    def test_a_conflict_with_no_reason_keeps_the_old_message(self, mock_post):
+        mock_post.return_value = _resp(409, {"error_code": "MEMBERSHIP_REFUSED"})
+
+        with pytest.raises(CloudConflictError) as exc:
+            _log().add_field_membership("subject:1", "westfield")
+
+        assert exc.value.detail is None
+        assert str(exc.value).endswith("(MEMBERSHIP_REFUSED)")
+
 
 class TestEndFieldMembership:
     def test_has_no_cloud_route(self):
