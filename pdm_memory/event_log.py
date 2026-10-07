@@ -36,6 +36,7 @@ from typing import Any
 
 from pdm_memory.core.signature import SignatureRecord
 from pdm_memory.storage.event_hash import compute_content_hash
+from pdm_memory.storage.schema import hash_fact_text
 from pdm_memory.storage.events import (
     EntityMentionRecord,
     EntityRecord,
@@ -414,6 +415,16 @@ class EventLog:
             text = spec.pop("text")
             about = spec.pop("about", None)
 
+            # ``save`` on a cloud store already gives a new fact its own
+            # provenance, so ``linked`` is False for a fresh fact as well as for
+            # a repeated one. Whether the fact was on file before this call is
+            # the only thing that tells them apart.
+            on_file = (
+                spec.get("dedupe", True)
+                and not spec.get("idempotency_key")
+                and self._storage.find_by_hash(hash_fact_text(text), user=self._user)
+                is not None
+            )
             memory_id = self._memory.save(text, **spec)
             signature_ids.append(memory_id)
 
@@ -425,7 +436,7 @@ class EventLog:
                 entities.append(mention)
 
             out = self._storage.attach_signature(event_id, memory_id, entities=entities)
-            if not out.get("linked"):
+            if on_file and not out.get("linked"):
                 reused += 1
             if about:
                 resolved = next(
@@ -439,7 +450,11 @@ class EventLog:
                 if resolved:
                     entity_ids[about] = resolved
 
-            if field_id:
+            # Companion refuses a second filing of the same fact in the same
+            # field, so a repeated ingest files only what is not filed yet.
+            if field_id and field_id not in self._storage.signature_fields(
+                memory_id, user=self._user
+            ):
                 self._storage.file_signature_in_field(
                     memory_id, field_id, user=self._user
                 )
