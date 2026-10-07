@@ -89,7 +89,7 @@ print(report.render())
 snap = mem.decay_at(hits[0].id)
 print(snap.shape, snap.half_life_days, snap.p_effective)
 
-# Store-wide purge of memories below the live P_effective threshold:
+# Store-wide soft-delete of memories below the live P_effective threshold:
 counts = mem.decay()
 print(f"Decayed: {counts['decayed']}, Deleted: {counts['deleted']}")
 ```
@@ -735,7 +735,7 @@ Use `report.is_safe_to_act` (True only when `status == "ALIGNED"`) before trigge
 | `apply_contrary_evidence(target, evidence, …)` → `ContraryEvidenceResult` | Immediate V-miss + Δp on conflicting evidence; does not rewrite historical fact fields |
 | `delete(memory_id)` → `bool` | Soft-delete when storage supports it |
 | `decay_at(signature, now=None)` → `DecaySnapshot` | Live shape-aware decay metrics for one memory (read-only) |
-| `decay(dry_run=False)` → `dict` | Purge signatures whose live `P_effective` is below threshold |
+| `decay(dry_run=False)` → `dict` | Soft-delete signatures whose live `P_effective` is below threshold |
 | `explain(memory_id, query)` → `ExplainReport` | Show why a memory has its current pressure |
 | `list(limit, min_pressure, drawer, cursor_id)` → `MemoryListPage` | Keyset page of memories (storage list API on cloud) |
 | `sync(direction, token, cloud_url)` → `SyncReport` | Sync local ↔ cloud |
@@ -762,7 +762,7 @@ Use `report.is_safe_to_act` (True only when `status == "ALIGNED"`) before trigge
 
 **Pressure** — every memory has a p_magnitude (0–100). Important, frequently-used memories stay strong. Unused ones decay. You control the baseline; the system adjusts dynamically.
 
-**Decay** — live `P_effective` uses an exponential half-life at recall/explain time (stored `p_magnitude` is not rewritten on read). Domain half-lives still apply (market signals ~1 day; core facts ~1 year). When a **memory shape** is set (`ephemeral` / `behavioral` / `structural`), it overrides domain: 2 hours / 90 days / ∞. `mem.decay_at(id)` returns a live snapshot; `mem.decay()` purges signatures below the live threshold.
+**Decay** — live `P_effective` uses an exponential half-life at recall/explain time (stored `p_magnitude` is not rewritten on read). Domain half-lives still apply (market signals ~1 day; core facts ~1 year). When a **memory shape** is set (`ephemeral` / `behavioral` / `structural`), it overrides domain: 2 hours / 90 days / ∞. `mem.decay_at(id)` returns a live snapshot; `mem.decay()` soft-deletes signatures below the live threshold (rows are hidden, not erased).
 
 **Retrieval (TAS)** — Threshold-Adjustment Search lowers the pressure threshold based on query uncertainty (search_cost). Then coupling scores rank memories by tag overlap, domain, regime, and pressure proximity. The most resonant memories surface first.
 

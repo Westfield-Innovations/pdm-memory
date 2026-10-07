@@ -1439,7 +1439,7 @@ class Memory:
 
     def decay(self, dry_run: bool = False) -> dict[str, int]:
         """
-        Purge memories whose live ``P_effective`` is below the delete threshold.
+        Soft-delete memories whose live ``P_effective`` is below the delete threshold.
 
         Uses the same half-life law as ``recall()`` / ``explain()``. Does not
         rewrite ``p_magnitude``. ``decayed`` stays in the return dict for API
@@ -1488,15 +1488,11 @@ class Memory:
                 counts["skipped"] += 1
 
         if to_delete and not dry_run:
-            hard_delete = getattr(self._storage, "hard_delete", None)
             txn = getattr(self._storage, "transaction", None)
             ctx: AbstractContextManager[None] = txn() if callable(txn) else nullcontext()
             with ctx:
                 for memory_id in to_delete:
-                    if callable(hard_delete):
-                        hard_delete(memory_id, user=self._user)
-                    else:
-                        self._storage.delete(memory_id, user=self._user)
+                    self._storage.delete(memory_id, user=self._user)
 
         logger.info("[PDM] decay() %s | %s", "(dry_run)" if dry_run else "", counts)
         return counts
