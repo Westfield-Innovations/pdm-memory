@@ -307,7 +307,9 @@ def calculate_temporal_geometry(
         E_T = C_T × transmission × P_T   (normalized via asymptotic scaling)
 
     Post-deadline:
-        E_T = 0, weight decays by decay_rate per day past deadline.
+        E_T = 0, weight = temporal_weight × (1 − decay_rate)^days_past.
+        The weight is a function of days_past alone, so repeated calls with
+        the same ``now`` agree however often they run.
 
     Args:
         c_base:          Initial curvature (0–1).
@@ -317,7 +319,10 @@ def calculate_temporal_geometry(
         t_remaining_days: Days to deadline (negative = past deadline).
         persist_days:    t_persistence value.
         decay_rate:      Post-deadline fade rate per day.
-        temporal_weight: Current weight (decays post-deadline).
+        temporal_weight: Base weight the post-deadline fade starts from
+                         (default 1.0). Pass the base, not a weight this
+                         function returned earlier: feeding the result back
+                         compounds the fade on every call.
 
     Returns:
         dict with keys: c_temporal, s_temporal, p_temporal, e_temporal,
