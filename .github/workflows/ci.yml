@@ -12,6 +12,8 @@ jobs:
   test:
     name: Test Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
+    # A PR merge commit was already tested as refs/pull/N/merge; direct pushes still run.
+    if: github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'Merge pull request')
     strategy:
       fail-fast: false
       matrix:
