@@ -302,6 +302,26 @@ class TestTemporalGeometry:
         assert result["status"] == "EXPIRED"
         assert result["e_temporal"] == 0.0
 
+    def _expired_weight(self, days_past, **kw):
+        return calculate_temporal_geometry(
+            c_base=0.5, s_base=0.5, p_base=0.7,
+            urgency_rate=2.0, t_remaining_days=-days_past, persist_days=30.0, **kw
+        )["temporal_weight"]
+
+    def test_post_deadline_weight_is_idempotent(self):
+        assert self._expired_weight(3.0) == self._expired_weight(3.0)
+
+    def test_post_deadline_weight_after_three_days(self):
+        assert self._expired_weight(3.0) == pytest.approx(0.857, abs=1e-3)
+
+    def test_post_deadline_weight_reaches_threshold_near_58_days(self):
+        assert self._expired_weight(58.0) == pytest.approx(0.05, abs=2e-3)
+
+    def test_temporal_weight_scales_the_base(self):
+        assert self._expired_weight(3.0, temporal_weight=0.5) == pytest.approx(
+            0.5 * 0.95**3
+        )
+
     def test_urgency_flag(self):
         # Very close to deadline → should be urgent
         result = calculate_temporal_geometry(
