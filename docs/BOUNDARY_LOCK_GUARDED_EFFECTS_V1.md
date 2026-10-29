@@ -1,6 +1,6 @@
 # Boundary Lock Guarded Effects Specification
 
-Version 1 | October 23 2026 | SDK preview 0.2.6a1
+Version 1 | October 23 2026 | SDK 0.2.6
 
 Westfield Innovations | Carl D. Hildebrandt
 
@@ -170,11 +170,11 @@ Existing SDK alignment, storage and evidence behavior must remain compatible. Op
 
 | Completed check | Result and scope |
 | --- | --- |
-| Full Python suite on Python 3.12 | 717 passed and 15 skipped; skipped tests require a configured live PostgreSQL service |
+| Full Python suite on Python 3.12 | 722 passed and 15 skipped; skipped tests require a configured live PostgreSQL service |
 | Final guarded-effects and PDM integration coverage | 44 passed; includes current evidence, exact request binding, configuration generations, concurrency, uncertainty and recovery |
 | OpenClaw plugin suite on Node 24 | 46 passed; includes 33 tests invoking actual registered hooks in the shipped bundle |
 | Bundled examples | Non-time simulation and real PDM save run locally; no production controller or deployed OpenClaw host used |
 
-The handoff includes an installable 0.2.6a1 wheel, source archive, local change patch, the OpenClaw plugin sources and runtime bundle, this specification and reproduction instructions. The repository changes are prepared on local branch `feat/boundary-lock-guarded-effects`. Nothing has been pushed or published.
+The preview was delivered as a 0.2.6a1 wheel, source archive and patch against `111b4b2`. It ships in pdm-memory 0.2.6 with fixes to same-controller re-release, unknown reconciliation of returned actions and the openings fingerprint.
 
 This specification builds on the six-panel review and the earlier Boundary Lock Control and Recovery Across Time paper. It does not treat panel agreement as implementation evidence or claim patent novelty. The inspected repository revision, implementation and recorded checks define what this preview actually contains.
