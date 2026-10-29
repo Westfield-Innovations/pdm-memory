@@ -4,19 +4,17 @@
 [![OpenClaw](https://img.shields.io/badge/OpenClaw-plugin-blue)](https://github.com/openclaw/openclaw)
 [![Documentation](https://img.shields.io/badge/Docs-azus.ai%2Fsupport-blue)](https://azus.ai/support)
 
-OpenClaw agents can call tools freely. **PDM Guard** runs `verify()` at OpenClaw's `before_tool_call` hook — scoring every proposed action against plain-English rules before it executes.
-
-Nothing in OpenClaw's own plugin catalog checks a proposed action against a stated rule before it fires. This plugin fills that lane.
+**PDM Guard** runs `verify()` at OpenClaw's `before_tool_call` hook, comparing a summary of a proposed action with owner-controlled, plain-English rules before that tool executes. Missing rules and failed checks block execution by default.
 
 - 🛡️ **Goal-Anchor Alignment.** Same gate as `pdm-memory`: **ALIGNED**, **CONFLICT**, or **TORSION**.
 - 📝 **Plain-English rules.** Add `never hardcode localhost` — no code, no PDM store required.
 - 🔒 **Local rules file.** `~/.openclaw/pdm-guard-rules.json` — your data stays on your machine.
-- 🧾 **Receipts, not screenshots.** Every gate decision logs a short JSON receipt to the OpenClaw gateway log.
+- 🧾 **Compact receipts.** Gate decisions and matched tool completions produce local JSON log entries.
 - ⚡ **Five minutes.** Install plugin → add one rule → watch a violating action stop before it runs.
 
 📖 **GAA background:** [Guarded Agents — GAA & Torsion](https://azus.ai/support)
 
-**Tested runtime:** OpenClaw **2026.7.1-2** (see spike report for block/permit receipts).
+**Existing live-host test baseline:** OpenClaw **2026.7.1-2** (see spike report for block/permit receipts). The hardening tests also invoke the registered hooks with a stub host entry helper; they do not replace testing a deployed host version.
 
 ---
 
@@ -41,17 +39,19 @@ Before an agent **acts**, PDM Guard:
 1. Loads guard rules from `~/.openclaw/pdm-guard-rules.json` (or config fallback).
 2. Builds an intent string from the tool name and payload (`command`, `text`, `patch`, …).
 3. Calls `pdm_memory.verify(intent, goals)` directly — spawns a short-lived Python process (`verify_bridge.py`) that imports `pdm_memory` in-process and calls the function. No HTTP, no server to run.
-4. **Blocks** the tool when `is_safe_to_act` is `False`, or **permits** it through.
+4. Validates the checker's response, then **blocks** unsafe results or **permits** a valid `ALIGNED` result. Missing rules, checker errors, timeouts, and malformed or inconsistent responses block by default.
 
 Statuses (same as standalone GAA):
 
 | Status | Meaning | Tool runs? |
 |--------|---------|------------|
-| **ALIGNED** | Intent agrees with the rules | Yes |
+| **ALIGNED** | No conflict detected in the summarized intent | Yes |
 | **CONFLICT** | Soft mismatch / fail-closed | No |
 | **TORSION** | Hard contradiction | No |
 
-Rule management (`pdm_guard_rule`, `/pdm-guard`) always bypasses the gate — otherwise you could lock yourself out.
+The agent can list rules using `pdm_guard_rule`. It cannot add or remove its own restrictions. Rule changes use the direct `/pdm-guard` command and require a verified owner; that command is independent of the action checker so an owner can repair missing rules.
+
+This is a text-alignment hook, not a complete permission boundary. `ALIGNED` does not prove that a tool is authorized to affect every resource it can reach. The host must invoke the hook for every protected action. The plugin does not isolate programs, intercept arbitrary computer operations, or undo external effects.
 
 ---
 
@@ -103,11 +103,13 @@ Restart the gateway:
 openclaw daemon restart
 ```
 
-### 2. Add a rule
+### 2. Add a rule as the owner
 
 ```text
 /pdm-guard add never hardcode localhost
 ```
+
+The host must identify you as both authorized and an owner. If your host supplies only an authorized sender identity, configure your exact identity in `ownerSenderIds`; missing owner evidence denies changes. Add the first rule before asking the agent to run other tools, since an empty rule set blocks by default.
 
 ### 3. Trigger a violating action
 
@@ -145,8 +147,10 @@ Clean one-liner (not the OpenClaw gateway envelope). Blocked example:
 |-----|---------|-------------|
 | `pythonBin` | `python3` | Interpreter used to run `verify_bridge.py` — must have `pdm-memory` importable |
 | `rulesFile` | `~/.openclaw/pdm-guard-rules.json` | Local rules JSON path |
-| `timeoutMs` | `8000` | Time budget for the `verify()` subprocess before it's killed |
+| `timeoutMs` | `8000` | Positive time budget, at most 2147483647 milliseconds, for the checker process |
 | `goals` | `[]` | Legacy fallback rules when the rules file is empty |
+| `failureMode` | `"block"` | Default blocks missing rules and failed checks. Explicit `"allow"` is **unprotected compatibility mode** for those failures. It still blocks a valid checker refusal. |
+| `ownerSenderIds` | `[]` | Exact authenticated host sender identities permitted to change rules when the host does not supply verified owner status |
 
 ### Environment overrides
 
@@ -158,6 +162,8 @@ Clean one-liner (not the OpenClaw gateway envelope). Blocked example:
 | `PDM_GUARD_RECEIPT_LOG` | Clean receipt JSONL path (default `/tmp/openclaw/pdm-guard-receipts.jsonl`) |
 
 Plugin config is read from `api.pluginConfig` at `register()` time — typed hooks do not populate `ctx.pluginConfig`.
+
+`failureMode` and `ownerSenderIds` are taken only from the registered owner configuration. A per-call hook context cannot enable unprotected compatibility mode or appoint an owner. Protect this configuration and the rules file from the agent's ordinary file-writing tools using host or operating-system permissions; this plugin cannot supply that protection itself.
 
 ### Rules file format
 
@@ -180,7 +186,7 @@ Plugin config is read from `api.pluginConfig` at `register()` time — typed hoo
 
 ## 📋 Managing Rules
 
-### Slash commands (recommended — bypasses LLM)
+### Owner slash commands (bypass the model)
 
 ```text
 /pdm-guard list
@@ -190,15 +196,17 @@ Plugin config is read from `api.pluginConfig` at `register()` time — typed hoo
 
 Aliases: `ls`/`show`, `set`/`create`, `delete`/`rm`/`drop`.
 
+The command is registered with `requireAuth: true`. Add/remove also require `isAuthorizedSender: true` plus either host-verified `senderIsOwner: true` or an exact match in owner-configured `ownerSenderIds`. When the host supplies `assertOwnerCurrent`, the handler rechecks owner standing immediately before mutation. An authorized non-owner cannot change rules. Older hosts without owner metadata need the explicit identity list; authentication alone is insufficient.
+
 ### Agent tool
 
-If the model has `pdm_guard_rule` allowlisted, ask in plain English:
+If the model has `pdm_guard_rule` allowlisted, it can inspect the active rules:
 
 ```json
-{ "action": "add", "rule": "never hardcode localhost" }
-{ "action": "remove", "rule": "never hardcode localhost" }
 { "action": "list" }
 ```
+
+Add/remove are rejected both by the registered before hook and by the tool implementation, including a direct call that skips the hook. Ask the owner to use `/pdm-guard` for changes.
 
 Keep the normal coding profile in `openclaw.json`. Do **not** set `tools.allow` to only `pdm_guard_rule` — that replaces the whole tool catalog and removes `exec` / other coding tools.
 
@@ -208,12 +216,18 @@ Keep the normal coding profile in `openclaw.json`. Do **not** set `tools.allow` 
 
 | Condition | Gate behavior |
 |-----------|---------------|
-| Rules file has entries | Verify every tool call (except rule management) |
-| No rules anywhere | Fail-open — tool proceeds |
-| `verify()` process fails/times out/bad output | Fail-open — tool proceeds (`gate_status: SKIPPED_VERIFY_ERROR`) |
+| Rules file has entries | Verify normal tool calls; agent rule listing is separate |
+| No rules anywhere | Block (`BLOCKED_NO_RULES`) |
+| Rules cannot be loaded | Block (`BLOCKED_RULES_ERROR`) |
+| Invalid checker timeout | Block (`BLOCKED_CONFIG_ERROR`) |
+| Checker cannot start, fails, times out, or returns malformed/inconsistent output | Block (`BLOCKED_VERIFY_ERROR`) |
 | `verify()` → not safe | Block with reason shown to user |
+| Owner explicitly sets `failureMode: "allow"` and a check cannot be made | Proceed without protection, with an `UNPROTECTED_*` receipt when the outcome can be matched |
+| Agent attempts to add/remove a rule | Block (`BLOCKED_OWNER_RULE_CHANGE`) |
 
 Intent strings are built by `intent.ts`: tool name, then `path=` (basename) / `command=` first; `content≈` is a short preview only. The label is `path=`, not `file=` — the word `file` false-triggers rules like "never create a file named …".
+
+These summaries omit information and clip long input. A full-parameter digest used for receipt matching does not change what the alignment engine sees or establish resource authority.
 
 ### Receipts
 
@@ -230,17 +244,25 @@ Each line is one compact object:
 | Field | Meaning |
 |-------|---------|
 | `time` | ISO timestamp of the gate decision |
-| `status` | `ALIGNED` / `CONFLICT` / `TORSION` / skip codes |
+| `status` | `ALIGNED`, `CONFLICT`, `TORSION`, `BLOCKED_*`, `UNPROTECTED_*`, or `UNCERTAIN_CORRELATION` |
 | `tool` | Tool name |
 | `action` | Short intent (`write path=config.py`, …) |
 | `rules` | Active guard rules |
-| `executed` | Whether the host ran the tool |
+| `executed` | `false` for a blocked call, `true` for a matched completion, `null` when completion cannot be uniquely matched |
 | `why` | Short explanation |
+| `tool_call_id` | Host call identity, when supplied |
+| `params_digest` | Digest of the complete JSON parameters, when available |
+| `outcome_status` | `UNCERTAIN` when result correlation is ambiguous |
 
 | Outcome | When logged |
 |---------|-------------|
 | **Blocked** | `before_tool_call` (`executed: false`) |
-| **Permitted / skipped** | `after_tool_call` (`executed: true`) |
+| **Permitted / unprotected** | Uniquely matched `after_tool_call` (`executed: true`) |
+| **Uncertain** | An unmatched or ambiguous completion affects pending candidates (`executed: null`) |
+
+Completions are matched by the host's tool-call identity, or by tool name plus complete-parameter digest when there is only one pending call of that tool. Concurrent same-tool calls without identities are uncertain even when their parameters differ: later host hooks can rewrite arguments. Contradictory final parameters and completions without enough identifying information are also uncertain instead of using arrival order. A missing completion remains pending in memory; a process restart loses that pending state.
+
+Receipt files are compact, best-effort audit logs. They are not a durable action journal, a complete copy of tool results, a recovery checkpoint, or proof of an external effect. Log write failure does not stop an already permitted tool. The SDK's guarded-effects controller is a separate addition; this plugin has not yet been connected to its durable admission/release/recovery lifecycle.
 
 Example:
 
@@ -268,12 +290,12 @@ openclaw daemon restart
 From repo root:
 
 ```bash
-# unit tests (no Python needed)
-node --test plugins/tests/openclaw/receipt.test.mjs plugins/tests/openclaw/rules-store.test.mjs
+# registered-hook tests (no real Python or external services needed; Node >= 24)
+node --experimental-strip-types --test plugins/tests/openclaw/registered-hooks.test.mjs
 
 # includes e2e — spawns verify_bridge.py directly, needs a Python >= 3.10
 # with pdm-memory installed (set PDM_GUARD_PYTHON if it's not your default python3)
-node --test plugins/tests/openclaw/*.test.mjs
+node --experimental-strip-types --test plugins/tests/openclaw/*.test.mjs
 ```
 
 ### Source layout
@@ -284,8 +306,8 @@ node --test plugins/tests/openclaw/*.test.mjs
 | `pdm-guard.js` | Runtime bundle loaded by OpenClaw |
 | `verify_bridge.py` | Reads `{intent, goals}` on stdin, calls `pdm_memory.verify()`, writes the report JSON to stdout |
 | `rules-store.ts` | Local rules file read/write with dedup |
-| `intent.ts` | Short deterministic intent strings (`file=` / `command=` first, tiny `content≈`) |
-| `receipt.ts` | Receipt helpers (`resulting_state`, block/complete builders) |
+| `intent.ts` | Short deterministic intent strings (`path=` / `command=` first, tiny `content≈`) |
+| `receipt.ts` | Receipt helpers, including explicit uncertain correlation |
 | `openclaw.plugin.json` | Manifest (`activation.onCapabilities: ["hook", "tool"]`) |
 | `plugins/tests/openclaw/` | Node test suite |
 
@@ -302,7 +324,7 @@ python -m pdm_memory.examples.standalone_guard
 
 ### `verify_bridge.py` contract
 
-Invoked as `{pythonBin} verify_bridge.py`, intent/goals passed as JSON on **stdin**, report JSON printed to **stdout**. Exit code 0 on success; nonzero (with a traceback on stderr) triggers fail-open.
+Invoked as `{pythonBin} verify_bridge.py`, intent/goals passed as JSON on **stdin**, report JSON printed to **stdout**. Exit code 0 on success. Nonzero exit, excessive output, process failure, timeout, invalid JSON, unknown status, missing fields, or an inconsistent safety flag blocks by default. Compatibility mode records these as unprotected execution instead.
 
 stdin:
 
@@ -327,12 +349,13 @@ stdout:
 
 This is a thin wrapper — `report = pdm_memory.verify(intent, goals)`, then `report.as_dict()` plus `is_safe_to_act`. No HTTP, no Django, no `companion_api` dependency for the gate itself.
 
+The plugin accepts only `ALIGNED` with `is_safe_to_act: true`, or `CONFLICT`/`TORSION` with `is_safe_to_act: false`; a nonempty explanation and a string-array `conflicting_goals` are required. The underlying `verify()` semantics are unchanged.
+
 ### `pdm_guard_rule` tool parameters
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `action` | `"add" \| "remove" \| "list"` | Rule operation |
-| `rule` | `string` | Plain-English rule text (required for add/remove) |
+| `action` | `"list"` | Inspect owner-controlled rules; mutation is not exposed to agents |
 
 ---
 

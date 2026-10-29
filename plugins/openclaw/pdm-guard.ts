@@ -2,14 +2,14 @@
  * PDM Guard — GAA gate for OpenClaw via before_tool_call hook.
  *
  * Rules live in ~/.openclaw/pdm-guard-rules.json (configurable).
- * Manage rules with:
- *   - slash command /pdm-guard (bypasses LLM)
- *   - agent tool pdm_guard_rule
+ * Owners change rules through authenticated /pdm-guard commands.
+ * The agent tool pdm_guard_rule may only list rules.
  * Calls pdm_memory.verify() directly (verify_bridge.py subprocess) before
  * every other tool execution — no HTTP endpoint involved.
  */
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -19,6 +19,7 @@ import { buildIntentText } from "./intent";
 import {
   buildBlockedReceipt,
   buildCompletedReceipt,
+  buildUncertainReceipt,
   logReceipt,
   OPENCLAW_VERSION,
   PDM_VERSION,
@@ -45,6 +46,10 @@ interface PluginConfig {
   goals?: string[];
   rulesFile?: string;
   timeoutMs?: number;
+  /** Owner-controlled compatibility escape hatch. Default is block. */
+  failureMode?: "block" | "allow";
+  /** For hosts without a verified senderIsOwner field, explicit owner identities. */
+  ownerSenderIds?: string[];
 }
 
 interface PluginApi {
@@ -69,7 +74,13 @@ interface PluginCommand {
   description: string;
   acceptsArgs?: boolean;
   requireAuth?: boolean;
-  handler: (ctx: { args?: string }) => Promise<{ text: string }> | { text: string };
+  handler: (ctx: {
+    args?: string;
+    senderId?: string;
+    isAuthorizedSender?: boolean;
+    senderIsOwner?: boolean;
+    assertOwnerCurrent?: () => void;
+  }) => Promise<{ text: string }> | { text: string };
 }
 
 interface RegisteredTool {
@@ -93,6 +104,7 @@ interface ToolExecuteResult {
 interface BeforeToolCallEvent {
   toolName: string;
   params?: Record<string, unknown>;
+  toolCallId?: string;
 }
 
 interface BeforeToolCallContext {
@@ -109,6 +121,41 @@ interface VerifyResponse {
   is_safe_to_act: boolean;
   explanation: string;
   conflicting_goals: string[];
+}
+
+const VERIFY_OUTPUT_LIMIT = 2 * 1024 * 1024;
+
+function checkedVerifyResponse(value: unknown): VerifyResponse | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  if (typeof row.status !== "string" ||
+      !["ALIGNED", "CONFLICT", "TORSION"].includes(row.status)) return null;
+  if (typeof row.is_safe_to_act !== "boolean") return null;
+  if (row.is_safe_to_act !== (row.status === "ALIGNED")) return null;
+  if (typeof row.explanation !== "string" || !row.explanation.trim()) return null;
+  if (!Array.isArray(row.conflicting_goals) ||
+      !row.conflicting_goals.every((goal) => typeof goal === "string")) return null;
+  return row as unknown as VerifyResponse;
+}
+
+/** Bind receipt correlation to complete JSON parameters, never the clipped intent. */
+function parametersDigest(value: unknown): string | null {
+  function ordered(v: unknown): unknown {
+    if (v === null || typeof v === "string" || typeof v === "boolean") return v;
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+    if (Array.isArray(v)) return v.map(ordered);
+    if (v && typeof v === "object") {
+      return Object.fromEntries(Object.keys(v).sort().map((key) => [
+        key, ordered((v as Record<string, unknown>)[key]),
+      ]));
+    }
+    throw new Error("parameters are not JSON values");
+  }
+  try {
+    return createHash("sha256").update(JSON.stringify(ordered(value))).digest("hex");
+  } catch {
+    return null;
+  }
 }
 
 function resolveRulesFilePath(cfg: Partial<PluginConfig>): string {
@@ -169,14 +216,14 @@ async function callVerifyFunction(
     try {
       child = spawn(pythonBin, [scriptPath], { stdio: ["pipe", "pipe", "pipe"] });
     } catch (err) {
-      console.warn(`[PDM GUARD] failed to spawn ${pythonBin} (${err}) - fail-open`);
+      console.warn(`[PDM GUARD] failed to spawn ${pythonBin} (${err})`);
       finish(null);
       return;
     }
 
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
-      console.warn(`[PDM GUARD] verify() call timed out after ${timeoutMs}ms - fail-open`);
+      console.warn(`[PDM GUARD] verify() call timed out after ${timeoutMs}ms`);
       finish(null);
     }, timeoutMs);
 
@@ -184,14 +231,24 @@ async function callVerifyFunction(
     let stderr = "";
     child.stdout?.on("data", (chunk: unknown) => {
       stdout += String(chunk);
+      if (stdout.length > VERIFY_OUTPUT_LIMIT) {
+        child.kill("SIGKILL");
+        clearTimeout(timer);
+        finish(null);
+      }
     });
     child.stderr?.on("data", (chunk: unknown) => {
       stderr += String(chunk);
+      if (stderr.length > VERIFY_OUTPUT_LIMIT) {
+        child.kill("SIGKILL");
+        clearTimeout(timer);
+        finish(null);
+      }
     });
 
     child.on("error", (err: unknown) => {
       clearTimeout(timer);
-      console.warn(`[PDM GUARD] verify() call failed (${err}) - fail-open`);
+      console.warn(`[PDM GUARD] verify() call failed (${err})`);
       finish(null);
     });
 
@@ -199,19 +256,24 @@ async function callVerifyFunction(
       clearTimeout(timer);
       if (code !== 0) {
         console.warn(
-          `[PDM GUARD] verify() exited with code ${code} - fail-open. ${stderr.trim().slice(-500)}`,
+          `[PDM GUARD] verify() exited with code ${code}. ${stderr.trim().slice(-500)}`,
         );
         finish(null);
         return;
       }
       try {
-        finish(JSON.parse(stdout) as VerifyResponse);
+        finish(checkedVerifyResponse(JSON.parse(stdout)));
       } catch (err) {
-        console.warn(`[PDM GUARD] verify() returned invalid JSON (${err}) - fail-open`);
+        console.warn(`[PDM GUARD] verify() returned invalid JSON (${err})`);
         finish(null);
       }
     });
 
+    child.stdin?.on("error", () => {
+      clearTimeout(timer);
+      child.kill("SIGKILL");
+      finish(null);
+    });
     child.stdin?.write(JSON.stringify({ intent, goals }));
     child.stdin?.end();
   });
@@ -322,7 +384,11 @@ export default definePluginEntry({
     const registeredCfg = (api as PluginApi).pluginConfig ?? {};
     const rulesFilePath = resolveRulesFilePath(registeredCfg);
     const pluginApi = api as PluginApi;
-    const pendingReceipts: PendingReceipt[] = [];
+    const pendingReceipts: Array<{
+      receipt: PendingReceipt;
+      callId: string | null;
+      paramsDigest: string | null;
+    }> = [];
 
     const registerTool = pluginApi.registerTool;
     if (registerTool) {
@@ -330,22 +396,17 @@ export default definePluginEntry({
         {
           name: GUARD_RULE_TOOL,
           description:
-            "REQUIRED for listing, adding, or deleting PDM guard rules. " +
-            "When the user says show/list/add/set/remove/delete guard rules, call this tool. " +
-            "Do not invent rules from memory — always call action=list first. " +
-            "Rules are stored in ~/.openclaw/pdm-guard-rules.json and enforce before_tool_call.",
+            "List the owner-controlled PDM guard rules. " +
+            "Rule changes require the authenticated owner /pdm-guard command; " +
+            "the agent cannot add or remove its own restrictions.",
           parameters: {
             type: "object",
             additionalProperties: false,
             properties: {
               action: {
                 type: "string",
-                enum: ["add", "remove", "list"],
-                description: "add a rule, remove by text/id, or list all rules",
-              },
-              rule: {
-                type: "string",
-                description: "Plain-English guard rule (required for add/remove)",
+                enum: ["list"],
+                description: "List the owner-controlled rules",
               },
             },
             required: ["action"],
@@ -361,6 +422,9 @@ export default definePluginEntry({
             required: ["action", "rules_file"],
           },
           async execute(_id, params) {
+            if (params.action !== "list") {
+              throw new Error("Guard rules are owner-controlled. Use the authenticated /pdm-guard command.");
+            }
             const { details } = await handleRuleAction(
               rulesFilePath,
               params.action,
@@ -385,6 +449,17 @@ export default definePluginEntry({
         async handler(ctx) {
           try {
             const parsed = parseGuardCommandArgs(ctx.args);
+            if (parsed.action !== "list") {
+              const configuredOwner = typeof ctx.senderId === "string" &&
+                Array.isArray(registeredCfg.ownerSenderIds) &&
+                registeredCfg.ownerSenderIds.includes(ctx.senderId);
+              if (ctx.isAuthorizedSender !== true ||
+                  (ctx.senderIsOwner !== true && !configuredOwner)) {
+                return { text: "Rule changes require a verified owner. On older hosts, configure ownerSenderIds with the owner's exact host sender identity." };
+              }
+              // Newer hosts can recheck live owner standing immediately here.
+              ctx.assertOwnerCurrent?.();
+            }
             const { text } = await handleRuleAction(
               rulesFilePath,
               parsed.action,
@@ -404,12 +479,54 @@ export default definePluginEntry({
       `[PDM GUARD] registered (rulesFile=${rulesFilePath}, tool=${GUARD_RULE_TOOL}, command=/pdm-guard)`,
     );
 
-    function enqueuePendingReceipt(pending: PendingReceipt): void {
-      pendingReceipts.push(pending);
+    function enqueuePendingReceipt(pending: PendingReceipt, event: BeforeToolCallEvent): void {
+      const callId = typeof event.toolCallId === "string" && event.toolCallId ? event.toolCallId : null;
+      const digest = parametersDigest(event.params ?? {});
+      pendingReceipts.push({
+        receipt: { ...pending, tool_call_id: callId ?? undefined, params_digest: digest ?? undefined },
+        callId,
+        paramsDigest: digest,
+      });
     }
 
-    function takePendingReceipt(): PendingReceipt | undefined {
-      return pendingReceipts.shift();
+    function takePendingReceipt(event: AfterToolCallEvent): PendingReceipt | undefined {
+      const callId = typeof event.toolCallId === "string" && event.toolCallId ? event.toolCallId : null;
+      const digest = event.params === undefined ? null : parametersDigest(event.params);
+      const candidates = pendingReceipts.filter((pending) =>
+        pending.receipt.tool_name === event.toolName &&
+        (callId === null || pending.callId === callId));
+      // A later host hook may rewrite arguments. Without a call ID, different
+      // parameter digests cannot safely distinguish concurrent same-tool calls.
+      if (candidates.length === 1) {
+        const candidate = candidates[0];
+        const identityMatches = callId !== null ||
+          (digest !== null && candidate.paramsDigest === digest);
+        const parametersAgree = digest === null || candidate.paramsDigest === digest;
+        if (identityMatches && parametersAgree) {
+          pendingReceipts.splice(pendingReceipts.indexOf(candidate), 1);
+          return candidate.receipt;
+        }
+      }
+      // With no reliable ID/parameters, contradictory parameters, or concurrent calls,
+      // preserve uncertainty rather than attaching somebody else's outcome.
+      for (const pending of candidates) {
+        pendingReceipts.splice(pendingReceipts.indexOf(pending), 1);
+        logReceipt(buildUncertainReceipt(pending.receipt,
+          "Completion could not be uniquely matched to its gate decision; execution and side effects remain uncertain."));
+      }
+      return undefined;
+    }
+
+    function blockRuleMutation(event: BeforeToolCallEvent): BeforeToolCallResult | void {
+      if (event.params?.action === "list") return;
+      const explanation = "Guard rules are owner-controlled. Use the authenticated /pdm-guard command.";
+      logReceipt(buildBlockedReceipt({
+        timestamp: new Date().toISOString(), proposed_action: buildIntentText(event.toolName, event.params),
+        gate_status: "BLOCKED_OWNER_RULE_CHANGE", governing_rules: [], rules_source: rulesFilePath,
+        explanation, tool_executed: false, pdm_version: PDM_VERSION,
+        openclaw_version: OPENCLAW_VERSION, tool_name: event.toolName,
+      }));
+      return { block: true, blockReason: explanation };
     }
 
     api.on(
@@ -417,11 +534,13 @@ export default definePluginEntry({
       async (event, ctx) => {
         const toolEvent = event as BeforeToolCallEvent;
         if (toolEvent.toolName === GUARD_RULE_TOOL) {
-          return;
+          return blockRuleMutation(toolEvent);
         }
 
         const pluginCfg = resolvePluginConfig(registeredCfg, ctx as BeforeToolCallContext);
-        const { goals, source } = await resolveGoals(pluginCfg);
+        const allowFailure = registeredCfg.failureMode === "allow";
+        let goals: string[] = [];
+        let source = resolveRulesFilePath(pluginCfg);
         const pythonBin =
           pluginCfg.pythonBin ?? process.env.PDM_GUARD_PYTHON ?? DEFAULT_PYTHON_BIN;
         const timeoutMs = pluginCfg.timeoutMs ?? 8000;
@@ -430,20 +549,35 @@ export default definePluginEntry({
         const intent = buildIntentText(toolEvent.toolName, params);
         const timestamp = new Date().toISOString();
 
+        function failedCheck(code: string, explanation: string): BeforeToolCallResult | void {
+          const pending: PendingReceipt = {
+            timestamp, proposed_action: intent,
+            gate_status: `${allowFailure ? "UNPROTECTED" : "BLOCKED"}_${code}`,
+            governing_rules: goals, rules_source: source,
+            explanation: `${explanation} ${allowFailure ? "Owner enabled unprotected failureMode=allow." : "No execution permission granted."}`,
+            tool_executed: allowFailure, pdm_version: PDM_VERSION,
+            openclaw_version: OPENCLAW_VERSION, tool_name: toolEvent.toolName,
+          };
+          if (allowFailure) {
+            enqueuePendingReceipt(pending, toolEvent);
+            return;
+          }
+          logReceipt(buildBlockedReceipt(pending));
+          return { block: true, blockReason: pending.explanation };
+        }
+
+        try {
+          ({ goals, source } = await resolveGoals(pluginCfg));
+        } catch {
+          return failedCheck("RULES_ERROR", "The owner rules could not be loaded.");
+        }
+
+        if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2_147_483_647) {
+          return failedCheck("CONFIG_ERROR", "The verifier timeout configuration is invalid.");
+        }
+
         if (!goals.length) {
-          enqueuePendingReceipt({
-            timestamp,
-            proposed_action: intent,
-            gate_status: "SKIPPED_NO_RULES",
-            governing_rules: [],
-            rules_source: source,
-            explanation: "No guard rules configured - fail-open.",
-            tool_executed: true,
-            pdm_version: PDM_VERSION,
-            openclaw_version: OPENCLAW_VERSION,
-            tool_name: toolEvent.toolName,
-          });
-          return;
+          return failedCheck("NO_RULES", "No owner guard rules are configured.");
         }
 
         const result = await callVerifyFunction(
@@ -455,19 +589,7 @@ export default definePluginEntry({
         );
 
         if (!result) {
-          enqueuePendingReceipt({
-            timestamp,
-            proposed_action: intent,
-            gate_status: "SKIPPED_VERIFY_ERROR",
-            governing_rules: goals,
-            rules_source: source,
-            explanation: "verify() call failed - fail-open.",
-            tool_executed: true,
-            pdm_version: PDM_VERSION,
-            openclaw_version: OPENCLAW_VERSION,
-            tool_name: toolEvent.toolName,
-          });
-          return;
+          return failedCheck("VERIFY_ERROR", "The verifier failed or returned an invalid or inconsistent response.");
         }
 
         const allowed = result.is_safe_to_act === true;
@@ -507,7 +629,7 @@ export default definePluginEntry({
           pdm_version: PDM_VERSION,
           openclaw_version: OPENCLAW_VERSION,
           tool_name: toolEvent.toolName,
-        });
+        }, toolEvent);
       },
       { priority: 90 },
     );
@@ -520,7 +642,7 @@ export default definePluginEntry({
           return;
         }
 
-        const pending = takePendingReceipt();
+        const pending = takePendingReceipt(toolEvent);
         if (!pending) {
           console.warn(
             `[PDM GUARD] after_tool_call without pending receipt for ${toolEvent.toolName}`,

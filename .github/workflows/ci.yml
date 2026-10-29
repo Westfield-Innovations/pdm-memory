@@ -77,9 +77,34 @@ jobs:
         with:
           fail_ci_if_error: false
 
+  openclaw-plugin:
+    name: OpenClaw plugin (Node 24)
+    runs-on: ubuntu-latest
+    if: github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'Merge pull request')
+    steps:
+      - uses: actions/checkout@v4
+
+      # The plugin's hooks call pdm_memory through a python3 subprocess.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install pdm-memory
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Run plugin tests
+        run: node --experimental-strip-types --test plugins/tests/openclaw/*.test.mjs
+
   publish:
     name: Publish to PyPI
-    needs: [test]
+    needs: [test, openclaw-plugin]
     runs-on: ubuntu-latest
     if: github.event_name == 'release' && github.event.action == 'published'
     environment:

@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -14,7 +14,15 @@ import { dirname, join } from "node:path";
  */
 
 export const OPENCLAW_VERSION = "2026.7.1-2";
-export const PDM_VERSION = "0.2.4";
+/** The bridge imports this checkout. A detached plugin must not invent a version. */
+export const PDM_VERSION = (() => {
+  try {
+    return readFileSync(new URL("../../pyproject.toml", import.meta.url), "utf8")
+      .match(/^version\s*=\s*"([^"]+)"/m)?.[1] ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+})();
 
 /** Clean JSONL receipt log (not the OpenClaw gateway envelope). */
 export const DEFAULT_RECEIPT_LOG = join("/tmp", "openclaw", "pdm-guard-receipts.jsonl");
@@ -32,18 +40,21 @@ export interface Receipt {
   gate_status: string;
   governing_rules: string[];
   rules_source: string;
-  tool_executed: boolean;
+  tool_executed: boolean | null;
   explanation: string;
   pdm_version: string;
   openclaw_version: string;
   resulting_state: ResultingState;
   tool_result?: unknown;
   duration_ms?: number | null;
+  tool_call_id?: string;
+  params_digest?: string;
+  outcome_status?: "UNCERTAIN";
 }
 
 export interface ResultingState {
-  executed: boolean;
-  side_effects: "none" | "observed";
+  executed: boolean | null;
+  side_effects: "none" | "observed" | "unknown";
   tool_name: string;
   exit_code?: number | null;
   stdout?: string | null;
@@ -63,10 +74,13 @@ export interface PendingReceipt {
   pdm_version: string;
   openclaw_version: string;
   tool_name: string;
+  tool_call_id?: string;
+  params_digest?: string;
 }
 
 export interface AfterToolCallEvent {
   toolName: string;
+  toolCallId?: string;
   params?: Record<string, unknown>;
   result?: unknown;
   error?: string;
@@ -108,6 +122,9 @@ export function toReceiptLog(receipt: Receipt): Record<string, unknown> {
     rules: receipt.governing_rules,
     executed: receipt.tool_executed,
     why: clip(receipt.explanation, LOG_WHY_MAX),
+    ...(receipt.tool_call_id ? { tool_call_id: receipt.tool_call_id } : {}),
+    ...(receipt.params_digest ? { params_digest: receipt.params_digest } : {}),
+    ...(receipt.outcome_status ? { outcome_status: receipt.outcome_status } : {}),
   };
 }
 
@@ -248,6 +265,8 @@ export function buildBlockedReceipt(
     resulting_state: blockedResultingState(pending.tool_name),
     tool_result: null,
     duration_ms: null,
+    tool_call_id: pending.tool_call_id,
+    params_digest: pending.params_digest,
   };
 }
 
@@ -274,6 +293,25 @@ export function buildCompletedReceipt(
     resulting_state: state,
     tool_result: toolResult,
     duration_ms: event.durationMs ?? null,
+    tool_call_id: pending.tool_call_id,
+    params_digest: pending.params_digest,
+  };
+}
+
+/** No guessed assignment of a completion to another concurrent action. */
+export function buildUncertainReceipt(pending: PendingReceipt, explanation: string): Receipt {
+  return {
+    ...buildBlockedReceipt(pending),
+    gate_status: "UNCERTAIN_CORRELATION",
+    explanation,
+    tool_executed: null,
+    outcome_status: "UNCERTAIN",
+    resulting_state: {
+      executed: null,
+      side_effects: "unknown",
+      tool_name: pending.tool_name,
+      detail: explanation,
+    },
   };
 }
 
