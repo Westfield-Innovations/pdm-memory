@@ -47,7 +47,7 @@ Staging retains a canonical copy of the full request. Reusing an action identity
 
 The host must bind the request's identity and versions to the actual worker session it controls. A fingerprint or version string supplied by an untrusted worker is an assertion, not authentication.
 
-The ledger retains the current owner configuration and a generation number. Reopening the same configuration preserves that generation. Replacing it requires the owner's explicit `replace_config=True` and advances the generation, including when reusing an earlier version label. The host must activate a new configuration when changing registered handlers, checks, limits or rules; the library cannot inspect a callback and discover a policy change. Superseded controller objects cannot mutate current work, and old held requests do not regain permission when a label is reused. Configuration replacement cannot retract a handler already dispatched; the host must settle or stop that work when immediate revocation is required.
+The ledger retains the current owner configuration and a generation number. Reopening the same configuration preserves that generation. Replacing it requires the owner's explicit `replace_config=True` and advances the generation, including when reusing an earlier version label. The ledger also fingerprints the declared openings: each operation and target, its dispatch allowance and whether it has a current check. Reopening with different openings under the same version labels is refused until the owner replaces the configuration. The host must still activate a new configuration when changing what a handler or check does; the library cannot inspect a callback and discover a policy change. Superseded controller objects cannot mutate current work, and old held requests do not regain permission when a label is reused. Configuration replacement cannot retract a handler already dispatched; the host must settle or stop that work when immediate revocation is required.
 
 ## Current conditions and release measurements
 
@@ -76,7 +76,7 @@ The guard stages a request, validates its current authority and scope, evaluates
 | --- | --- |
 | HELD | The protected executor has not been entered; the request can be reconsidered or cancelled |
 | REJECTED | The request did not meet the declared boundary; the reason survives recovery |
-| DISPATCHING | Dispatch was reserved and recorded; execution may be in progress or interrupted |
+| DISPATCHING | Dispatch was reserved and recorded; execution may be in progress or interrupted. Releasing it again from the dispatching controller returns this state unchanged; any other controller records it as UNCERTAIN |
 | RETURNED | The registered handler returned a result; this is not automatic proof of a physical outcome |
 | UNCERTAIN | Execution or its outcome cannot be established from the available record; do not blindly retry |
 | CANCELLED | A held request was invalidated without dispatch |
@@ -115,7 +115,7 @@ All new types are available from `pdm_memory` and `pdm_memory.guarded_effects`. 
 | `release(action_id)` | Recheck current configuration, branch, parameters, conditions and allowance; reserve before dispatch |
 | `receipt(action_id)` and `cancel(action_id, reason=...)` | Read the current action receipt or cancel held work |
 | `dispatch_count(operation, target)` | Read cumulative dispatch attempts for this owner and opening; recovery does not reset them |
-| `reconcile(action_id, *, executed, evidence)` | Record trusted evidence for a returned or uncertain action; never resend it |
+| `reconcile(action_id, *, executed, evidence)` | Record trusted evidence for a returned or uncertain action; never resend it. `executed=None` attaches the evidence and keeps the current RETURNED or UNCERTAIN status |
 | `checkpoint(checkpoint_id, *, branch_id, state)` | Capture bounded explicit worker state; return the checkpoint identity |
 | `recover(checkpoint_id, *, new_branch_id, receipt_limit=128)` | Retire the old branch and return `RecoveryContext` with captured state, current versions and bounded surviving receipts |
 | `history(action_id=None, *, after_sequence=0, limit=100)` | Read ordered events; continue from the last returned sequence |
@@ -171,7 +171,7 @@ Existing SDK alignment, storage and evidence behavior must remain compatible. Op
 | Completed check | Result and scope |
 | --- | --- |
 | Full Python suite on Python 3.12 | 717 passed and 15 skipped; skipped tests require a configured live PostgreSQL service |
-| Final guarded-effects and PDM integration coverage | 39 passed; includes current evidence, exact request binding, configuration generations, concurrency, uncertainty and recovery |
+| Final guarded-effects and PDM integration coverage | 44 passed; includes current evidence, exact request binding, configuration generations, concurrency, uncertainty and recovery |
 | OpenClaw plugin suite on Node 24 | 46 passed; includes 33 tests invoking actual registered hooks in the shipped bundle |
 | Bundled examples | Non-time simulation and real PDM save run locally; no production controller or deployed OpenClaw host used |
 

@@ -449,3 +449,62 @@ def test_owner_namespaces_are_separate(tmp_path):
             assert b.release("a1").status == "RETURNED"
             assert a.receipt("a1").status == "HELD"
             assert b.verify_history() and a.verify_history()
+
+
+def test_same_controller_rerelease_during_dispatch_does_not_mark_uncertain(tmp_path):
+    entered, finish = threading.Event(), threading.Event()
+    calls = []
+
+    def handler(r):
+        calls.append(r.action_id)
+        entered.set()
+        assert finish.wait(5)
+        return "done"
+
+    with guard(tmp_path / "g.db", handler) as g:
+        g.stage(request())
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(g.release, "a1")
+            assert entered.wait(5)
+            assert g.release("a1").status == "DISPATCHING"
+            finish.set()
+            assert first.result(timeout=5).status == "RETURNED"
+        assert calls == ["a1"]
+        assert "UNCERTAIN" not in [e["kind"] for e in g.history("a1")]
+
+
+def test_unknown_reconciliation_of_returned_action_keeps_namespace_open(tmp_path):
+    with guard(tmp_path / "g.db", lambda r: {"accepted": True}) as g:
+        g.stage(request())
+        g.release("a1")
+        noted = g.reconcile("a1", executed=None, evidence={"source": "receiver", "seen": False})
+        assert noted.status == "RETURNED" and noted.executed is None
+        assert noted.evidence == {"source": "receiver", "seen": False}
+        assert noted.result == {"accepted": True}
+        g.stage(request("a2"))
+        assert g.release("a2").status == "RETURNED"
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        dict(max_dispatches=5),
+        dict(check=lambda r: True),
+        dict(extra=Opening("set", "sim:valve", lambda r: None, lambda r: True)),
+    ],
+)
+def test_changed_openings_require_explicit_config_replacement(tmp_path, changed):
+    path = tmp_path / "g.db"
+    guard(path, lambda r: None).close()
+    extra = changed.pop("extra", None)
+    openings = [opening(lambda r: None, **changed)] + ([extra] if extra else [])
+    kwargs = dict(
+        owner="owner", program_version="worker-1", policy_version="policy-1", openings=openings
+    )
+    with pytest.raises(ConfigurationError, match="replace_config"):
+        GuardedEffects(path, **kwargs)
+    with GuardedEffects(path, replace_config=True, **kwargs) as g:
+        assert g._config_epoch == 2
+    # Same openings with different handler objects is the same configuration.
+    with GuardedEffects(path, **kwargs) as g:
+        assert g._config_epoch == 2

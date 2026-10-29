@@ -189,6 +189,20 @@ def _hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _openings_hash(openings: Mapping[tuple[str, str], Opening]) -> str:
+    # Callables have no stable identity across processes, so the fingerprint
+    # covers the declared scope: which openings exist, their allowance and
+    # whether a current check is required.
+    return _hash(
+        json.dumps(
+            sorted(
+                [op, target, o.max_dispatches, o.check is not None]
+                for (op, target), o in openings.items()
+            )
+        )
+    )
+
+
 _TERMINAL = {"REJECTED", "CANCELLED", "RETURNED", "OBSERVED"}
 
 
@@ -203,8 +217,9 @@ class GuardedEffects:
     transaction, including other owner namespaces in the same database; keep
     them bounded and do not recursively call mutating controller methods.
 
-    A different owner configuration requires ``replace_config=True`` on a new
-    controller. This increments a durable epoch and fences previous objects
+    A different owner configuration (version labels, or the declared openings:
+    operation, target, max_dispatches and whether a check exists) requires
+    ``replace_config=True`` on a new controller. This increments a durable epoch and fences previous objects
     and their staged work, even if version labels are later reused. Normal
     same-version reopen does not change the epoch. Configuration replacement
     cannot interrupt an already dispatched handler; quiesce handlers first.
@@ -259,7 +274,9 @@ class GuardedEffects:
             ):
                 raise ValueError("max_dispatches must be a nonnegative integer or None")
             self._openings[key] = opening
+        self._openings_hash = _openings_hash(self._openings)
         self._lock = threading.RLock()
+        self._in_flight: set[str] = set()
         self._conn = sqlite3.connect(
             str(path), timeout=30, isolation_level=None, check_same_thread=False
         )
@@ -271,7 +288,8 @@ class GuardedEffects:
           owner TEXT PRIMARY KEY, active_branch TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS ge_config (
           owner TEXT PRIMARY KEY, program_version TEXT NOT NULL,
-          policy_version TEXT NOT NULL, epoch INTEGER NOT NULL);
+          policy_version TEXT NOT NULL, openings_hash TEXT NOT NULL,
+          epoch INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS ge_branches (
           owner TEXT NOT NULL, branch_id TEXT NOT NULL, active INTEGER NOT NULL,
           PRIMARY KEY(owner, branch_id));
@@ -312,20 +330,33 @@ class GuardedEffects:
                 if current is None:
                     self._config_epoch = 1
                     self._conn.execute(
-                        "INSERT INTO ge_config VALUES (?, ?, ?, ?)",
-                        (self.owner, self.program_version, self.policy_version, self._config_epoch),
+                        "INSERT INTO ge_config VALUES (?, ?, ?, ?, ?)",
+                        (
+                            self.owner,
+                            self.program_version,
+                            self.policy_version,
+                            self._openings_hash,
+                            self._config_epoch,
+                        ),
                     )
                 elif replace_config:
                     self._config_epoch = current["epoch"] + 1
                     self._conn.execute(
-                        "UPDATE ge_config SET program_version=?,policy_version=?,epoch=? WHERE owner=?",
-                        (self.program_version, self.policy_version, self._config_epoch, self.owner),
+                        "UPDATE ge_config SET program_version=?,policy_version=?,openings_hash=?,epoch=? WHERE owner=?",
+                        (
+                            self.program_version,
+                            self.policy_version,
+                            self._openings_hash,
+                            self._config_epoch,
+                            self.owner,
+                        ),
                     )
                 else:
-                    if (current["program_version"], current["policy_version"]) != (
-                        self.program_version,
-                        self.policy_version,
-                    ):
+                    if (
+                        current["program_version"],
+                        current["policy_version"],
+                        current["openings_hash"],
+                    ) != (self.program_version, self.policy_version, self._openings_hash):
                         raise ConfigurationError(
                             "different current owner configuration; explicit replace_config=True is required"
                         )
@@ -336,6 +367,7 @@ class GuardedEffects:
                         {
                             "program_version": self.program_version,
                             "policy_version": self.policy_version,
+                            "openings_hash": self._openings_hash,
                             "config_epoch": self._config_epoch,
                         },
                     )
@@ -663,7 +695,9 @@ class GuardedEffects:
         failed/invalid return is UNCERTAIN because the function may already
         have affected the outside world. Releasing that ID again never calls
         the handler again. Other effects wait while an unresolved dispatch
-        exists in this owner namespace.
+        exists in this owner namespace. Releasing an ID whose handler this
+        controller is still running returns DISPATCHING unchanged; another
+        controller cannot tell that from an interruption and marks it UNCERTAIN.
         """
         action_id = _name(action_id, "action_id")
         with self._transaction():
@@ -672,6 +706,8 @@ class GuardedEffects:
             if row["status"] in _TERMINAL or row["status"] == "UNCERTAIN":
                 return self._receipt(row)
             if row["status"] == "DISPATCHING":
+                if action_id in self._in_flight:
+                    return self._receipt(row)
                 return self._set(
                     action_id,
                     "UNCERTAIN",
@@ -735,6 +771,16 @@ class GuardedEffects:
                 verdict.reason or "current conditions satisfied; dispatch intent secured",
                 evidence=verdict.evidence,
             )
+            self._in_flight.add(action_id)
+        try:
+            return self._dispatch(action_id, opening, encoded, verdict)
+        finally:
+            with self._lock:
+                self._in_flight.discard(action_id)
+
+    def _dispatch(
+        self, action_id: str, opening: Opening, encoded: str, verdict: ConditionVerdict
+    ) -> ActionReceipt:
         # The transaction committed before any outward action is attempted.
         try:
             result_json = _json(opening.handler(self._request(encoded)), self.max_result_bytes)
@@ -782,7 +828,9 @@ class GuardedEffects:
 
         Call this from the owner side after settling any live handler. A
         worker's assertion is not independent observation. ``None`` retains
-        uncertainty. ``False`` does not grant automatic retry permission.
+        uncertainty: an UNCERTAIN action stays UNCERTAIN and a RETURNED one
+        stays RETURNED with the evidence attached. ``False`` does not grant
+        automatic retry permission.
         """
         if executed is not None and type(executed) is not bool:
             raise TypeError("executed must be bool or None")
@@ -794,10 +842,16 @@ class GuardedEffects:
             row = self._row(_name(action_id, "action_id"))
             if row["status"] not in ("UNCERTAIN", "RETURNED"):
                 raise ValueError("only uncertain or returned actions can be reconciled")
+            if executed is not None:
+                status, disposition = "OBSERVED", CheckResult.SATISFIED
+            elif row["status"] == "RETURNED":
+                status, disposition = "RETURNED", CheckResult(row["disposition"])
+            else:
+                status, disposition = "UNCERTAIN", CheckResult.UNKNOWN
             return self._set(
                 action_id,
-                "UNCERTAIN" if executed is None else "OBSERVED",
-                CheckResult.UNKNOWN if executed is None else CheckResult.SATISFIED,
+                status,
+                disposition,
                 "owner supplied current outcome evidence",
                 evidence=evidence,
                 result=json.loads(row["result_json"]) if row["result_json"] else None,
