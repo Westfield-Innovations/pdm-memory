@@ -47,7 +47,7 @@ Staging retains a canonical copy of the full request. Reusing an action identity
 
 The host must bind the request's identity and versions to the actual worker session it controls. A fingerprint or version string supplied by an untrusted worker is an assertion, not authentication.
 
-The ledger retains the current owner configuration and a generation number. Reopening the same configuration preserves that generation. Replacing it requires the owner's explicit `replace_config=True` and advances the generation, including when reusing an earlier version label. The ledger also fingerprints the declared openings: each operation and target, its dispatch allowance and whether it has a current check. Reopening with different openings under the same version labels is refused until the owner replaces the configuration. The host must still activate a new configuration when changing what a handler or check does; the library cannot inspect a callback and discover a policy change. Superseded controller objects cannot mutate current work, and old held requests do not regain permission when a label is reused. Configuration replacement cannot retract a handler already dispatched; the host must settle or stop that work when immediate revocation is required.
+The ledger retains the current owner configuration and a generation number. Reopening the same configuration preserves that generation. Replacing it requires the owner's explicit `replace_config=True` and advances the generation, including when reusing an earlier version label. The ledger also fingerprints the declared openings: each operation and target, its dispatch allowance and whether it has a current check. Reopening with different openings under the same version labels is refused until the owner replaces the configuration. A ledger created by the 0.2.6a1 preview has no fingerprint; the first reopen with the same version labels records the current openings and keeps the configuration generation. The host must still activate a new configuration when changing what a handler or check does; the library cannot inspect a callback and discover a policy change. Superseded controller objects cannot mutate current work, and old held requests do not regain permission when a label is reused. Configuration replacement cannot retract a handler already dispatched; the host must settle or stop that work when immediate revocation is required.
 
 ## Current conditions and release measurements
 
@@ -170,8 +170,8 @@ Existing SDK alignment, storage and evidence behavior must remain compatible. Op
 
 | Completed check | Result and scope |
 | --- | --- |
-| Full Python suite on Python 3.12 | 722 passed and 15 skipped; skipped tests require a configured live PostgreSQL service |
-| Final guarded-effects and PDM integration coverage | 44 passed; includes current evidence, exact request binding, configuration generations, concurrency, uncertainty and recovery |
+| Full Python suite on Python 3.12 | 724 passed and 15 skipped; skipped tests require a configured live PostgreSQL service |
+| Final guarded-effects and PDM integration coverage | 46 passed; includes current evidence, exact request binding, configuration generations, concurrency, uncertainty and recovery |
 | OpenClaw plugin suite on Node 24 | 46 passed; includes 33 tests invoking actual registered hooks in the shipped bundle |
 | Bundled examples | Non-time simulation and real PDM save run locally; no production controller or deployed OpenClaw host used |
 

@@ -324,13 +324,24 @@ class GuardedEffects:
         """)
         try:
             with self._transaction():
+                columns = {
+                    row["name"] for row in self._conn.execute("PRAGMA table_info(ge_config)")
+                }
+                if "openings_hash" not in columns:
+                    # Ledgers from the 0.2.6a1 preview predate the openings
+                    # fingerprint; the first reopen records it (see below).
+                    self._conn.execute(
+                        "ALTER TABLE ge_config ADD COLUMN openings_hash TEXT NOT NULL DEFAULT ''"
+                    )
                 current = self._conn.execute(
                     "SELECT * FROM ge_config WHERE owner=?", (self.owner,)
                 ).fetchone()
                 if current is None:
                     self._config_epoch = 1
                     self._conn.execute(
-                        "INSERT INTO ge_config VALUES (?, ?, ?, ?, ?)",
+                        "INSERT INTO ge_config"
+                        " (owner, program_version, policy_version, openings_hash, epoch)"
+                        " VALUES (?, ?, ?, ?, ?)",
                         (
                             self.owner,
                             self.program_version,
@@ -352,15 +363,29 @@ class GuardedEffects:
                         ),
                     )
                 else:
-                    if (
-                        current["program_version"],
-                        current["policy_version"],
-                        current["openings_hash"],
-                    ) != (self.program_version, self.policy_version, self._openings_hash):
+                    recorded = current["openings_hash"]
+                    if (current["program_version"], current["policy_version"]) != (
+                        self.program_version,
+                        self.policy_version,
+                    ) or recorded not in ("", self._openings_hash):
                         raise ConfigurationError(
                             "different current owner configuration; explicit replace_config=True is required"
                         )
                     self._config_epoch = current["epoch"]
+                    if not recorded:
+                        # Same version labels, no fingerprint yet: this is the
+                        # configuration already active, so keep its epoch.
+                        self._conn.execute(
+                            "UPDATE ge_config SET openings_hash=? WHERE owner=?",
+                            (self._openings_hash, self.owner),
+                        )
+                        self._append(
+                            "CONFIGURATION_FINGERPRINTED",
+                            {
+                                "openings_hash": self._openings_hash,
+                                "config_epoch": self._config_epoch,
+                            },
+                        )
                 if current is None or replace_config:
                     self._append(
                         "CONFIGURATION_ACTIVATED",

@@ -508,3 +508,52 @@ def test_changed_openings_require_explicit_config_replacement(tmp_path, changed)
     # Same openings with different handler objects is the same configuration.
     with GuardedEffects(path, **kwargs) as g:
         assert g._config_epoch == 2
+
+
+def _preview_ledger(path):
+    """A ledger as the 0.2.6a1 preview left it: ge_config without openings_hash."""
+    raw = sqlite3.connect(path)
+    raw.execute(
+        "CREATE TABLE ge_config (owner TEXT PRIMARY KEY, program_version TEXT NOT NULL,"
+        " policy_version TEXT NOT NULL, epoch INTEGER NOT NULL)"
+    )
+    raw.execute("INSERT INTO ge_config VALUES ('owner', 'worker-1', 'policy-1', 3)")
+    raw.commit()
+    raw.close()
+
+
+def test_preview_ledger_is_migrated_and_keeps_its_epoch(tmp_path):
+    path = tmp_path / "g.db"
+    _preview_ledger(path)
+    with guard(path, lambda r: {"accepted": True}) as g:
+        assert g._config_epoch == 3
+        assert [e["kind"] for e in g.history()] == ["CONFIGURATION_FINGERPRINTED", "BRANCH_STARTED"]
+        g.stage(request())
+        assert g.release("a1").status == "RETURNED"
+        assert g.verify_history()
+    # The fingerprint is recorded once; changed openings now need replacement.
+    with guard(path, lambda r: None) as g:
+        assert [e["kind"] for e in g.history()].count("CONFIGURATION_FINGERPRINTED") == 1
+    with pytest.raises(ConfigurationError, match="replace_config"):
+        GuardedEffects(
+            path,
+            owner="owner",
+            program_version="worker-1",
+            policy_version="policy-1",
+            openings=[opening(lambda r: None, max_dispatches=1)],
+        )
+
+
+def test_preview_ledger_with_other_versions_still_needs_replacement(tmp_path):
+    path = tmp_path / "g.db"
+    _preview_ledger(path)
+    kwargs = dict(
+        owner="owner",
+        program_version="worker-2",
+        policy_version="policy-1",
+        openings=[opening(lambda r: None)],
+    )
+    with pytest.raises(ConfigurationError, match="replace_config"):
+        GuardedEffects(path, **kwargs)
+    with GuardedEffects(path, replace_config=True, **kwargs) as g:
+        assert g._config_epoch == 4
