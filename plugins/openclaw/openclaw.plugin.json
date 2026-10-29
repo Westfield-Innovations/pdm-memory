@@ -16,7 +16,9 @@
       "pythonBin": { "type": "string" },
       "rulesFile": { "type": "string" },
       "goals": { "type": "array", "items": { "type": "string" } },
-      "timeoutMs": { "type": "number" }
+      "timeoutMs": { "type": "number", "minimum": 1, "maximum": 2147483647 },
+      "failureMode": { "type": "string", "enum": ["block", "allow"], "default": "block" },
+      "ownerSenderIds": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }
     },
     "required": []
   }

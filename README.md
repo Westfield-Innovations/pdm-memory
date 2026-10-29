@@ -412,7 +412,7 @@ Before an agent **acts**, `verify()` scores the proposed intent against a plain 
 
 Statuses:
 
-- **ALIGNED** — safe to proceed (`report.is_safe_to_act` is `True`)
+- **ALIGNED** — GAA found no blocking conflict (`report.is_safe_to_act` is `True`); the host still owns permission for the actual operation
 - **CONFLICT** — soft mismatch / missing anchors (fail-closed by default)
 - **TORSION** — hard contradiction — block the ACT
 
@@ -499,6 +499,32 @@ for report in mem.detect_torsion(threshold=0.5):
 ```
 
 Full walkthroughs: `python -m pdm_memory.examples.standalone_guard`, `python -m pdm_memory.examples.guarded_agent_logic` and `python -m pdm_memory.examples.handling_contradictions`.
+
+### Boundary Lock guarded effects preview
+
+The opt-in `pdm_memory.guarded_effects` module adds a durable action boundary
+around exact structured operations. The owner registers the actual executors and
+current-condition checks. A request stays held until those checks permit it;
+there is no mandatory three- or six-second timer.
+
+- Retain full operation, target, parameters, program/policy versions and stable
+  action identity. A changed request cannot reuse an existing action identity.
+- Reserve and record dispatch before executing a registered operation. An
+  interrupted or uncertain action is not blindly executed again on retry.
+- Save bounded application-state checkpoints and recover a new worker branch
+  without erasing decisions, returned results or cumulative limits.
+- Keep this record separate from ordinary memories that may decay or reconcile.
+  A returned tool result is not automatically an observed physical outcome.
+
+The host must retain the guard and its files outside the worker's authority and
+route protected access through it. This is an application-level action/recovery
+module, not an operating-system sandbox or arbitrary computer-memory rollback.
+Existing `verify()` and `Memory` calls keep their signatures and behavior.
+
+See [Boundary Lock Guarded Effects Specification](docs/BOUNDARY_LOCK_GUARDED_EFFECTS_V1.md)
+for the theme, lifecycle and integration responsibilities. The OpenClaw plugin
+also now defaults to blocking when its checker cannot complete; see its
+[configuration and migration notes](plugins/openclaw/README.md).
 
 ---
 

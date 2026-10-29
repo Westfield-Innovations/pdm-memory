@@ -32,6 +32,20 @@ from pdm_memory.core.signature import (
     MemoryHit,
 )
 from pdm_memory.memory import Memory
+from pdm_memory.guarded_effects import (
+    ActionReceipt,
+    BranchError,
+    CheckResult,
+    ConditionVerdict,
+    ConfigurationError,
+    EffectRequest,
+    GuardedEffects,
+    IdReuseError,
+    LedgerIntegrityError,
+    Opening,
+    RecoveryContext,
+    ResourceLimitError,
+)
 from pdm_memory.models import (
     AlignmentReport,
     RelationshipChannelResolution,
@@ -40,16 +54,28 @@ from pdm_memory.models import (
 )
 from pdm_memory.storage.factory import create_storage, register_storage
 
-__version__ = "0.2.5"
+__version__ = "0.2.6"
 __all__ = [
+    "ActionReceipt",
     "AlignmentReport",
+    "BranchError",
+    "CheckResult",
+    "ConditionVerdict",
+    "ConfigurationError",
     "ContraryEvidenceResult",
     "DecaySnapshot",
     "DrawerInfo",
+    "EffectRequest",
+    "GuardedEffects",
+    "IdReuseError",
+    "LedgerIntegrityError",
     "MEMORY_SHAPE_KEY",
     "Memory",
     "MemoryHit",
+    "Opening",
+    "RecoveryContext",
     "RelationshipChannelResolution",
+    "ResourceLimitError",
     "SHAPE_HALF_LIVES",
     "SurfaceReport",
     "TorsionReport",
