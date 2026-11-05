@@ -102,6 +102,46 @@ Store only SHA-256 hashes of memory text — the content never touches disk:
 mem = Memory(store="./private.db", user="alice", store_raw=False)
 ```
 
+### Save Filters
+
+Opt-in passes every write must clear. A filter has a `name` and a
+`check(text)` that returns a `FilterVerdict`; it sees the text exactly as it
+will be stored (stripped, cut to 500 characters).
+
+```python
+from pdm_memory import FilterRefused, FilterVerdict, Memory
+
+class NoSecrets:
+    name = "no_secrets"
+
+    def check(self, text: str) -> FilterVerdict:
+        hit = "password" in text.lower()
+        return FilterVerdict(self.name, "1", ran=True, passed=not hit,
+                             terms=("password",) if hit else ())
+
+mem = Memory(store="./my_app.db", user="alice", filters=[NoSecrets()])
+# or later: mem.add_filter(NoSecrets())
+
+try:
+    mem.save("The admin password is hunter2", tags=["admin", "access", "ops"])
+except FilterRefused as err:
+    print(err)          # no_secrets refused the save: password
+```
+
+- **Refused** (`ran=True, passed=False`): nothing is written and `save` /
+  `update(text=...)` raise `FilterRefused` (a `ValueError`). On a cloud store
+  no request is sent.
+- **Passed**: the record carries `metadata["filters"][name] = {"version", "ran", "passed", "terms"}`.
+- **Could not read the text** (`ran=False`): the record is written and marked
+  with `"ran": False`, so you can find it later.
+- **The filter raises**: the exception reaches you and nothing is written.
+- `save_many` and `ingest` count refused items as `blocked` and write the
+  rest; the `blocked` key is there only when filters are set.
+- A dedupe or idempotency hit returns the existing ID before any filter runs.
+
+Without `filters`, nothing changes: no calls, no extra metadata, the same
+result dicts.
+
 ---
 
 ## ☁️ Ecosystem Mode (AZUS Cloud)
