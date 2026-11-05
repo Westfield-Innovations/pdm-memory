@@ -372,13 +372,15 @@ class Memory:
         ``metadata``, ``shape``, ``deadline``, ``event_at``).
 
         Returns:
-            Dict with ``saved``, ``skipped``, ``errors`` counts.
+            Dict with ``saved``, ``skipped``, ``errors`` counts, plus ``blocked``
+            (items a filter refused) when the memory has filters.
         """
         from pdm_memory.storage.schema import hash_fact_text
 
         saved = 0
         skipped = 0
         errors = 0
+        blocked = 0
         sigs_to_save: list[SignatureRecord] = []
         seen_idempotency_keys: set[str] = set()
         seen_hashes: set[str] = set()
@@ -442,7 +444,21 @@ class Memory:
                             seen_hashes.add(fact_hash)
                             continue
                         seen_hashes.add(fact_hash)
+                except Exception:
+                    errors += 1
+                    continue
 
+                # Outside the per-item guard: a filter that raises is not a pass (see _check_filters).
+                try:
+                    marks = self._check_filters(text[:500])
+                except FilterRefused:
+                    blocked += 1
+                    continue
+
+                try:
+                    metadata = item.get("metadata")
+                    if marks:
+                        metadata = {**(metadata or {}), "filters": marks}
                     sig = self._build_signature_record(
                         text,
                         source=str(item.get("source") or "batch"),
@@ -453,7 +469,7 @@ class Memory:
                         regime=str(item.get("regime") or item.get("question_regime") or "neutral"),
                         deadline=item.get("deadline") or item.get("t_deadline"),
                         event_at=item.get("event_at") or item.get("t_event_at"),
-                        metadata=item.get("metadata"),
+                        metadata=metadata,
                         shape=item.get("shape"),
                         phase_privilege=float(item.get("phase_privilege", 1.0)),
                         idempotency_key=idempotency_key or None,
@@ -491,8 +507,17 @@ class Memory:
             except Exception as exc:
                 logger.warning("[PDM] save_many dedupe reinforce failed for %s: %s", memory_id, exc)
 
-        logger.info("[PDM] save_many saved=%d skipped=%d errors=%d", saved, skipped, errors)
-        return {"saved": saved, "skipped": skipped, "errors": errors}
+        logger.info(
+            "[PDM] save_many saved=%d skipped=%d errors=%d blocked=%d",
+            saved,
+            skipped,
+            errors,
+            blocked,
+        )
+        result = {"saved": saved, "skipped": skipped, "errors": errors}
+        if self._filters:
+            result["blocked"] = blocked
+        return result
 
     def export_json(
         self,
@@ -1773,7 +1798,8 @@ class Memory:
             on_progress: Optional callback(processed: int, total: int).
 
         Returns:
-            Dict with keys: saved, skipped, errors.
+            Dict with keys: saved, skipped, errors, plus ``blocked`` (rows a
+            filter refused) when the memory has filters.
         """
         from pdm_memory.ingest.batch import BatchProcessor
         from pdm_memory.ingest.ingester import DataIngester
@@ -1783,9 +1809,13 @@ class Memory:
             user=self._user,
             mapping=mapping,
             llm_client=llm_client,
+            check=self._check_filters if self._filters else None,
         )
         processor = BatchProcessor(batch_size=batch_size)
-        return processor.process(data_source, ingester, on_progress=on_progress)
+        counts = processor.process(data_source, ingester, on_progress=on_progress)
+        if self._filters:
+            counts.setdefault("blocked", 0)
+        return counts
 
     # ------------------------------------------------------------------
     # Introspection

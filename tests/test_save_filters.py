@@ -199,3 +199,69 @@ def test_a_refused_cloud_save_sends_nothing():
         with pytest.raises(FilterRefused):
             mem.save("The operator is deployed.", tags=TAGS, dedupe=False)
         assert route.call_count == before == 0
+
+
+# ---------------------------------------------------------------------------
+# Memory.save_many and Memory.ingest
+# ---------------------------------------------------------------------------
+
+
+class RefuseOperator:
+    name = "x"
+
+    def check(self, text):
+        refused = "operator" in text
+        return FilterVerdict(
+            "x", "1", ran=True, passed=not refused, terms=("operator",) if refused else ()
+        )
+
+
+MIXED = [
+    "The budget accumulates.",
+    "The operator is deployed.",
+    "Maria owns the rollback plan.",
+]
+
+
+def test_save_many_counts_what_the_filter_refused(tmp_path):
+    mem = _mem(tmp_path, RefuseOperator())
+    result = mem.save_many([{"text": t, "tags": TAGS} for t in MIXED])
+    assert result == {"saved": 2, "skipped": 0, "errors": 0, "blocked": 1}
+    assert mem.count() == 2
+    assert all(
+        stored(mem, hit.id).metadata["filters"]["x"]["passed"] for hit in mem.list().items
+    )
+
+
+def test_a_failing_filter_stops_save_many_before_anything_is_written(tmp_path):
+    mem = _mem(tmp_path, Boom())
+    with pytest.raises(RuntimeError, match="down"):
+        mem.save_many([{"text": t, "tags": TAGS} for t in MIXED])
+    assert mem.count() == 0
+
+
+def test_without_filters_save_many_returns_what_it_did(tmp_path):
+    mem = Memory(store=str(tmp_path / "f.db"), user=USER)
+    result = mem.save_many([{"text": t, "tags": TAGS} for t in MIXED])
+    assert set(result) == {"saved", "skipped", "errors"}
+
+
+def test_ingest_counts_what_the_filter_refused(tmp_path):
+    mem = _mem(tmp_path, RefuseOperator())
+    result = mem.ingest([{"text": t} for t in MIXED])
+    assert result["blocked"] == 1
+    assert result["saved"] == 2
+    assert mem.count() == 2
+
+
+def test_a_failing_filter_writes_no_ingested_row(tmp_path):
+    mem = _mem(tmp_path, Boom())
+    result = mem.ingest([{"text": t} for t in MIXED])
+    assert result == {"saved": 0, "skipped": 0, "errors": 3, "blocked": 0}
+    assert mem.count() == 0
+
+
+def test_without_filters_ingest_returns_what_it_did(tmp_path):
+    mem = Memory(store=str(tmp_path / "f.db"), user=USER)
+    result = mem.ingest([{"text": t} for t in MIXED])
+    assert result == {"saved": 3, "skipped": 0, "errors": 0}
