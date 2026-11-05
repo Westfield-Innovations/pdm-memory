@@ -31,6 +31,7 @@ from pdm_memory.core.signature import (
     DrawerInfo,
     MemoryHit,
 )
+from pdm_memory.filters import FilterRefused, FilterVerdict, SaveFilter
 from pdm_memory.memory import Memory
 from pdm_memory.guarded_effects import (
     ActionReceipt,
@@ -66,6 +67,8 @@ __all__ = [
     "DecaySnapshot",
     "DrawerInfo",
     "EffectRequest",
+    "FilterRefused",
+    "FilterVerdict",
     "GuardedEffects",
     "IdReuseError",
     "LedgerIntegrityError",
@@ -77,6 +80,7 @@ __all__ = [
     "RelationshipChannelResolution",
     "ResourceLimitError",
     "SHAPE_HALF_LIVES",
+    "SaveFilter",
     "SurfaceReport",
     "TorsionReport",
     "__version__",
