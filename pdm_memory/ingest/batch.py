@@ -77,9 +77,8 @@ class BatchProcessor:
             batch = rows[i : i + self.batch_size]
             batch_counts = self._process_batch(batch, ingester)
 
-            counts["saved"] += batch_counts["saved"]
-            counts["skipped"] += batch_counts["skipped"]
-            counts["errors"] += batch_counts["errors"]
+            for key, value in batch_counts.items():
+                counts[key] = counts.get(key, 0) + value
             processed += len(batch)
 
             if on_progress:

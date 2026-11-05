@@ -36,6 +36,7 @@ import builtins
 import logging
 import math
 import os
+from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
@@ -67,6 +68,7 @@ from pdm_memory.core.signature import (
     MemoryHit,
     SignatureRecord,
 )
+from pdm_memory.filters import FilterRefused, SaveFilter
 from pdm_memory.models import (
     AlignmentReport,
     FieldStateSnapshot,
@@ -115,6 +117,8 @@ class Memory:
         engine:      Custom RetrievalEngine instance (override for testing).
         storage:     Pre-built :class:`BaseStorage` instance (bypasses ``store`` URL).
         torsion_judge: Optional callback to flag torsion pairs rules-only detection misses.
+        filters:     Opt-in :class:`SaveFilter` passes every write must clear;
+                     a refusal stores nothing and raises :class:`FilterRefused`.
     """
 
     def __init__(
@@ -129,8 +133,10 @@ class Memory:
         engine: RetrievalEngine | None = None,
         storage: BaseStorage | None = None,
         torsion_judge: TorsionJudge | None = None,
+        filters: Sequence[SaveFilter] | None = None,
     ) -> None:
         self._user = user
+        self._filters: list[SaveFilter] = list(filters or [])
         self._engine = engine or RetrievalEngine()
         self._torsion_judge = torsion_judge
         self._pre_save_hooks: list[PreSaveHook] = []
@@ -172,6 +178,26 @@ class Memory:
                 self._post_recall_hooks.append(hook)
             case _:
                 raise ValueError(f"Unknown hook event: {event!r}")
+
+    def add_filter(self, save_filter: SaveFilter) -> None:
+        """Add a filter every later save, update(text=...), save_many and ingest must clear."""
+        self._filters.append(save_filter)
+
+    def _check_filters(self, text: str) -> dict[str, dict[str, Any]]:
+        """
+        Run every filter on the text as it will be stored.
+
+        Raises FilterRefused on the first refusal; a filter that raises is not
+        a pass, so its exception reaches the caller and nothing is written.
+        Returns ``{name: verdict}`` marks, or ``{}`` when no filters are set.
+        """
+        marks: dict[str, dict[str, Any]] = {}
+        for save_filter in self._filters:
+            verdict = save_filter.check(text)
+            if verdict.refuses:
+                raise FilterRefused(verdict)
+            marks[verdict.name] = verdict.as_metadata()
+        return marks
 
     def _run_pre_save_hooks(self, sig: SignatureRecord) -> SignatureRecord:
         for hook in self._pre_save_hooks:
@@ -306,6 +332,10 @@ class Memory:
                 logger.debug("[PDM] save() dedupe → %s", existing.id[:8])
                 return existing.id
 
+        marks = self._check_filters(text)
+        if marks:
+            metadata = {**(metadata or {}), "filters": marks}
+
         sig = self._build_signature_record(
             text=text,
             source=source,
@@ -342,13 +372,15 @@ class Memory:
         ``metadata``, ``shape``, ``deadline``, ``event_at``).
 
         Returns:
-            Dict with ``saved``, ``skipped``, ``errors`` counts.
+            Dict with ``saved``, ``skipped``, ``errors`` counts, plus ``blocked``
+            (items a filter refused) when the memory has filters.
         """
         from pdm_memory.storage.schema import hash_fact_text
 
         saved = 0
         skipped = 0
         errors = 0
+        blocked = 0
         sigs_to_save: list[SignatureRecord] = []
         seen_idempotency_keys: set[str] = set()
         seen_hashes: set[str] = set()
@@ -412,7 +444,21 @@ class Memory:
                             seen_hashes.add(fact_hash)
                             continue
                         seen_hashes.add(fact_hash)
+                except Exception:
+                    errors += 1
+                    continue
 
+                # Outside the per-item guard: a filter that raises is not a pass (see _check_filters).
+                try:
+                    marks = self._check_filters(text[:500])
+                except FilterRefused:
+                    blocked += 1
+                    continue
+
+                try:
+                    metadata = item.get("metadata")
+                    if marks:
+                        metadata = {**(metadata or {}), "filters": marks}
                     sig = self._build_signature_record(
                         text,
                         source=str(item.get("source") or "batch"),
@@ -423,7 +469,7 @@ class Memory:
                         regime=str(item.get("regime") or item.get("question_regime") or "neutral"),
                         deadline=item.get("deadline") or item.get("t_deadline"),
                         event_at=item.get("event_at") or item.get("t_event_at"),
-                        metadata=item.get("metadata"),
+                        metadata=metadata,
                         shape=item.get("shape"),
                         phase_privilege=float(item.get("phase_privilege", 1.0)),
                         idempotency_key=idempotency_key or None,
@@ -461,8 +507,17 @@ class Memory:
             except Exception as exc:
                 logger.warning("[PDM] save_many dedupe reinforce failed for %s: %s", memory_id, exc)
 
-        logger.info("[PDM] save_many saved=%d skipped=%d errors=%d", saved, skipped, errors)
-        return {"saved": saved, "skipped": skipped, "errors": errors}
+        logger.info(
+            "[PDM] save_many saved=%d skipped=%d errors=%d blocked=%d",
+            saved,
+            skipped,
+            errors,
+            blocked,
+        )
+        result = {"saved": saved, "skipped": skipped, "errors": errors}
+        if self._filters:
+            result["blocked"] = blocked
+        return result
 
     def export_json(
         self,
@@ -572,6 +627,11 @@ class Memory:
         rec = self._storage.get(memory_id, user=self._user)
         if rec is None:
             raise ValueError(f"Memory '{memory_id}' not found for user '{self._user}'")
+
+        if text is not None and text.strip():
+            marks = self._check_filters(text.strip()[:500])
+            if marks:
+                metadata = {**(metadata or {}), "filters": marks}
 
         fields = self._build_update_fields(
             rec,
@@ -1738,7 +1798,8 @@ class Memory:
             on_progress: Optional callback(processed: int, total: int).
 
         Returns:
-            Dict with keys: saved, skipped, errors.
+            Dict with keys: saved, skipped, errors, plus ``blocked`` (rows a
+            filter refused) when the memory has filters.
         """
         from pdm_memory.ingest.batch import BatchProcessor
         from pdm_memory.ingest.ingester import DataIngester
@@ -1748,9 +1809,13 @@ class Memory:
             user=self._user,
             mapping=mapping,
             llm_client=llm_client,
+            check=self._check_filters if self._filters else None,
         )
         processor = BatchProcessor(batch_size=batch_size)
-        return processor.process(data_source, ingester, on_progress=on_progress)
+        counts = processor.process(data_source, ingester, on_progress=on_progress)
+        if self._filters:
+            counts.setdefault("blocked", 0)
+        return counts
 
     # ------------------------------------------------------------------
     # Introspection
