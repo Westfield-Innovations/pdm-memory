@@ -42,6 +42,11 @@ UPDATABLE_COLUMNS: frozenset[str] = frozenset(
     }
 )
 
+# Counters a write may move by a delta, in one statement (no lost update).
+INCREMENTABLE_COLUMNS: frozenset[str] = frozenset(
+    {"retrieval_count", "validation_prediction_total", "validation_prediction_correct"}
+)
+
 SCHEMA_SQLITE = """
 CREATE TABLE IF NOT EXISTS pdm_signatures (
     id                              TEXT PRIMARY KEY,
@@ -261,6 +266,19 @@ def prepare_update_fields(fields: dict) -> dict:
         else:
             prepared[col] = value
     return prepared
+
+
+def increment_set_clause(
+    deltas: Mapping[str, int], fields: dict, placeholder: str
+) -> tuple[str, list[Any]]:
+    """SET clause adding *deltas* to counters and assigning *fields*, with its values."""
+    unknown = set(deltas) - INCREMENTABLE_COLUMNS
+    if unknown:
+        raise ValueError(f"Not a counter: {sorted(unknown)}")
+    prepared = prepare_update_fields(fields)
+    parts = [f"{col} = {col} + {placeholder}" for col in deltas]
+    parts += [f"{col} = {placeholder}" for col in prepared]
+    return ", ".join(parts), [int(v) for v in deltas.values()] + list(prepared.values())
 
 
 def signature_insert_row(sig: SignatureRecord, *, store_raw: bool) -> tuple[Any, ...]:

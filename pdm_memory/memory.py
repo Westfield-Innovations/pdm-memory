@@ -36,6 +36,8 @@ import builtins
 import logging
 import math
 import os
+import warnings
+from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
@@ -277,7 +279,7 @@ class Memory:
                             ``structural``. Stored in ``metadata[memory_shape]``. When
                             omitted, inferred from tags/text when possible.
             dedupe:         If True, return existing ID when fact hash already stored.
-            dedupe_reinforce: When dedupe hits, call reinforce() on the existing memory.
+            dedupe_reinforce: When dedupe hits, touch() the existing memory (a use, not a grade).
             idempotency_key:  If set, repeated saves with the same key return the existing ID.
 
         Returns:
@@ -302,7 +304,7 @@ class Memory:
             existing = self._storage.find_by_hash(hash_fact_text(text), user=self._user)
             if existing is not None:
                 if dedupe_reinforce:
-                    self.reinforce(existing.id)
+                    self.touch([existing.id])
                 logger.debug("[PDM] save() dedupe → %s", existing.id[:8])
                 return existing.id
 
@@ -455,11 +457,11 @@ class Memory:
                     if len(save_results) < len(sigs_to_save):
                         errors += len(sigs_to_save) - len(save_results)
 
-        for memory_id in reinforce_ids:
+        if reinforce_ids:
             try:
-                self.reinforce(memory_id)
+                self.touch(reinforce_ids)
             except Exception as exc:
-                logger.warning("[PDM] save_many dedupe reinforce failed for %s: %s", memory_id, exc)
+                logger.warning("[PDM] save_many dedupe touch failed: %s", exc)
 
         logger.info("[PDM] save_many saved=%d skipped=%d errors=%d", saved, skipped, errors)
         return {"saved": saved, "skipped": skipped, "errors": errors}
@@ -676,7 +678,7 @@ class Memory:
         min_pressure: float = 0.0,
         search_cost: float = 0.5,
         drawer: str | None = None,
-        reinforce: bool = True,
+        reinforce: bool = False,
         *,
         candidate_limit: int = 2_000,
         page_size: int = 500,
@@ -700,12 +702,13 @@ class Memory:
             min_pressure: Only consider memories with p_magnitude >= this.
             search_cost: 0.0 = strict (high threshold), 1.0 = loose (low threshold).
             drawer:      Optional: filter by drawer name.
-            reinforce:   If True, increment retrieval_count and update last_retrieved.
+            reinforce:   Deprecated. Recall writes nothing (PDM v1.9 change 3); True
+                         only touches the hits. Call :meth:`touch` with what you used.
             candidate_limit: Max signatures loaded from storage for ranking (default 2_000).
             page_size:       Keyset page size when loading candidates (default 500).
             diversity_bias:  Max fraction of top-k from one drawer (default ``0.4``).
                              Pass ``None`` for pure score order.
-            on_recall:       Optional callback invoked for each returned hit before reinforce.
+            on_recall:       Optional callback invoked for each returned hit.
 
         Returns:
             List[MemoryHit] ranked by relevance, length ≤ k.
@@ -744,8 +747,10 @@ class Memory:
                 on_recall(hit)
 
         reinforced = bool(reinforce and hits)
+        if reinforce:
+            _warn_reinforce("recall")
         if reinforced:
-            self._apply_reinforcement(hits)
+            self.touch([hit.id for hit in hits])
 
         ctx = {
             "query": query,
@@ -779,7 +784,7 @@ class Memory:
             search_cost:        TAS threshold looseness for recall.
             torsion_threshold:  Minimum torsion_score to count.
             min_goal_pressure:  Goal-anchor pressure floor for alignment.
-            reinforce:          If True, reinforce recall hits (default False).
+            reinforce:          Deprecated; True only touches the hits.
 
         Returns:
             SurfaceReport with hits, torsion_count, and alignment status.
@@ -794,8 +799,10 @@ class Memory:
             diversity_bias=DEFAULT_DIVERSITY_BIAS,
         )
         reinforced = bool(reinforce and hits)
+        if reinforce:
+            _warn_reinforce("surface")
         if reinforced:
-            self._apply_reinforcement(hits)
+            self.touch([hit.id for hit in hits])
         self._run_post_recall_hooks(
             {
                 "query": query,
@@ -827,87 +834,59 @@ class Memory:
             torsion_reports=torsion_reports,
         )
 
-    def reinforce(self, memory_id: str, coupling_score: float = 0.5) -> None:
-        """
-        Manually reinforce a memory (raise its pressure) and record a correct
-        prediction in the Validation Coefficient counters.
+    def touch(
+        self,
+        ids: Sequence[str],
+        *,
+        match_scores: dict[str, float] | None = None,
+    ) -> int:
+        """Record that the caller used *ids*: resets their disuse clock. Returns how many.
 
-        recall() calls this automatically for all returned hits when
-        ``reinforce=True`` (the default).  Call this explicitly to signal
-        that a memory-driven prediction turned out to be *correct*.
-
-        Each call increments both ``validation_prediction_total`` and
-        ``validation_prediction_correct``, which raises V and therefore
-        P_effective on the next retrieval.
-
-        Args:
-            memory_id:      The memory UUID to reinforce.
-            coupling_score: Coupling strength (0–1), influences Δp magnitude.
+        The only writer of ``last_retrieved`` and ``retrieval_count`` (PDM v1.9
+        change 3). Never a grade: P and V stay where they are.
         """
         now = datetime.now(tz=timezone.utc)
-        atomic_reinforce = getattr(self._storage, "atomic_reinforce", None)
-        if callable(atomic_reinforce):
-            atomic_reinforce(
-                memory_id,
-                self._user,
-                compute_delta=lambda p, rc: self._engine.compute_reinforcement_delta(
-                    p, rc, coupling_score
-                ),
-                last_retrieved=now,
+        touched = 0
+        for memory_id in dict.fromkeys(str(i) for i in ids if i):
+            touched += self._storage.increment(
+                memory_id, self._user, {"retrieval_count": 1}, last_retrieved=now
             )
-            logger.debug("[PDM] reinforce(%s) atomic", memory_id)
-            return
+        return touched
 
-        rec = self._storage.get(memory_id, user=self._user)
-        if rec is None:
-            raise ValueError(f"Memory '{memory_id}' not found for user '{self._user}'")
-        delta = self._engine.compute_reinforcement_delta(
-            rec.p_magnitude, rec.retrieval_count, coupling_score
-        )
-        new_p = min(100.0, rec.p_magnitude + delta)
-        new_spike = calculate_effective_spike(new_p, rec.t_persistence, rec.phase_privilege)
-        new_total = (rec.validation_prediction_total or 0) + 1
-        new_correct = (rec.validation_prediction_correct or 0) + 1
-        self._storage.update(
-            memory_id,
-            user=self._user,
-            p_magnitude=new_p,
-            effective_spike=new_spike,
-            retrieval_count=(rec.retrieval_count or 0) + 1,
-            last_retrieved=now,
-            validation_prediction_total=new_total,
-            validation_prediction_correct=new_correct,
-        )
-        logger.debug(
-            "[PDM] reinforce(%s) Δp=+%.2f → P=%.1f  V_total=%d V_correct=%d",
-            memory_id, delta, new_p, new_total, new_correct,
-        )
-
-    def penalize(self, memory_id: str, coupling_score: float = 0.5) -> None:
+    def reinforce(self, memory_id: str, coupling_score: float = 0.5) -> set[str]:
         """
-        Penalise a memory after a *wrong* prediction and lower its authority.
+        Validate a memory's prediction as correct: ``correct + 1``, ``total + 1``.
 
-        This is the consequence signal **E*** described in the Correctability
-        Benchmark spec.  Call it when the memory that was used as the basis
-        for a prediction turned out to be **incorrect**.
+        V rises; P and the disuse clock do not move (PDM v1.9 change 3).
+        ``coupling_score`` is accepted for compatibility and ignored. Returns the
+        ids a correction re-opened (none, on the correct path).
 
-        Mechanically:
-        - Increments ``validation_prediction_total`` (prediction was made).
-        - Does **not** increment ``validation_prediction_correct`` (it was wrong).
-        - This lowers V = (correct+1)/(total+2), which lowers P_effective on
-          the next retrieval — the wrong signature loses authority over time.
-        - Also decrements ``p_magnitude`` by the same delta formula used in
-          reinforcement, so the raw pressure drops too.
+        Raises:
+            ValueError: Memory not found.
+        """
+        found = self._storage.increment(
+            memory_id,
+            self._user,
+            {"validation_prediction_total": 1, "validation_prediction_correct": 1},
+        )
+        if not found:
+            raise ValueError(f"Memory '{memory_id}' not found for user '{self._user}'")
+        return set()
 
-        Args:
-            memory_id:      The memory UUID to penalise.
-            coupling_score: Coupling strength (0–1), influences Δp magnitude.
+    def penalize(self, memory_id: str, coupling_score: float = 0.5) -> set[str]:
+        """
+        Validate a memory's prediction as wrong: ``total + 1``, ``correct`` unchanged.
+
+        V falls, so the weight falls; P and the disuse clock do not move (PDM
+        v1.9 change 3). ``coupling_score`` is accepted and ignored. Returns the
+        ids a correction re-opened.
         """
         rec = self._storage.get(memory_id, user=self._user)
         if rec is None:
             logger.warning("[PDM] penalize(%s): not found", memory_id)
-            return
-        self._apply_prediction_miss(rec, coupling_score=coupling_score)
+            return set()
+        self._apply_prediction_miss(rec)
+        return set()
 
     def apply_contrary_evidence(
         self,
@@ -920,10 +899,10 @@ class Memory:
         evidence_shape: str | None = None,
     ) -> ContraryEvidenceResult:
         """
-        Immediately lower active pressure on ``target`` when contrary evidence arrives.
+        Immediately lower the weight of ``target`` when contrary evidence arrives.
 
-        Applies the same V-miss + Δp update as :meth:`penalize` without rewriting
-        the target's ``compressed_fact``, ``created_at``, or
+        Records the same miss as :meth:`penalize` (V falls; P and the clock stay)
+        without rewriting the target's ``compressed_fact``, ``created_at``, or
         ``validation_prediction_correct``. Optionally persists the evidence as a
         new signature linked via ``metadata["contrary_to"]``.
 
@@ -931,7 +910,7 @@ class Memory:
             target:            Target memory id or loaded ``SignatureRecord``.
             evidence:          Contrary fact as text, record, or mapping with
                                ``text`` / ``tags`` / ``shape`` / ``metadata``.
-            coupling_score:    Strength of the miss (0–1), same as ``penalize``.
+            coupling_score:    Accepted for compatibility and ignored, as in ``penalize``.
             persist_evidence:  If True, ``save`` the evidence as a new signature.
             evidence_tags:     Tags for the evidence signature (overrides mapping).
             evidence_shape:    Optional shape for the evidence signature.
@@ -989,9 +968,7 @@ class Memory:
                 dedupe=False,
             )
 
-        updated = self._apply_prediction_miss(
-            rec, coupling_score=coupling_score, touch=False
-        )
+        updated = self._apply_prediction_miss(rec)
         v_after = calculate_v(
             updated.validation_prediction_correct,
             updated.validation_prediction_total,
@@ -1021,58 +998,12 @@ class Memory:
             validation_prediction_correct=correct_before,
         )
 
-    def _apply_prediction_miss(
-        self,
-        rec: SignatureRecord,
-        *,
-        coupling_score: float = 0.5,
-        touch: bool = True,
-    ) -> SignatureRecord:
-        """
-        Record a wrong prediction: Δp down, V total +1, correct unchanged.
-
-        Does not modify ``compressed_fact`` or ``created_at``.
-
-        Args:
-            touch: When True (default, ``penalize``), bump ``last_retrieved``.
-                   When False (``apply_contrary_evidence``), leave the decay
-                   clock alone so live ``P_effective`` does not rebound.
-        """
-        delta = self._engine.compute_reinforcement_delta(
-            rec.p_magnitude, rec.retrieval_count, coupling_score
-        )
-        new_p = max(0.0, rec.p_magnitude - delta)
-        new_spike = calculate_effective_spike(
-            new_p, rec.t_persistence, rec.phase_privilege
-        )
-        new_total = (rec.validation_prediction_total or 0) + 1
-        fields: dict[str, Any] = {
-            "p_magnitude": new_p,
-            "effective_spike": new_spike,
-            "validation_prediction_total": new_total,
-        }
-        if touch:
-            now = datetime.now(tz=timezone.utc)
-            fields["retrieval_count"] = (rec.retrieval_count or 0) + 1
-            fields["last_retrieved"] = now
-        self._storage.update(rec.id, user=self._user, **fields)
-        logger.debug(
-            "[PDM] prediction_miss(%s) Δp=-%.2f → P=%.1f  V_total=%d V_correct=%d touch=%s",
-            rec.id,
-            delta,
-            new_p,
-            new_total,
-            rec.validation_prediction_correct or 0,
-            touch,
-        )
+    def _apply_prediction_miss(self, rec: SignatureRecord) -> SignatureRecord:
+        """Record a wrong prediction: ``total + 1``. P, text and clock stay."""
+        self._storage.increment(rec.id, self._user, {"validation_prediction_total": 1})
         updated = self._storage.get(rec.id, user=self._user)
         if updated is None:
-            rec.p_magnitude = new_p
-            rec.effective_spike = new_spike
-            rec.validation_prediction_total = new_total
-            if touch:
-                rec.retrieval_count = (rec.retrieval_count or 0) + 1
-                rec.last_retrieved = fields["last_retrieved"]
+            rec.validation_prediction_total = (rec.validation_prediction_total or 0) + 1
             return rec
         return updated
 
@@ -2336,46 +2267,11 @@ class Memory:
             except Exception as e:
                 logger.warning("[PDM] torsion V penalty batch failed: %s", e)
 
-    def _apply_reinforcement(self, hits: builtins.list[MemoryHit]) -> None:
-        """Write retrieval reinforcement back to storage for all hits.
 
-        Also increments Validation Coefficient counters so repeated successful
-        retrievals raise V and therefore P_effective over time.
-        """
-        if not hits:
-            return
-        now = datetime.now(tz=timezone.utc)
-        records = self._storage.get_many([hit.id for hit in hits], user=self._user)
-        batch_updates: list[tuple[str, dict]] = []
-        for hit in hits:
-            rec = records.get(hit.id)
-            if rec is None:
-                continue
-            try:
-                delta = self._engine.compute_reinforcement_delta(
-                    rec.p_magnitude, rec.retrieval_count, hit.coupling_score
-                )
-                new_p = min(100.0, rec.p_magnitude + delta)
-                new_spike = calculate_effective_spike(new_p, rec.t_persistence, rec.phase_privilege)
-                batch_updates.append(
-                    (
-                        hit.id,
-                        {
-                            "p_magnitude": new_p,
-                            "effective_spike": new_spike,
-                            "retrieval_count": (rec.retrieval_count or 0) + 1,
-                            "last_retrieved": now,
-                        },
-                    )
-                )
-            except (TypeError, ValueError) as e:
-                logger.warning("[PDM] reinforcement check failed for %s: %s", hit.id, e)
-
-        if batch_updates:
-            try:
-                results = self._storage.update_batch(batch_updates, user=self._user)
-                for res in results:
-                    if res.error:
-                        logger.warning("[PDM] reinforcement update failed for %s: %s", res.id, res.error)
-            except Exception as e:
-                logger.warning("[PDM] reinforcement batch update failed: %s", e)
+def _warn_reinforce(where: str) -> None:
+    warnings.warn(
+        f"{where}(reinforce=True) is deprecated: retrieve writes nothing. "
+        "Call Memory.touch() with the ids you used.",
+        DeprecationWarning,
+        stacklevel=3,
+    )

@@ -86,6 +86,25 @@ class BaseStorage(ABC):
         """Update whitelisted columns for ``memory_id`` owned by ``user``."""
         ...
 
+    def increment(
+        self,
+        memory_id: str,
+        user: str = "default",
+        deltas: dict[str, int] | None = None,
+        **fields,
+    ) -> bool:
+        """Add *deltas* to counters and set *fields*. False when the row is not there.
+
+        SQL drivers do it in one UPDATE; this fallback reads, then writes.
+        """
+        rec = self.get(memory_id, user=user)
+        if rec is None:
+            return False
+        for col, delta in (deltas or {}).items():
+            fields[col] = int(getattr(rec, col) or 0) + int(delta)
+        self.update(memory_id, user=user, **fields)
+        return True
+
     @abstractmethod
     def update_batch(
         self,

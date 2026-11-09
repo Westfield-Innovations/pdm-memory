@@ -37,6 +37,7 @@ from pdm_memory.storage.base import BaseStorage, SaveBatchResult, UpdateBatchRes
 from pdm_memory.storage.schema import (
     SCHEMA_SQLITE,
     apply_sqlite_migrations,
+    increment_set_clause,
     mapping_to_record,
     prepare_update_fields,
     signature_insert_row,
@@ -498,6 +499,24 @@ class SQLiteDriver(BaseStorage):
                 memory_id,
                 user,
             )
+
+    def increment(
+        self,
+        memory_id: str,
+        user: str = "default",
+        deltas: dict[str, int] | None = None,
+        **fields,
+    ) -> bool:
+        """Add *deltas* to counters and set *fields* in one UPDATE."""
+        set_clause, values = increment_set_clause(deltas or {}, fields, "?")
+        if not set_clause:
+            return self.get(memory_id, user=user) is not None
+        cur = self._conn().execute(
+            f'UPDATE pdm_signatures SET {set_clause} WHERE id = ? AND user = ?',
+            values + [memory_id, user],
+        )
+        self._commit_if_idle(self._conn())
+        return cur.rowcount > 0
 
     def update_batch(
         self,

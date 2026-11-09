@@ -17,17 +17,16 @@ from __future__ import annotations
 import builtins
 import logging
 import threading
-from collections.abc import Callable, Generator
+from collections.abc import Generator
 from contextlib import contextmanager
-from datetime import datetime
 from typing import Any
 
-from pdm_memory.core.math import P_MAX, calculate_effective_spike
 from pdm_memory.core.signature import DrawerInfo, SignatureRecord
 from pdm_memory.storage.base import BaseStorage, SaveBatchResult, UpdateBatchResult
 from pdm_memory.storage.schema import (
     SCHEMA_POSTGRES,
     apply_postgres_migrations,
+    increment_set_clause,
     mapping_to_record,
     prepare_update_fields,
     signature_insert_row,
@@ -335,55 +334,24 @@ class PostgresDriver(BaseStorage):
                 user,
             )
 
-    def atomic_reinforce(
+    def increment(
         self,
         memory_id: str,
-        user: str,
-        *,
-        compute_delta: Callable[[float, int], float],
-        last_retrieved: datetime,
-    ) -> None:
-        """
-        Row-locked reinforce: SELECT … FOR UPDATE then atomic counter increment.
+        user: str = "default",
+        deltas: dict[str, int] | None = None,
+        **fields,
+    ) -> bool:
+        """Add *deltas* to counters and set *fields* in one UPDATE."""
+        set_clause, values = increment_set_clause(deltas or {}, fields, "%s")
+        if not set_clause:
+            return self.get(memory_id, user=user) is not None
+        cur = self._conn().execute(
+            f'UPDATE pdm_signatures SET {set_clause} WHERE id = %s AND "user" = %s',
+            values + [memory_id, user],
+        )
+        self._commit_if_idle(self._conn())
+        return cur.rowcount > 0
 
-        Prevents lost updates when multiple threads reinforce the same signature.
-        """
-        with self.transaction():
-            conn = self._conn()
-            row = conn.execute(
-                """
-                SELECT p_magnitude, retrieval_count, t_persistence, phase_privilege
-                FROM pdm_signatures
-                WHERE id = %s AND "user" = %s AND is_deleted = 0
-                FOR UPDATE
-                """,
-                (memory_id, user),
-            ).fetchone()
-            if row is None:
-                raise ValueError(
-                    f"Memory '{memory_id}' not found for user '{user}'"
-                )
-
-            p_magnitude = float(row["p_magnitude"])
-            retrieval_count = int(row["retrieval_count"] or 0)
-            delta = compute_delta(p_magnitude, retrieval_count)
-            new_p = min(P_MAX, p_magnitude + delta)
-            new_spike = calculate_effective_spike(
-                new_p,
-                float(row["t_persistence"]),
-                float(row["phase_privilege"]),
-            )
-            conn.execute(
-                """
-                UPDATE pdm_signatures
-                SET p_magnitude = %s,
-                    effective_spike = %s,
-                    retrieval_count = retrieval_count + 1,
-                    last_retrieved = %s
-                WHERE id = %s AND "user" = %s AND is_deleted = 0
-                """,
-                (new_p, new_spike, last_retrieved, memory_id, user),
-            )
     def update_batch(
         self,
         updates: builtins.list[tuple[str, dict]],

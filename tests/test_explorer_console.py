@@ -71,13 +71,14 @@ class TestExplorerConsoleAPI:
     def test_reinforce_memory(self, client: TestClient) -> None:
         with Memory(store=str(client.app.state.store), user="default") as mem:
             mid = mem._storage.list(user="default", limit=1)[0].id
-            before = mem._storage.get(mid, user="default").p_magnitude
+            before = mem._storage.get(mid, user="default")
 
         res = client.post(f"/api/v1/memories/{mid}/reinforce", json={"coupling_score": 0.8})
         assert res.status_code == 200
         body = res.json()
         assert body["ok"] is True
-        assert body["node"]["p_magnitude"] > before
+        assert body["node"]["p_magnitude"] == before.p_magnitude
+        assert body["node"]["v_correct"] == before.validation_prediction_correct + 1
 
     def test_delete_memory(self, client: TestClient) -> None:
         with Memory(store=str(client.app.state.store), user="default") as mem:
