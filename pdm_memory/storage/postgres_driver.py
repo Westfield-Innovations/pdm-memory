@@ -24,6 +24,7 @@ from typing import Any
 from pdm_memory.core.signature import DrawerInfo, SignatureRecord
 from pdm_memory.storage.base import BaseStorage, SaveBatchResult, UpdateBatchResult
 from pdm_memory.storage.schema import (
+    CARRIED_SQL,
     SCHEMA_POSTGRES,
     apply_postgres_migrations,
     increment_set_clause,
@@ -442,11 +443,15 @@ class PostgresDriver(BaseStorage):
         cursor_id: str | None = None,
         include_deleted: bool = False,
         tag_any: builtins.list[str] | tuple[str, ...] | None = None,
+        min_carried: float = 0.0,
     ) -> builtins.list[SignatureRecord]:
         where = ['"user" = %s', "p_magnitude >= %s"]
         params: list[Any] = [user, min_pressure]
         if not include_deleted:
             where.append("is_deleted = 0")
+        if min_carried > 0:
+            where.append(f"{CARRIED_SQL} >= %s")
+            params.append(min_carried)
         if drawer:
             where.append("drawer_domain = %s")
             params.append(drawer)
@@ -474,6 +479,14 @@ class PostgresDriver(BaseStorage):
         params.append(limit)
         rows = self._conn().execute(query, params).fetchall()
         return [mapping_to_record(r) for r in rows]
+
+    def count_below_carried(self, user: str, theta: float) -> int:
+        row = self._conn().execute(
+            'SELECT COUNT(*) FROM pdm_signatures WHERE "user" = %s AND is_deleted = 0 '
+            f"AND {CARRIED_SQL} < %s",
+            (user, theta),
+        ).fetchone()
+        return int(row[0]) if row else 0
 
     def list_drawers(self, user: str = "default") -> builtins.list[DrawerInfo]:
         rows = self._conn().execute(

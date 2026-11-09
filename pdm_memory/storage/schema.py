@@ -42,6 +42,25 @@ UPDATABLE_COLUMNS: frozenset[str] = frozenset(
     }
 )
 
+# The carried number (PDM v1.9 change 10): P × V on the 0–100 scale. The fade
+# 0.5^(t/T½) is at most 1, so the carried number is never below the weight and a
+# gate on it never drops a row the exact weight would keep. Kept as an index on
+# this expression: nothing writes it, so it cannot drift from the row.
+CARRIED_SQL: str = (
+    "(p_magnitude * (validation_prediction_correct + 1.0)"
+    " / (validation_prediction_total + 2.0))"
+)
+
+
+def carried_of(rec: SignatureRecord) -> float:
+    """The carried number of *rec*, as :data:`CARRIED_SQL` computes it."""
+    return (
+        rec.p_magnitude
+        * (rec.validation_prediction_correct + 1.0)
+        / (rec.validation_prediction_total + 2.0)
+    )
+
+
 # Counters a write may move by a delta, in one statement (no lost update).
 INCREMENTABLE_COLUMNS: frozenset[str] = frozenset(
     {"retrieval_count", "validation_prediction_total", "validation_prediction_correct"}
@@ -188,6 +207,10 @@ def apply_sqlite_migrations(conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_pdm_user_event_at "
         "ON pdm_signatures (user, t_event_at)"
     )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pdm_user_carried "
+        f"ON pdm_signatures (user, {CARRIED_SQL})"
+    )
 
 
 def apply_postgres_migrations(conn: Any) -> None:
@@ -217,6 +240,10 @@ def apply_postgres_migrations(conn: Any) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pdm_user_event_at "
         'ON pdm_signatures ("user", t_event_at)'
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pdm_user_carried "
+        f'ON pdm_signatures ("user", {CARRIED_SQL})'
     )
 
 

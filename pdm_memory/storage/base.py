@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 
 from pdm_memory.core.signature import DrawerInfo, SignatureRecord
+from pdm_memory.storage.schema import carried_of
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +135,7 @@ class BaseStorage(ABC):
         cursor_id: str | None = None,
         include_deleted: bool = False,
         tag_any: Sequence[str] | None = None,
+        min_carried: float = 0.0,
     ) -> builtins.list[SignatureRecord]:
         """
         List signatures ordered by ``p_magnitude DESC, id DESC``.
@@ -141,8 +143,22 @@ class BaseStorage(ABC):
         Keyset pagination: pass ``cursor_id`` from the last item of the previous page.
         Optional ``tag_any``: prefer records whose ``intent_tags`` contain any token
         (drivers without native support may ignore or filter client-side).
+        ``min_carried``: only rows whose carried number (P × V, 0–100) is at least this.
         """
         ...
+
+    def count_below_carried(self, user: str, theta: float) -> int:
+        """Live rows whose carried number is under *theta*: silent without weighing.
+
+        SQL drivers answer from the index; this fallback pages through :meth:`list`.
+        """
+        count, cursor = 0, None
+        while True:
+            page = self.list(user=user, limit=500, cursor_id=cursor)
+            count += sum(1 for rec in page if carried_of(rec) < theta)
+            if len(page) < 500:
+                return count
+            cursor = page[-1].id
 
     @abstractmethod
     def list_drawers(self, user: str = "default") -> builtins.list[DrawerInfo]:
