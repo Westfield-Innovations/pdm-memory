@@ -268,14 +268,19 @@ def apply_postgres_migrations(conn: Any) -> None:
     )
 
 
+# The old decay() deleted below P × V × fade × 0.80 < 30, i.e. weight < 37.5;
+# weight only falls with disuse, so a deleted row at or over this was a caller's.
+OLD_DECAY_REACH: float = DEFAULT_MIN_P / 0.80
+
+
 def restore_silent(conn: Any, *, dialect: str) -> tuple[int, int]:
     """
     Return to the memory the rows the old ``decay()`` deleted: ``(restored, kept)``.
 
-    Run once, on the upgrade that adds the carried index. A flagged row whose
-    weight is now under the default gate comes back as silent (PDM v1.9: nothing
-    is deleted). One at or over it stays deleted: the old pass could not have
-    deleted it, so a caller did, and restoring it would make it loud. A row whose
+    Run once, on the upgrade that adds the carried index (PDM v1.9: nothing is
+    deleted). A flagged row the old pass could have deleted (weight now under
+    :data:`OLD_DECAY_REACH`) comes back; under 30 it is silent. One at or over
+    the reach stays deleted: only a caller could have deleted it. A row whose
     fact is already live for the same user stays deleted too.
     """
     ph, user_col = ("?", "user") if dialect == "sqlite" else ("%s", '"user"')
@@ -290,7 +295,7 @@ def restore_silent(conn: Any, *, dialect: str) -> tuple[int, int]:
         "AND l.compressed_fact_hash = s.compressed_fact_hash AND l.is_deleted = 0)"
     ).fetchall()
     now = datetime.now(tz=timezone.utc)
-    quiet = [r["id"] for r in rows if weight_of(mapping_to_record(r), now)[0] < DEFAULT_MIN_P]
+    quiet = [r["id"] for r in rows if weight_of(mapping_to_record(r), now)[0] < OLD_DECAY_REACH]
     for i in range(0, len(quiet), 500):
         chunk = quiet[i : i + 500]
         conn.execute(
@@ -300,7 +305,7 @@ def restore_silent(conn: Any, *, dialect: str) -> tuple[int, int]:
         )
     kept = int(flagged) - len(quiet)
     logger.warning(
-        "[PDM] upgrade: restored %d silent rows the old decay() deleted; "
+        "[PDM] upgrade: restored %d rows the old decay() could have deleted; "
         "kept %d deleted (a caller's delete, or a live copy exists)",
         len(quiet),
         kept,

@@ -44,7 +44,11 @@ def test_decay_deletes_nothing(tmp_path):
 def _old_store(path):
     """A store as the shipped module left it: no carried index, some rows deleted."""
     driver = SQLiteDriver(path)
-    for text, p in [("quiet one the old decay deleted", 20), ("loud one a caller deleted", 80)]:
+    for text, p in [
+        ("quiet one the old decay deleted", 20),  # weight 10
+        ("fresh one the old decay deleted", 70),  # weight 35: old read 28 < 30
+        ("loud one a caller deleted", 80),  # weight 40: past the old pass's reach
+    ]:
         driver.save(SignatureRecord(user=USER, compressed_fact=text, p_magnitude=p, is_deleted=True))
     driver.save(SignatureRecord(user=USER, compressed_fact="live twin", p_magnitude=20))
     driver.save(SignatureRecord(user=USER, compressed_fact="live twin", p_magnitude=20, is_deleted=True))
@@ -63,9 +67,10 @@ def test_upgrade_returns_quiet_deleted_rows(tmp_path, caplog):
         for r in driver._conn().execute("SELECT compressed_fact, is_deleted FROM pdm_signatures")
     }
     assert rows["quiet one the old decay deleted"] == 0
+    assert rows["fresh one the old decay deleted"] == 0
     assert rows["loud one a caller deleted"] == 1
-    assert driver.count(USER) == 2  # the restored row and the live twin
-    assert "restored 1 silent rows" in caplog.text
+    assert driver.count(USER) == 3  # two restored and the live twin
+    assert "restored 2 rows" in caplog.text
     assert "kept 2 deleted" in caplog.text
     driver.close()
 
