@@ -1121,12 +1121,12 @@ class Memory:
         limit: int = 10_000,
     ) -> dict[str, Any]:
         """
-        Full-store self-maintenance: torsion scan, auto-reconcile, decay purge.
+        Full-store self-maintenance: torsion scan, auto-reconcile, silent count.
 
         1. ``detect_torsion`` across the store (optional drawer filter).
         2. Auto-reconcile pairs with ``torsion_score > auto_reconcile_threshold``
            (default ``0.85``), highest score first; overlapping IDs skipped.
-        3. Optional ``decay()`` purge of low ``P_effective`` signatures.
+        3. Optional count of the silent set (nothing is deleted).
 
         Returns:
             Dict with ``scanned_pairs``, ``reconciled``, ``skipped``,
@@ -1210,7 +1210,7 @@ class Memory:
 
         decay_counts: dict[str, int] | None = None
         if run_decay:
-            decay_counts = self.decay(dry_run=dry_run)
+            decay_counts = self._silent_counts()
 
         narrative = self._heal_narrative(
             reconciled=reconciled,
@@ -1256,12 +1256,9 @@ class Memory:
         else:
             parts.append("No high-confidence torsion pairs required reconciliation.")
 
-        purged = int((decay or {}).get("deleted", 0) or 0)
-        if purged > 0:
-            residue = "residue" if purged == 1 else "residues"
-            parts.append(f"Purged {purged} low-pressure {residue}.")
-        elif decay is not None:
-            parts.append("No low-pressure residues required purge.")
+        if decay is not None:
+            silent = int(decay.get("silent", 0) or 0)
+            parts.append(f"{silent} silent below the default gate; nothing deleted.")
 
         return " ".join(parts)
 
@@ -1316,7 +1313,7 @@ class Memory:
         Live shape-aware decay metrics for one signature (read-only).
 
         Does not mutate storage. Uses the same half-life law as ``recall`` /
-        ``explain``. For store-wide purge, use :meth:`decay`.
+        ``explain``. For the store-wide silent set, use :meth:`count_silent`.
         """
         as_of = now or datetime.now(tz=timezone.utc)
         if isinstance(signature, SignatureRecord):
@@ -1356,44 +1353,49 @@ class Memory:
             as_of=as_of,
         )
 
+    def count_silent(self, theta: float = DEFAULT_MIN_P, as_of: datetime | None = None) -> int:
+        """
+        How many live memories weigh under *theta* (0–100; default 30 = 0.3 of full).
+
+        The silent set: below the default gate, still there for a search. Rows
+        whose carried number is under θ count without weighing; the rest are
+        weighed exactly at *as_of*. Writes nothing (PDM v1.9 change 3).
+        """
+        as_of = as_of or datetime.now(tz=timezone.utc)
+        silent = self._storage.count_below_carried(self._user, theta)
+        cursor: str | None = None
+        while True:
+            page = self._storage.list(
+                user=self._user, limit=500, cursor_id=cursor, min_carried=theta
+            )
+            silent += sum(1 for rec in page if weight_of(rec, as_of)[0] < theta)
+            if len(page) < 500:
+                return silent
+            cursor = page[-1].id
+
     def decay(self, dry_run: bool = False) -> dict[str, int]:
         """
-        Soft-delete memories whose live ``P_effective`` is below the delete threshold.
+        Deprecated: count the silent set; nothing is deleted (PDM v1.9).
 
-        Uses the same half-life law as ``recall()`` / ``explain()``. Does not
-        rewrite ``p_magnitude``. ``decayed`` stays in the return dict for API
-        compat and is always 0.
-
-        For a single-memory live snapshot, use :meth:`decay_at`.
-
-        Args:
-            dry_run: If True, compute what would be deleted but make no writes.
-
-        Returns:
-            Dict with keys: decayed, deleted, skipped.
+        Returns ``decayed`` and ``deleted`` (always 0), ``skipped`` (live rows at
+        or over the default gate) and ``silent``. Use :meth:`count_silent`.
         """
-        records = self._storage.list(user=self._user, limit=10_000)
-        now = datetime.now(tz=timezone.utc)
-        counts = {"decayed": 0, "deleted": 0, "skipped": 0}
-        to_delete: list[str] = []
+        warnings.warn(
+            "decay() deletes nothing now; call Memory.count_silent().",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self._silent_counts()
 
-        for rec in records:
-            p_eff, _, _ = weight_of(rec, now)
-
-            if p_eff < DEFAULT_MIN_P:
-                to_delete.append(rec.id)
-                counts["deleted"] += 1
-            else:
-                counts["skipped"] += 1
-
-        if to_delete and not dry_run:
-            txn = getattr(self._storage, "transaction", None)
-            ctx: AbstractContextManager[None] = txn() if callable(txn) else nullcontext()
-            with ctx:
-                for memory_id in to_delete:
-                    self._storage.delete(memory_id, user=self._user)
-
-        logger.info("[PDM] decay() %s | %s", "(dry_run)" if dry_run else "", counts)
+    def _silent_counts(self) -> dict[str, int]:
+        silent = self.count_silent()
+        counts = {
+            "decayed": 0,
+            "deleted": 0,
+            "skipped": max(0, self.count() - silent),
+            "silent": silent,
+        }
+        logger.info("[PDM] silent set | %s", counts)
         return counts
 
     @staticmethod
