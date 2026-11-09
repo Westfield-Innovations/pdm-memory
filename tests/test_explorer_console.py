@@ -39,7 +39,8 @@ def console_db(tmp_path: Path) -> Path:
             "User prefers dark mode",
             tags=["ui", "prefs", "theme"],
             drawer="prefs",
-            p_magnitude=40,
+            # Weight 15: under θ 16.35 at search_cost 0.65, over 11.1 at 0.9.
+            p_magnitude=30,
         )
     return db
 

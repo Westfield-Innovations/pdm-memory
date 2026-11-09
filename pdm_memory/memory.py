@@ -45,18 +45,18 @@ from typing_extensions import Self
 
 from pdm_memory.core.alignment import verify_records
 from pdm_memory.core.math import (
-    DECAY_DELETE_THRESHOLD,
+    DEFAULT_MIN_P,
     MEMORY_SHAPE_KEY,
     SHAPE_HALF_LIVES,
-    calculate_decay_factor,
     calculate_effective_spike,
     calculate_intent_weight,
-    calculate_p_effective,
     calculate_v,
+    disuse_clock,
     half_life_for_signature,
     infer_domain,
     infer_shape,
     resolve_memory_shape,
+    weight_of,
 )
 from pdm_memory.core.retrieval import DEFAULT_DIVERSITY_BIAS, RetrievalEngine
 from pdm_memory.core.signature import (
@@ -1398,7 +1398,7 @@ class Memory:
                 f"Memory '{memory_id}' not found for user '{self._user}'."
             )
 
-        days_since = self._days_since(rec.last_retrieved or rec.created_at, as_of)
+        days_since = self._days_since(disuse_clock(rec), as_of)
         days_since_created = self._days_since(rec.created_at, as_of)
         shape = resolve_memory_shape(
             rec.metadata, rec.intent_tags, rec.compressed_fact
@@ -1410,19 +1410,7 @@ class Memory:
             metadata=rec.metadata,
             text=rec.compressed_fact,
         )
-        decay = calculate_decay_factor(
-            days_since,
-            half_life,
-            days_since_created=days_since_created,
-            t_persistence=rec.t_persistence,
-        )
-        v = calculate_v(
-            rec.validation_prediction_correct,
-            rec.validation_prediction_total,
-        )
-        p_eff = calculate_p_effective(
-            rec.p_magnitude, v, decay, intent_weight=1.0, quality=0.80
-        )
+        p_eff, v, decay = weight_of(rec, as_of)
         return DecaySnapshot(
             memory_id=rec.id,
             shape=shape,
@@ -1459,29 +1447,9 @@ class Memory:
         to_delete: list[str] = []
 
         for rec in records:
-            days_since_touch = self._days_since(rec.last_retrieved or rec.created_at, now)
-            days_since_created = self._days_since(rec.created_at, now)
-            half_life = half_life_for_signature(
-                rec.domain,
-                intent_tags=rec.intent_tags,
-                metadata=rec.metadata,
-                text=rec.compressed_fact,
-            )
-            decay = calculate_decay_factor(
-                days_since_touch,
-                half_life,
-                days_since_created=days_since_created,
-                t_persistence=rec.t_persistence,
-            )
-            v = calculate_v(
-                rec.validation_prediction_correct,
-                rec.validation_prediction_total,
-            )
-            p_eff = calculate_p_effective(
-                rec.p_magnitude, v, decay, intent_weight=1.0, quality=0.80
-            )
+            p_eff, _, _ = weight_of(rec, now)
 
-            if p_eff < DECAY_DELETE_THRESHOLD:
+            if p_eff < DEFAULT_MIN_P:
                 to_delete.append(rec.id)
                 counts["deleted"] += 1
             else:
@@ -1510,22 +1478,7 @@ class Memory:
     def _record_to_hit(self, rec: SignatureRecord) -> MemoryHit:
         """Build a MemoryHit with live decay / P_effective (no query coupling)."""
         now = datetime.now(tz=timezone.utc)
-        days_since = self._days_since(rec.last_retrieved or rec.created_at, now)
-        days_since_created = self._days_since(rec.created_at, now)
-        half_life = half_life_for_signature(
-            rec.domain,
-            intent_tags=rec.intent_tags,
-            metadata=rec.metadata,
-            text=rec.compressed_fact,
-        )
-        decay = calculate_decay_factor(
-            days_since,
-            half_life,
-            days_since_created=days_since_created,
-            t_persistence=rec.t_persistence,
-        )
-        v = calculate_v(rec.validation_prediction_correct, rec.validation_prediction_total)
-        p_eff = calculate_p_effective(rec.p_magnitude, v, decay, 1.0, 0.80)
+        p_eff, v, decay = weight_of(rec, now)
         e_temporal, is_urgent = self._engine._temporal_energy(rec, now)
         return MemoryHit.from_record(
             rec,
@@ -1601,8 +1554,7 @@ class Memory:
             raise KeyError(f"Memory '{memory_id}' not found for user '{self._user}'.")
 
         now = datetime.now(tz=timezone.utc)
-        days_since = self._days_since(rec.last_retrieved or rec.created_at, now)
-        days_since_created = self._days_since(rec.created_at, now)
+        days_since = self._days_since(disuse_clock(rec), now)
 
         domain = rec.domain or infer_domain(rec.intent_tags)
         half_life = half_life_for_signature(
@@ -1611,21 +1563,8 @@ class Memory:
             metadata=rec.metadata,
             text=rec.compressed_fact,
         )
-        decay = calculate_decay_factor(
-            days_since,
-            half_life,
-            days_since_created=days_since_created,
-            t_persistence=rec.t_persistence,
-        )
-        v = calculate_v(rec.validation_prediction_correct, rec.validation_prediction_total)
+        p_eff, v, decay = weight_of(rec, now)
         i_weight = calculate_intent_weight(rec.intent_tags, query) if query else None
-        p_eff = calculate_p_effective(
-            rec.p_magnitude,
-            v,
-            decay,
-            i_weight if i_weight is not None else 1.0,
-            0.80,
-        )
 
         # TAS coupling for the query
         coupling_score = tag_overlap = domain_match = regime_match = press_prox = None

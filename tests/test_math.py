@@ -5,7 +5,7 @@ import math
 import pytest
 
 from pdm_memory.core.math import (
-    DECAY_DELETE_THRESHOLD,
+    DEFAULT_MIN_P,
     DOMAIN_HALF_LIVES,
     MEMORY_SHAPE_KEY,
     SHAPE_HALF_LIVES,
@@ -267,7 +267,7 @@ class TestHalfLifePressure:
             35, days_since_retrieved=200, half_life=30, t_persistence=30,
             days_since_created=230,
         )
-        assert new_p < DECAY_DELETE_THRESHOLD
+        assert new_p < DEFAULT_MIN_P
 
     def test_spike_recomputed(self):
         _, new_spike = calculate_half_life_pressure(
