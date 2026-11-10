@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import os
+import sqlite3
 import sys
 from datetime import datetime
 from typing import Any
@@ -24,6 +25,8 @@ INSTALL_HINT = (
     "PDM connector requires the MCP package.\n"
     'Install with:  pip install "pdm-memory[connector]"'
 )
+SETUP_HINT = 'Set PDM_STORE and PDM_USER in the connector\'s settings, and PDM_TOKEN when PDM_STORE is "cloud".'
+TRANSPORTS = ("stdio", "streamable-http")
 
 
 def _mcp():
@@ -128,4 +131,15 @@ def main() -> None:
     except ImportError:
         print(INSTALL_HINT, file=sys.stderr)
         sys.exit(1)
-    build_server().run(transport=os.environ.get("PDM_CONNECTOR_TRANSPORT", "stdio"))
+    transport = os.environ.get("PDM_CONNECTOR_TRANSPORT", "stdio")
+    if transport not in TRANSPORTS:
+        print(f"PDM_CONNECTOR_TRANSPORT must be one of {', '.join(TRANSPORTS)}, not {transport!r}.",
+              file=sys.stderr)
+        sys.exit(1)
+    try:
+        server = build_server()
+    except (ValueError, OSError, sqlite3.Error) as problem:
+        # The desktop app shows this text; stdout stays clean for the protocol.
+        print(f"PDM connector could not start: {problem}\n{SETUP_HINT}", file=sys.stderr)
+        sys.exit(1)
+    server.run(transport=transport)

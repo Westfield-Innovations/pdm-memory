@@ -759,7 +759,7 @@ Four tools:
 - `pdm_drawers` — the drawers with their counts and average pressure.
 - `pdm_explain` — why one memory holds the pressure it holds.
 
-It runs over stdio by default. `PDM_CONNECTOR_TRANSPORT=streamable-http` serves it at an address instead. `python -m pdm_memory.connector` works too.
+It runs over stdio by default. `PDM_CONNECTOR_TRANSPORT=streamable-http` serves it at `http://127.0.0.1:8000/mcp` instead, on this machine only. `python -m pdm_memory.connector` works too. If it can't start (no `PDM_STORE`, a wrong path, no token for the cloud store), it says why on stderr and exits.
 
 ---
 

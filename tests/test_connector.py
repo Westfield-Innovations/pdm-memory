@@ -195,3 +195,28 @@ def test_stdio_subprocess_lists_tools(tmp_path):
             return {t.name for t in (await client.list_tools()).tools}
 
     assert asyncio.run(asyncio.wait_for(go(), 60)) == TOOLS
+
+
+def test_main_without_store_says_what_to_set(monkeypatch, capsys):
+    from pdm_memory.connector import server
+
+    for name in ("PDM_STORE", "PDM_USER", "PDM_TOKEN", "PDM_CONNECTOR_TRANSPORT"):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(SystemExit) as stopped:
+        server.main()
+    assert stopped.value.code == 1
+    err = capsys.readouterr().err
+    assert "PDM_STORE" in err and "PDM_TOKEN" in err
+
+
+def test_main_rejects_an_unknown_transport(tmp_path, monkeypatch, capsys):
+    from pdm_memory.connector import server
+
+    monkeypatch.setenv("PDM_STORE", str(tmp_path / "t.db"))
+    monkeypatch.setenv("PDM_USER", "owner")
+    monkeypatch.setenv("PDM_CONNECTOR_TRANSPORT", "http")
+    with pytest.raises(SystemExit) as stopped:
+        server.main()
+    assert stopped.value.code == 1
+    err = capsys.readouterr().err
+    assert "'http'" in err and "stdio" in err and "streamable-http" in err
