@@ -23,6 +23,7 @@ The public surface of the SDK:
 See README.md for full documentation.
 """
 
+from pdm_memory.claims import Claim
 from pdm_memory.core.alignment import verify
 from pdm_memory.core.math import MEMORY_SHAPE_KEY, SHAPE_HALF_LIVES
 from pdm_memory.core.signature import (
@@ -60,6 +61,7 @@ __all__ = [
     "AlignmentReport",
     "BranchError",
     "CheckResult",
+    "Claim",
     "ConditionVerdict",
     "ConfigurationError",
     "ContraryEvidenceResult",

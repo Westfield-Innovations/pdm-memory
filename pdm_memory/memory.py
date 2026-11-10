@@ -45,6 +45,7 @@ from typing import Any, Mapping
 
 from typing_extensions import Self
 
+from pdm_memory.claims import Claim
 from pdm_memory.core.alignment import verify_records
 from pdm_memory.core.math import (
     DEFAULT_MIN_P,
@@ -252,6 +253,7 @@ class Memory:
         dedupe: bool = True,
         dedupe_reinforce: bool = False,
         idempotency_key: str | None = None,
+        claim: Claim | None = None,
     ) -> str:
         """
         Store a new memory.
@@ -281,6 +283,9 @@ class Memory:
             dedupe:         If True, return existing ID when fact hash already stored.
             dedupe_reinforce: When dedupe hits, touch() the existing memory (a use, not a grade).
             idempotency_key:  If set, repeated saves with the same key return the existing ID.
+            claim:          A prediction on this memory: direction, due, bound source
+                            (PDM v1.9 change 4). A claim is never deduped: each is its
+                            own prediction.
 
         Returns:
             The new memory ID (UUID string), or existing ID if dedupe matched.
@@ -289,6 +294,8 @@ class Memory:
             raise ValueError("Memory text cannot be empty.")
 
         text = text.strip()[:500]
+        if claim is not None:
+            dedupe = False
 
         if idempotency_key:
             key = idempotency_key.strip()
@@ -323,6 +330,11 @@ class Memory:
             shape=shape,
             idempotency_key=idempotency_key,
         )
+        if claim is not None:
+            sig.direction = claim.direction
+            sig.due = claim.due
+            sig.outcome_source = (claim.outcome_source or "").strip()
+            sig.watch_window = claim.watch_window_days
         sig = self._run_pre_save_hooks(sig)
         memory_id = self._storage.save(sig)
         self._run_post_save_hooks(sig, memory_id)
@@ -852,6 +864,24 @@ class Memory:
                 memory_id, self._user, {"retrieval_count": 1}, last_retrieved=now
             )
         return touched
+
+    def report_coverage_gap(self, source: str, gap_from: datetime, gap_to: datetime) -> int:
+        """
+        Record that *source* did not report from *gap_from* to *gap_to* (PDM v1.9 change 4).
+
+        A claim bound to *source* whose interval the gap touches is never settled
+        by a missing report. Returns how many verdicts the gap amended (none
+        until settlement is built).
+        """
+        source = (source or "").strip()
+        if not source:
+            raise ValueError("A coverage gap names its source.")
+        if gap_from.tzinfo is None or gap_to.tzinfo is None:
+            raise ValueError("A coverage gap's bounds must be timezone-aware.")
+        if gap_to <= gap_from:
+            raise ValueError("A coverage gap ends after it starts.")
+        self._storage.save_coverage_gap(self._user, source, gap_from, gap_to)
+        return 0
 
     def reinforce(self, memory_id: str, coupling_score: float = 0.5) -> set[str]:
         """
