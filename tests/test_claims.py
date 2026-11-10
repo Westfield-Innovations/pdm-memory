@@ -1,4 +1,4 @@
-"""PDM v1.9 change 4: the claim on a signature and coverage gaps."""
+"""PDM v1.9 changes 4 and 6: the claim on a signature, coverage gaps, the owl and the duck."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from pdm_memory import Claim, Memory
+from pdm_memory.claims import is_duck, is_owl
 from pdm_memory.core.signature import SignatureRecord
 from pdm_memory.storage.sqlite_driver import SQLiteDriver
 
@@ -101,3 +102,31 @@ def test_old_rows_read_as_plain_signatures(tmp_path):
     assert (rec.direction, rec.due, rec.verdict) == ("", None, "")
     d.close()
 
+
+def _claim_rec(direction, *, due=FRIDAY, verdict="", outcome=""):
+    return SignatureRecord(direction=direction, due=due, verdict=verdict, outcome=outcome)
+
+
+def test_an_occurs_claim_past_due_with_nothing_seen_is_an_owl():
+    after = FRIDAY + timedelta(hours=1)
+    assert is_owl(_claim_rec("occurs"), after)
+    assert is_owl(_claim_rec("occurs", verdict="not_by_due"), after)
+    assert is_owl(_claim_rec("occurs", verdict="expired_unobserved"), after)
+    assert not is_owl(_claim_rec("occurs", verdict="on_time"), after)
+
+
+def test_an_occurs_claim_before_due_is_not_an_owl():
+    assert not is_owl(_claim_rec("occurs"), NOW)
+
+
+def test_an_absent_claim_without_an_observation_is_a_duck():
+    assert is_duck(_claim_rec("absent"))
+    assert is_duck(_claim_rec("absent", verdict="not_by_due"))  # a missing report, not a look
+    assert not is_duck(_claim_rec("absent", outcome="observed_absent"))
+    assert not is_duck(_claim_rec("absent", outcome="occurred"))
+
+
+def test_a_plain_signature_is_neither():
+    rec = SignatureRecord()
+    assert not is_owl(rec, NOW + timedelta(days=999))
+    assert not is_duck(rec)
