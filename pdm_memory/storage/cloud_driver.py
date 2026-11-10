@@ -161,9 +161,14 @@ class CloudDriver(BaseStorage):
     # BaseStorage
     # ------------------------------------------------------------------
 
-    def save(self, sig: SignatureRecord) -> str:
+    #: The server writes support links at ingest (``rests_on``); Memory passes them here.
+    support_at_ingest = True
+
+    def save(self, sig: SignatureRecord, *, rests_on: builtins.list[str] | None = None) -> str:
         """POST /api/v1/pdm/ingest — create a new signature in the cloud."""
         payload = self._record_to_payload(sig)
+        if rests_on:
+            payload["rests_on"] = list(rests_on)
         resp = self._post("/api/v1/pdm/ingest", payload)
         data = resp.json()
         cloud_id = data.get("id") or data.get("signature_id") or sig.id
@@ -604,6 +609,28 @@ class CloudDriver(BaseStorage):
                 "List response missing valid pagination.total_count",
                 path=path,
             ) from exc
+
+    def touch(self, user: str, ids: builtins.list[str]) -> int:
+        """POST /api/v1/pdm/touch: the server stamps the rows and links them as coaccess."""
+        resp = self._post("/api/v1/pdm/touch", {"ids": list(ids)})
+        return int(resp.json().get("touched", 0) or 0)
+
+    def save_coverage_gap(
+        self, user: str, source: str, gap_from: datetime, gap_to: datetime
+    ) -> int:
+        """POST /api/v1/pdm/coverage-gaps; returns how many verdicts the server amended."""
+        resp = self._post(
+            "/api/v1/pdm/coverage-gaps",
+            {"source": source, "from": gap_from.isoformat(), "to": gap_to.isoformat()},
+        )
+        return int(resp.json().get("amended", 0) or 0)
+
+    def count_silent(self, user: str, theta: float, as_of: datetime) -> int:
+        """GET /api/v1/pdm/count-silent: counted by the server, from its own index."""
+        resp = self._get(
+            "/api/v1/pdm/count-silent", params={"theta": theta, "as_of": as_of.isoformat()}
+        )
+        return int(resp.json().get("silent", 0) or 0)
 
     def list_drawers(self, user: str = "default") -> builtins.list[DrawerInfo]:
         """GET /api/v1/pdm/drawers — raises on failure."""
@@ -1581,6 +1608,14 @@ class CloudDriver(BaseStorage):
             "t_event_at": cls._iso(sig.t_event_at),
             "source_sdk": sig.source,
         }
+        if sig.direction:
+            # The response serializer omits the claim; keep it for the round trip.
+            sdk_bag["claim"] = {
+                "direction": sig.direction,
+                "due": cls._iso(sig.due),
+                "outcome_source": sig.outcome_source,
+                "watch_window": sig.watch_window,
+            }
         shape = meta.get(MEMORY_SHAPE_KEY)
         if isinstance(shape, str) and shape:
             sdk_bag[MEMORY_SHAPE_KEY] = shape
@@ -1614,6 +1649,13 @@ class CloudDriver(BaseStorage):
         }
         if sig.idempotency_key:
             payload["idempotency_key"] = sig.idempotency_key
+        if sig.direction:
+            payload["direction"] = sig.direction
+            payload["due"] = cls._iso(sig.due)
+            if sig.outcome_source:
+                payload["outcome_source"] = sig.outcome_source
+            if sig.watch_window is not None:
+                payload["watch_window_days"] = sig.watch_window
         return payload
 
     @staticmethod
@@ -1717,7 +1759,22 @@ class CloudDriver(BaseStorage):
             or bool(isinstance(meta, dict) and meta.get("_pdm_is_deleted")),
             "idempotency_key": data.get("idempotency_key")
             or (meta.get("_idempotency_key") if isinstance(meta, dict) else None),
+            "validation_status": str(data.get("validation_status") or "UNVALIDATED"),
         }
+        claim = sdk_bag.get("claim") if isinstance(sdk_bag.get("claim"), dict) else {}
+        direction = data.get("direction") or claim.get("direction") or ""
+        if direction:
+            watch = data.get("watch_window_days", claim.get("watch_window"))
+            kwargs.update(
+                direction=str(direction),
+                due=_dt(data.get("due") or claim.get("due")),
+                outcome_source=str(data.get("outcome_source") or claim.get("outcome_source") or ""),
+                watch_window=float(watch) if watch is not None else None,
+                outcome=str(data.get("outcome") or ""),
+                verdict=str(data.get("verdict") or ""),
+                event_time=_dt(data.get("event_time")),
+                report_time=_dt(data.get("report_time")),
+            )
         if record_id:
             kwargs["id"] = record_id
         # Restore shape from SDK bag when top-level metadata was stripped.

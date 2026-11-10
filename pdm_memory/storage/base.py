@@ -165,8 +165,8 @@ class BaseStorage(ABC):
 
     def save_coverage_gap(
         self, user: str, source: str, gap_from: datetime, gap_to: datetime
-    ) -> None:
-        """Record that *source* did not report from *gap_from* to *gap_to*."""
+    ) -> int:
+        """Record that *source* did not report from *gap_from* to *gap_to*; returns verdicts amended."""
         raise NotImplementedError(f"{type(self).__name__} keeps no coverage gaps")
 
     def count_below_carried(self, user: str, theta: float) -> int:
