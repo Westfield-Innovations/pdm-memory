@@ -35,8 +35,10 @@ from datetime import datetime, timezone
 from pdm_memory.core.signature import DrawerInfo, SignatureRecord
 from pdm_memory.storage.base import BaseStorage, SaveBatchResult, UpdateBatchResult
 from pdm_memory.storage.schema import (
+    CARRIED_SQL,
     SCHEMA_SQLITE,
     apply_sqlite_migrations,
+    increment_set_clause,
     mapping_to_record,
     prepare_update_fields,
     signature_insert_row,
@@ -499,6 +501,24 @@ class SQLiteDriver(BaseStorage):
                 user,
             )
 
+    def increment(
+        self,
+        memory_id: str,
+        user: str = "default",
+        deltas: dict[str, int] | None = None,
+        **fields,
+    ) -> bool:
+        """Add *deltas* to counters and set *fields* in one UPDATE."""
+        set_clause, values = increment_set_clause(deltas or {}, fields, "?")
+        if not set_clause:
+            return self.get(memory_id, user=user) is not None
+        cur = self._conn().execute(
+            f'UPDATE pdm_signatures SET {set_clause} WHERE id = ? AND user = ?',
+            values + [memory_id, user],
+        )
+        self._commit_if_idle(self._conn())
+        return cur.rowcount > 0
+
     def update_batch(
         self,
         updates: builtins.list[tuple[str, dict]],
@@ -607,11 +627,15 @@ class SQLiteDriver(BaseStorage):
         cursor_id: str | None = None,
         include_deleted: bool = False,
         tag_any: builtins.list[str] | tuple[str, ...] | None = None,
+        min_carried: float = 0.0,
     ) -> builtins.list[SignatureRecord]:
         where = ["user = ?", "p_magnitude >= ?"]
         params: list = [user, min_pressure]
         if not include_deleted:
             where.append("is_deleted = 0")
+        if min_carried > 0:
+            where.append(f"{CARRIED_SQL} >= ?")
+            params.append(min_carried)
         if drawer:
             where.append("drawer_domain = ?")
             params.append(drawer)
@@ -640,6 +664,14 @@ class SQLiteDriver(BaseStorage):
         params.append(limit)
         rows = self._conn().execute(query, params).fetchall()
         return [mapping_to_record(r) for r in rows]
+
+    def count_below_carried(self, user: str, theta: float) -> int:
+        row = self._conn().execute(
+            "SELECT COUNT(*) FROM pdm_signatures WHERE user = ? AND is_deleted = 0 "
+            f"AND {CARRIED_SQL} < ?",
+            (user, theta),
+        ).fetchone()
+        return int(row[0]) if row else 0
 
     def list_drawers(self, user: str = "default") -> builtins.list[DrawerInfo]:
         rows = self._conn().execute(

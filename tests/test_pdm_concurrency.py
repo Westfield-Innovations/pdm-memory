@@ -1,7 +1,7 @@
 """
-Postgres storage seam — concurrent reinforce() must not lose retrieval_count updates.
+Postgres storage seam — concurrent reinforce() must not lose a verdict count.
 
-10 workers × 50 reinforces = exactly 500 retrieval_count, or we have lost updates.
+10 workers × 50 reinforces = exactly 500 correct of 500, or we have lost updates.
 """
 
 from __future__ import annotations
@@ -114,11 +114,11 @@ class TestPostgresConcurrentReinforce:
         try:
             rec = verify._storage.get(target_id, user=stress_user)
             assert rec is not None, "stress target missing after concurrent reinforces"
-            assert rec.retrieval_count == EXPECTED_COUNT, (
-                f"Lost updates detected: retrieval_count={rec.retrieval_count}, "
-                f"expected={EXPECTED_COUNT}. "
-                "PostgresDriver must use SELECT FOR UPDATE or atomic "
-                "retrieval_count = retrieval_count + 1."
+            assert rec.validation_prediction_total == EXPECTED_COUNT, (
+                f"Lost updates detected: total={rec.validation_prediction_total}, "
+                f"expected={EXPECTED_COUNT}. PostgresDriver.increment must be atomic."
             )
+            assert rec.validation_prediction_correct == EXPECTED_COUNT
+            assert rec.retrieval_count == 0
         finally:
             verify.close()

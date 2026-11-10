@@ -77,7 +77,7 @@ class TestCLIDecay:
 
         output, code = run_cli(["--store", db, "decay", "--dry-run"])
         assert code == 0
-        assert "DRY RUN" in output
+        assert "Silent (weight < 30 = 0.3 of full): 0" in output
 
 
 class TestCLIDrawers:

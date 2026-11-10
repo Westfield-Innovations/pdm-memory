@@ -83,10 +83,11 @@ class TestMemorySaveRecall:
 
     def test_save_dedupe_reinforce(self, mem):
         mid = mem.save("Repeat me", tags=["a", "b", "c"], p_magnitude=50)
-        before = mem._storage.get(mid, user="test_user").p_magnitude
         mem.save("Repeat me", tags=["a", "b", "c"], dedupe_reinforce=True)
-        after = mem._storage.get(mid, user="test_user").p_magnitude
-        assert after > before
+        after = mem._storage.get(mid, user="test_user")
+        assert after.p_magnitude == 50
+        assert after.retrieval_count == 1
+        assert after.validation_prediction_total == 0
 
     def test_save_dedupe_disabled(self, mem):
         mem.save("Same text", tags=["a", "b", "c"], dedupe=False)
@@ -397,12 +398,12 @@ class TestMemoryFromEnv:
 
 
 class TestMemoryReinforce:
-    def test_reinforce_increases_pressure(self, mem):
+    def test_reinforce_raises_v_not_pressure(self, mem):
         mid = mem.save("Important fact", tags=["fact", "important", "core"], p_magnitude=60)
-        original = mem._storage.get(mid, user="test_user")
         mem.reinforce(mid, coupling_score=0.8)
         updated = mem._storage.get(mid, user="test_user")
-        assert updated.p_magnitude > original.p_magnitude
+        assert updated.p_magnitude == 60
+        assert updated.validation_prediction_correct == 1
 
     def test_reinforce_missing_id(self, mem):
         with pytest.raises(ValueError, match="not found"):

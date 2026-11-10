@@ -96,12 +96,10 @@ def cmd_decay(args: argparse.Namespace) -> None:
     from pdm_memory import Memory
 
     with Memory(store=args.store, user=_require_user(args)) as mem:
-        counts = mem.decay(dry_run=args.dry_run)
-        mode = " [DRY RUN — no changes written]" if args.dry_run else ""
-        print(f"Decay complete{mode}:")
-        print(f"  Decayed (pressure reduced):  {counts['decayed']}")
-        print(f"  Deleted (pressure < 30):     {counts['deleted']}")
-        print(f"  Skipped (within persistence): {counts['skipped']}")
+        silent = mem.count_silent()
+        print("Decay deletes nothing; old memories go quiet and a search still reaches them.")
+        print(f"  Silent (weight < 30 = 0.3 of full): {silent}")
+        print(f"  Live:                               {mem.count()}")
 
 
 def cmd_stats(args: argparse.Namespace) -> None:
@@ -238,8 +236,8 @@ def cmd_heal(args: argparse.Namespace) -> None:
             print("  decay:          (skipped)")
         else:
             print(
-                f"  decay:          deleted={decay.get('deleted', 0)} "
-                f"skipped={decay.get('skipped', 0)}"
+                f"  decay:          silent={decay.get('silent', 0)} "
+                f"live={decay.get('skipped', 0) + decay.get('silent', 0)}"
             )
 
 
@@ -367,8 +365,8 @@ def main() -> None:
     p_explain.set_defaults(func=cmd_explain)
 
     # decay
-    p_decay = subparsers.add_parser("decay", parents=[sub_parent_parser], help="Trigger a decay pass")
-    p_decay.add_argument("--dry-run", action="store_true", help="Preview without writing")
+    p_decay = subparsers.add_parser("decay", parents=[sub_parent_parser], help="Count the silent memories")
+    p_decay.add_argument("--dry-run", action="store_true", help="Accepted; decay never writes")
     p_decay.set_defaults(func=cmd_decay)
 
     # stats
@@ -467,7 +465,7 @@ def main() -> None:
     p_heal.add_argument(
         "--no-decay",
         action="store_true",
-        help="Skip the decay purge pass after reconciliation",
+        help="Skip the silent count after reconciliation",
     )
     p_heal.add_argument(
         "--dry-run",

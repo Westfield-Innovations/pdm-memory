@@ -32,6 +32,7 @@ from pdm_memory.storage.errors import (
     CloudNotFoundError,
     CloudStorageError,
 )
+from pdm_memory.storage.schema import carried_of
 
 logger = logging.getLogger(__name__)
 
@@ -495,20 +496,22 @@ class CloudDriver(BaseStorage):
         cursor_id: str | None = None,
         include_deleted: bool = False,
         tag_any: builtins.list[str] | tuple[str, ...] | None = None,
+        min_carried: float = 0.0,
     ) -> builtins.list[SignatureRecord]:
         """
         GET /api/v1/pdm/signatures — keyset list, mirrors Postgres/SQLite.
 
         Storage scan endpoint (no retrieve side effects). Pages transparently
         when ``limit`` exceeds ``_API_PAGE_MAX`` (server max page size).
-        Optional ``tag_any`` is filtered client-side (API has no tag param yet).
+        Optional ``tag_any`` and ``min_carried`` are filtered client-side.
         """
         if limit <= 0:
             return []
 
         tags = {t.strip().lower() for t in (tag_any or ()) if t and str(t).strip()}
         # Over-fetch when tag-filtering so callers can still fill ``limit`` matches.
-        need = limit if not tags else min(max(limit * 5, limit), 2_000)
+        filtered = bool(tags) or min_carried > 0
+        need = limit if not filtered else min(max(limit * 5, limit), 2_000)
 
         records: builtins.list[SignatureRecord] = []
         next_cursor = cursor_id
@@ -554,6 +557,8 @@ class CloudDriver(BaseStorage):
                     for rec in page_records
                     if {tag.lower() for tag in (rec.intent_tags or []) if tag} & tags
                 ]
+            if min_carried > 0:
+                page_records = [rec for rec in page_records if carried_of(rec) >= min_carried]
 
             if raw_count == 0:
                 break

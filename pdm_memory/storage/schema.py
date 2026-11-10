@@ -8,11 +8,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
+from pdm_memory.core.math import DEFAULT_MIN_P, weight_of
 from pdm_memory.core.signature import SignatureRecord
+
+logger = logging.getLogger(__name__)
 
 UPDATABLE_COLUMNS: frozenset[str] = frozenset(
     {
@@ -40,6 +44,30 @@ UPDATABLE_COLUMNS: frozenset[str] = frozenset(
         "is_deleted",
         "idempotency_key",
     }
+)
+
+# The carried number (PDM v1.9 change 10): P × V on the 0–100 scale. The fade
+# 0.5^(t/T½) is at most 1, so the carried number is never below the weight and a
+# gate on it never drops a row the exact weight would keep. Kept as an index on
+# this expression: nothing writes it, so it cannot drift from the row.
+CARRIED_SQL: str = (
+    "(p_magnitude * (validation_prediction_correct + 1.0)"
+    " / (validation_prediction_total + 2.0))"
+)
+
+
+def carried_of(rec: SignatureRecord) -> float:
+    """The carried number of *rec*, as :data:`CARRIED_SQL` computes it."""
+    return (
+        rec.p_magnitude
+        * (rec.validation_prediction_correct + 1.0)
+        / (rec.validation_prediction_total + 2.0)
+    )
+
+
+# Counters a write may move by a delta, in one statement (no lost update).
+INCREMENTABLE_COLUMNS: frozenset[str] = frozenset(
+    {"retrieval_count", "validation_prediction_total", "validation_prediction_correct"}
 )
 
 SCHEMA_SQLITE = """
@@ -183,6 +211,19 @@ def apply_sqlite_migrations(conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_pdm_user_event_at "
         "ON pdm_signatures (user, t_event_at)"
     )
+    upgrading = (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_pdm_user_carried'"
+        ).fetchone()
+        is None
+    )
+    if upgrading:
+        restore_silent(conn, dialect="sqlite")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pdm_user_carried "
+        f"ON pdm_signatures (user, {CARRIED_SQL})"
+    )
 
 
 def apply_postgres_migrations(conn: Any) -> None:
@@ -213,6 +254,63 @@ def apply_postgres_migrations(conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_pdm_user_event_at "
         'ON pdm_signatures ("user", t_event_at)'
     )
+    upgrading = (
+        conn.execute(
+            "SELECT 1 FROM pg_indexes WHERE indexname = 'idx_pdm_user_carried'"
+        ).fetchone()
+        is None
+    )
+    if upgrading:
+        restore_silent(conn, dialect="postgres")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pdm_user_carried "
+        f'ON pdm_signatures ("user", {CARRIED_SQL})'
+    )
+
+
+# The old decay() deleted below P × V × fade × 0.80 < 30, i.e. weight < 37.5;
+# weight only falls with disuse, so a deleted row at or over this was a caller's.
+OLD_DECAY_REACH: float = DEFAULT_MIN_P / 0.80
+
+
+def restore_silent(conn: Any, *, dialect: str) -> tuple[int, int]:
+    """
+    Return to the memory the rows the old ``decay()`` deleted: ``(restored, kept)``.
+
+    Run once, on the upgrade that adds the carried index (PDM v1.9: nothing is
+    deleted). A flagged row the old pass could have deleted (weight now under
+    :data:`OLD_DECAY_REACH`) comes back; under 30 it is silent. One at or over
+    the reach stays deleted: only a caller could have deleted it. A row whose
+    fact is already live for the same user stays deleted too.
+    """
+    ph, user_col = ("?", "user") if dialect == "sqlite" else ("%s", '"user"')
+    flagged = conn.execute(
+        "SELECT COUNT(*) AS n FROM pdm_signatures WHERE is_deleted = 1"
+    ).fetchone()["n"]
+    if not flagged:
+        return 0, 0
+    rows = conn.execute(
+        "SELECT * FROM pdm_signatures s WHERE s.is_deleted = 1 AND NOT EXISTS ("
+        f"SELECT 1 FROM pdm_signatures l WHERE l.{user_col} = s.{user_col} "
+        "AND l.compressed_fact_hash = s.compressed_fact_hash AND l.is_deleted = 0)"
+    ).fetchall()
+    now = datetime.now(tz=timezone.utc)
+    quiet = [r["id"] for r in rows if weight_of(mapping_to_record(r), now)[0] < OLD_DECAY_REACH]
+    for i in range(0, len(quiet), 500):
+        chunk = quiet[i : i + 500]
+        conn.execute(
+            "UPDATE pdm_signatures SET is_deleted = 0 "
+            f"WHERE id IN ({', '.join([ph] * len(chunk))})",
+            chunk,
+        )
+    kept = int(flagged) - len(quiet)
+    logger.warning(
+        "[PDM] upgrade: restored %d rows the old decay() could have deleted; "
+        "kept %d deleted (a caller's delete, or a live copy exists)",
+        len(quiet),
+        kept,
+    )
+    return len(quiet), kept
 
 
 def parse_dt(value: str | None) -> datetime | None:
@@ -261,6 +359,19 @@ def prepare_update_fields(fields: dict) -> dict:
         else:
             prepared[col] = value
     return prepared
+
+
+def increment_set_clause(
+    deltas: Mapping[str, int], fields: dict, placeholder: str
+) -> tuple[str, list[Any]]:
+    """SET clause adding *deltas* to counters and assigning *fields*, with its values."""
+    unknown = set(deltas) - INCREMENTABLE_COLUMNS
+    if unknown:
+        raise ValueError(f"Not a counter: {sorted(unknown)}")
+    prepared = prepare_update_fields(fields)
+    parts = [f"{col} = {col} + {placeholder}" for col in deltas]
+    parts += [f"{col} = {placeholder}" for col in prepared]
+    return ", ".join(parts), [int(v) for v in deltas.values()] + list(prepared.values())
 
 
 def signature_insert_row(sig: SignatureRecord, *, store_raw: bool) -> tuple[Any, ...]:
