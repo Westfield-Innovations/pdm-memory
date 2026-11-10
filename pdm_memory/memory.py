@@ -361,9 +361,16 @@ class Memory:
             sig.outcome_source = (claim.outcome_source or "").strip()
             sig.watch_window = claim.watch_window_days
         sig = self._run_pre_save_hooks(sig)
-        memory_id = self._storage.save(sig)
-        if rests_on:
-            self._write_support(memory_id, rests_on)
+        if rests_on and getattr(self._storage, "support_at_ingest", False):
+            known = self._storage.get_many(
+                [i for i in dict.fromkeys(str(x) for x in rests_on if x) if i != sig.id],
+                user=self._user,
+            )
+            memory_id = self._storage.save(sig, rests_on=sorted(known))
+        else:
+            memory_id = self._storage.save(sig)
+            if rests_on:
+                self._write_support(memory_id, rests_on)
         self._run_post_save_hooks(sig, memory_id)
         logger.debug("[PDM] save() → %s (P=%.1f)", memory_id, p_magnitude)
         return memory_id
