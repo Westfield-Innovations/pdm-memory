@@ -227,16 +227,18 @@ def test_looks_done_is_not_proof(verdict, kind):
     assert all(x.to_state is not S.COMPLETE for x in r.ctl.receipts(r.jid))
 
 
-def test_the_state_table_has_one_way_into_complete():
-    entrances = [old for old, new in TRANSITIONS.items() if S.COMPLETE in new]
-    assert entrances == [S.VERIFYING]
+def test_complete_is_reached_only_with_a_proof_receipt():
+    entrances = {old for old, new in TRANSITIONS.items() if S.COMPLETE in new}
+    # verifying: the proof arrived; waiting: a watch period closed with every action proved
+    assert entrances == {S.VERIFYING, S.WAITING}
     with pytest.raises(InvalidTransition):
-        check_transition(S.WAITING, S.COMPLETE)
+        check_transition(S.ESCALATED, S.COMPLETE)
     r = rig()
-    verifying = replace(r.ctl.job(r.jid), state=S.VERIFYING)
-    tx = _Tx(r.ctl, verifying, r.ctl.contract(r.jid).current, r.clock.now)
-    with pytest.raises(InvalidTransition, match="proof receipt"):
-        tx.move(S.COMPLETE, "looks done to me")
+    for state in (S.VERIFYING, S.WAITING):
+        job = replace(r.ctl.job(r.jid), state=state)
+        tx = _Tx(r.ctl, job, r.ctl.contract(r.jid).current, r.clock.now)
+        with pytest.raises(InvalidTransition, match="proof receipt"):
+            tx.move(S.COMPLETE, "looks done to me")
 
 
 def test_exhausted_action_budget_ends_in_out_of_budget_with_the_reason():
@@ -256,8 +258,9 @@ def test_deadline_ends_a_waiting_job_on_tick():
     r = rig(contract_kwargs=dict(budget=Budget(deadline=T0 + timedelta(days=1))))
     assert r.ctl.tick(r.clock.advance(hours=23)) == []
     (job,) = r.ctl.tick(r.clock.advance(hours=2))
-    assert job.state is S.OUT_OF_BUDGET
-    assert job.end_reason == "deadline 2026-09-02T12:00:00+00:00 reached"
+    # Nothing fired: no proof of the period, and no proof that nothing crossed.
+    assert job.state is S.STOPPED
+    assert job.end_reason == "end_date: deadline 2026-09-02T12:00:00+00:00 reached"
 
 
 # ------------------------------------------------------------ arming
@@ -315,7 +318,9 @@ def test_first_reading_above_the_line_does_not_fire():
     r = rig()
     feed(r, "41.0", "42.0")
     assert r.sms.calls == []
-    assert r.ctl.job(r.jid).trigger_state is TriggerState.LATCHED
+    assert r.ctl.job(r.jid).trigger_state is TriggerState.UNKNOWN
+    feed(r, "39.8", "40.5")  # a dip under the line arms it, as in AZUS goals
+    assert len(r.sms.calls) == 1
 
 
 def test_duplicate_and_stale_readings_are_ignored():
@@ -498,8 +503,16 @@ def test_a_guard_that_raises_fails_closed():
 
     r = rig(guard=Broken())
     job = fire(r)
+    assert job.state is S.RETRYING  # a failed check, retried like AZUS goals
+    assert r.ctl.receipts(r.jid)[-1].kind == "check_failed"
+    (job,) = r.ctl.tick(r.clock.advance(minutes=5))
     assert job.state is S.ESCALATED
-    assert "guard failed" in job.escalation_reason
+    assert job.escalation_kind is EscalationKind.APPROVAL_REQUIRED
+    assert "guard failed on every try" in job.escalation_reason
+    assert r.sms.calls == []
+    # The owner's "proceed" does not skip the guard: it still fails closed.
+    job = r.ctl.resolve(r.jid, OWNER, decision="proceed")
+    assert job.state is S.RETRYING
     assert r.sms.calls == []
 
 
@@ -1024,3 +1037,301 @@ def test_the_watch_price_example_sends_one_text_and_keeps_an_intact_chain(tmp_pa
     assert result["state"] == "waiting"
     assert result["chain_intact"] and result["promise_change_refused"]
     assert result["proof"].source == "sms_delivery_receipt"
+
+
+def test_guard_without_owner_approval_escalates_by_default():
+    from pdm_memory.goal_loop import ProposedStep
+
+    contract = GoalContract(
+        contract_id="g",
+        owner="eric",
+        outcome="text Eric",
+        trigger=Trigger(kind="event", event="tick"),
+        proof="sms",
+        never=["Never trade MU shares"],
+        autonomy=Autonomy(allowed=["sms.send"], ask_first=["broker.order"]),
+    )
+    step = ProposedStep("g:v1:f1", 1, "broker.order", "MU", "Buy MU shares")
+    decision = DefaultGuard().check(contract, step)
+    assert decision.verdict == "escalate"
+    assert "ask-first" in decision.reason
+    other = ProposedStep("g:v1:f1", 1, "mail.send", "eric", "Email Eric")
+    assert "not listed" in DefaultGuard().check(contract, other).reason
+
+
+# ------------------------------------------------------------ AZUS goals parity
+# Scenarios from companion_api goals/tests (test_retry.py, test_api.py, test_trigger.py).
+
+
+def test_default_is_one_retry_per_action():
+    r = rig(sms=Sms(["not_executed", "not_executed", "ok"]))
+    assert fire(r).state is S.RETRYING
+    (job,) = r.ctl.tick(r.clock.advance(minutes=5))
+    assert job.state is S.OUT_OF_BUDGET
+    assert job.end_reason == "max_attempts=2 reached for watch-mu:v1:f1"
+    assert len(r.sms.calls) == 2
+
+
+def test_guard_exception_is_a_failed_check_that_is_retried():
+    """goals/tests/test_retry.py::test_guard_exception_is_a_failed_check_that_is_retried"""
+
+    class Flaky:
+        calls = 0
+
+        def check(self, contract, step, *, owner_approved=False):
+            Flaky.calls += 1
+            if Flaky.calls == 1:
+                raise RuntimeError("model down")
+            return GuardDecision("proceed", "ok")
+
+    r = rig(guard=Flaky())
+    assert fire(r).state is S.RETRYING
+    assert r.sms.calls == []
+    (job,) = r.ctl.tick(r.clock.advance(minutes=5))
+    assert job.state is S.COMPLETE
+    assert len(r.sms.calls) == 1
+    reserved = [x.reason for x in r.ctl.receipts(r.jid) if x.to_state is S.ACTING]
+    assert reserved == ["dispatch reserved (attempt 2)"]
+    assert r.ctl.job(r.jid).actions_dispatched == 1
+
+
+def test_unanswered_question_expires_to_stopped_unconfirmed():
+    """goals/tests/test_retry.py::test_unanswered_question_expires_to_stopped_unconfirmed"""
+    r = rig(proofs=Proofs(["NOT_YET"] * 10))
+    assert fire(r).state is S.VERIFYING
+    (job,) = r.ctl.tick(r.clock.advance(minutes=11))
+    assert job.escalation_kind is EscalationKind.PROOF_TIMEOUT
+    assert job.confirm_by == r.clock.now + timedelta(days=7)
+    assert r.ctl.tick(r.clock.advance(days=6)) == []
+    (job,) = r.ctl.tick(r.clock.advance(days=1, minutes=1))
+    assert job.state is S.STOPPED
+    assert job.end_reason.startswith("unconfirmed: nobody confirmed whether watch-mu:v1:f1")
+    count = len(r.ctl.receipts(r.jid))
+    assert r.ctl.tick(r.clock.advance(days=3)) == []  # the next run leaves it alone
+    assert len(r.ctl.receipts(r.jid)) == count
+    # A late "yes" is still recorded on the stopped job.
+    r.proofs.plan = ["PROVEN"]
+    job = r.ctl.submit_evidence(r.jid, "watch-mu:v1:f1", {"owner": "got it"})
+    assert job.state is S.STOPPED
+    late = r.ctl.receipts(r.jid)[-1]
+    assert late.kind == "late_proof" and late.proof is not None
+    assert r.ctl.verify_receipts(r.jid)
+
+
+def test_an_uncertain_outcome_also_expires_unconfirmed():
+    r = rig(sms=Sms(["boom"]))
+    job = fire(r)
+    assert job.escalation_kind is EscalationKind.OUTCOME_UNCERTAIN
+    (job,) = r.ctl.tick(r.clock.advance(days=7))
+    assert job.state is S.STOPPED
+    assert len(r.sms.calls) == 1  # never sent twice
+
+
+def test_answering_the_question_in_time_clears_the_expiry():
+    r = rig(sms=Sms(["boom"]))
+    fire(r)
+    job = r.ctl.submit_evidence(r.jid, "watch-mu:v1:f1", {"seen": True})
+    assert job.state is S.COMPLETE
+    assert job.confirm_by is None
+
+
+def test_pause_ignores_readings_and_resume_does_not_fire_late():
+    """goals/tests/test_api.py::test_pause_then_task_skips / test_resume_does_not_fire_late"""
+    r = rig()
+    feed(r, "39.0")
+    assert r.ctl.job(r.jid).trigger_state is TriggerState.ARMED
+    job = r.ctl.pause(r.jid, "travelling")
+    assert (job.state, job.paused_from, job.pause_reason) == (S.PAUSED, S.WAITING, "travelling")
+    feed(r, "40.5", "41.0")
+    assert r.sms.calls == []
+    assert r.ctl.tick(r.clock.advance(days=40)) == []  # no deadline, no expiry while paused
+    r.clock.now = T0 + timedelta(days=1)
+    job = r.ctl.resume(r.jid)
+    assert job.state is S.WAITING
+    assert job.trigger_state is TriggerState.UNKNOWN  # must see a reading below the line first
+    feed(r, "41.2")
+    assert r.sms.calls == []
+    feed(r, "39.8", "40.1")
+    assert len(r.sms.calls) == 1
+    paused = [x.kind for x in r.ctl.receipts(r.jid) if x.kind in ("paused", "resumed")]
+    assert paused == ["paused", "resumed"]
+
+
+def test_resume_keeps_a_fired_trigger_latched():
+    """goals/tests/test_api.py::test_resume_keeps_a_fired_job_disarmed"""
+    r = rig(contract_kwargs=dict(end=EndConditions(on_success="rearm")))
+    fire(r)
+    assert r.ctl.job(r.jid).trigger_state is TriggerState.LATCHED
+    r.ctl.pause(r.jid, "away")
+    assert r.ctl.resume(r.jid).trigger_state is TriggerState.LATCHED
+    feed(r, "39.8", "40.3")  # no reset below 39.50 yet
+    assert len(r.sms.calls) == 1
+
+
+def test_resume_rechecks_its_grounds_and_stays_paused_without_them():
+    r = rig()
+    r.ctl.pause(r.jid, "away")
+    executor = r.ctl._executors.pop("sms.send")
+    with pytest.raises(NotArmableError):
+        r.ctl.resume(r.jid)
+    assert r.ctl.job(r.jid).state is S.PAUSED
+    r.ctl._executors["sms.send"] = executor
+    assert r.ctl.resume(r.jid, "back").state is S.WAITING
+
+
+def test_resume_after_the_deadline_closes_the_period():
+    """goals/tests/test_api.py::test_resume_after_end_date_ends_the_job"""
+    r = rig(contract_kwargs=dict(budget=Budget(deadline=T0 + timedelta(days=1))))
+    r.ctl.pause(r.jid, "away")
+    r.clock.advance(days=2)
+    job = r.ctl.resume(r.jid)
+    assert job.end_reason.startswith("end_date:")
+    # AZUS completes this job; the SDK cannot prove that nothing crossed, so it stops.
+    assert job.state is S.STOPPED
+
+
+def test_pause_keeps_a_retry_and_an_escalation():
+    r = rig(sms=Sms(["not_executed"]))
+    fire(r)
+    retry_at = r.ctl.job(r.jid).retry_at
+    r.ctl.pause(r.jid, "carrier maintenance")
+    assert r.ctl.tick(r.clock.advance(hours=1)) == []
+    job = r.ctl.resume(r.jid)
+    assert (job.state, job.retry_at) == (S.RETRYING, retry_at)
+    (job,) = r.ctl.tick()
+    assert job.state is S.COMPLETE
+
+    r = rig(sms=Sms(["boom"]))
+    fire(r)
+    r.ctl.pause(r.jid, "away")
+    job = r.ctl.resume(r.jid)
+    assert job.escalation_kind is EscalationKind.OUTCOME_UNCERTAIN
+    assert job.confirm_by is not None
+
+
+def test_pause_is_refused_while_a_step_is_in_flight_or_the_job_ended():
+    r = rig(proofs=Proofs(["NOT_YET"]))
+    with pytest.raises(ValueError):
+        r.ctl.pause(r.jid, " ")
+    fire(r)
+    with pytest.raises(InvalidTransition, match="verifying"):
+        r.ctl.pause(r.jid, "x")
+    r.ctl.cancel(r.jid, "done")
+    with pytest.raises(InvalidTransition):
+        r.ctl.pause(r.jid, "x")
+    with pytest.raises(InvalidTransition):
+        r.ctl.resume(r.jid)
+
+
+def test_a_paused_job_can_be_cancelled():
+    r = rig()
+    r.ctl.pause(r.jid, "away")
+    assert r.ctl.cancel(r.jid, "not needed").state is S.CANCELLED
+
+
+def test_paused_job_survives_a_restart(tmp_path):
+    store = SqliteJobStore(tmp_path / "jobs.db")
+    r = rig(store=store)
+    feed(r, "39.0")
+    r.ctl.pause(r.jid, "away")
+    store.close()
+    again = build(SqliteJobStore(tmp_path / "jobs.db"), clock=r.clock)
+    job = again.ctl.resume(r.jid)
+    assert job.state is S.WAITING and job.paused_from is None
+
+
+def test_watch_period_with_every_action_proved_completes_at_the_deadline():
+    r = rig(
+        contract_kwargs=dict(
+            budget=Budget(deadline=T0 + timedelta(days=1)), end=EndConditions(on_success="rearm")
+        )
+    )
+    feed(r, "39.0", "40.1", "39.4", "40.2")
+    assert len(r.sms.calls) == 2
+    assert r.ctl.job(r.jid).state is S.WAITING
+    (job,) = r.ctl.tick(r.clock.advance(days=2))
+    assert job.state is S.COMPLETE
+    assert job.end_reason.startswith("end_date:")
+    last = r.ctl.receipts(r.jid)[-1]
+    assert last.to_state is S.COMPLETE and last.proof is not None
+    assert "every action in the period was proved (2)" in last.reason
+
+
+def test_after_the_deadline_nothing_new_fires():
+    r = rig(contract_kwargs=dict(budget=Budget(deadline=T0 + timedelta(minutes=2))))
+    feed(r, "39.0")
+    r.clock.advance(minutes=5)
+    job = feed(r, "40.5")
+    assert job.state is S.STOPPED
+    assert r.sms.calls == []
+
+
+def test_an_alert_fired_before_the_deadline_still_gets_its_proof():
+    """goals/tests/test_retry.py::test_bounce_after_end_date_retries...: the open
+    step is settled after the end date instead of being cut off."""
+    r = rig(
+        proofs=Proofs(["NOT_YET"]),
+        contract_kwargs=dict(
+            budget=Budget(deadline=T0 + timedelta(minutes=3)), end=EndConditions(on_success="rearm")
+        ),
+    )
+    assert fire(r).state is S.VERIFYING
+    r.clock.advance(minutes=5)  # past the deadline, inside the proof timeout
+    assert r.ctl.tick() == []
+    assert r.ctl.job(r.jid).state is S.VERIFYING
+    job = r.ctl.submit_evidence(r.jid, "watch-mu:v1:f1", {"dlr": "delivered"})
+    assert job.state is S.COMPLETE
+    assert job.end_reason.startswith("end_date:")
+
+
+def test_a_retry_due_after_the_deadline_still_runs():
+    r = rig(
+        sms=Sms(["not_executed"]),
+        contract_kwargs=dict(budget=Budget(deadline=T0 + timedelta(minutes=2, seconds=10))),
+    )
+    assert fire(r).state is S.RETRYING
+    (job,) = r.ctl.tick(r.clock.advance(minutes=5))
+    assert job.state is S.COMPLETE
+    assert len(r.sms.calls) == 2
+
+
+def test_an_unproved_action_stops_the_period_instead_of_completing():
+    r = rig(
+        sms=Sms(["boom"]),
+        contract_kwargs=dict(
+            budget=Budget(deadline=T0 + timedelta(days=1)), end=EndConditions(on_success="rearm")
+        ),
+    )
+    fire(r)
+    r.clock.advance(days=2)
+    job = r.ctl.resolve(r.jid, OWNER, decision="skip")
+    assert job.state is S.STOPPED
+    assert "1 of 1 actions were not proved" in r.ctl.receipts(r.jid)[-1].reason
+
+
+def test_a_step_waiting_for_approval_stops_at_the_deadline():
+    r = rig(
+        operation="sms.blast",
+        contract_kwargs=dict(
+            budget=Budget(deadline=T0 + timedelta(days=1)),
+            autonomy=Autonomy(allowed=("sms.send",), ask_first=("sms.blast",)),
+        ),
+    )
+    assert fire(r).state is S.ESCALATED
+    (job,) = r.ctl.tick(r.clock.advance(days=2))
+    assert job.state is S.STOPPED
+    assert "never ran" in r.ctl.receipts(r.jid)[-1].reason
+    assert r.sms.calls == []
+
+
+def test_a_spent_budget_is_never_complete():
+    """goals/tests/test_retry.py::test_last_budgeted_email_still_gets_its_bounce_retry"""
+    r = rig(
+        contract_kwargs=dict(
+            budget=Budget(max_actions=1, deadline=T0 + timedelta(days=1)),
+            end=EndConditions(on_success="rearm"),
+        )
+    )
+    job = fire(r)
+    assert job.state is S.OUT_OF_BUDGET
+    assert r.ctl.receipts(r.jid)[-1].proof is not None

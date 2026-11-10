@@ -3,9 +3,13 @@
     drafted -> approved -> armed -> waiting -> triggered -> guard_checked
             -> acting -> verifying -> complete
 
-with side paths: retrying, escalated, out_of_budget, conflict, cancelled and
-impossible. ``complete`` has exactly one way in: from ``verifying``, with a
-proof receipt (the controller refuses the move without one).
+with side paths: retrying, escalated, paused, out_of_budget, conflict,
+cancelled, impossible and stopped. ``complete`` always carries a proof receipt
+(the controller refuses the move without one). It is reached from ``verifying``
+when the proof arrives, or from ``waiting`` when a watch period ends and every
+action in it was proved. ``stopped`` ends a job that is not proved complete:
+the watch period ended with an action unproved or nothing fired, or nobody
+confirmed whether a step happened. Stopping is never a claim of success.
 """
 
 from __future__ import annotations
@@ -38,6 +42,8 @@ class JobState(str, Enum):
     CONFLICT = "conflict"
     CANCELLED = "cancelled"
     IMPOSSIBLE = "impossible"
+    PAUSED = "paused"
+    STOPPED = "stopped"
 
 
 class EscalationKind(str, Enum):
@@ -55,16 +61,18 @@ class InvalidTransition(ValueError):
 S = JobState
 
 TERMINAL: frozenset[JobState] = frozenset(
-    {S.COMPLETE, S.OUT_OF_BUDGET, S.CONFLICT, S.CANCELLED, S.IMPOSSIBLE}
+    {S.COMPLETE, S.OUT_OF_BUDGET, S.CONFLICT, S.CANCELLED, S.IMPOSSIBLE, S.STOPPED}
 )
 
 TRANSITIONS: dict[JobState, frozenset[JobState]] = {
     S.DRAFTED: frozenset({S.APPROVED, S.CANCELLED}),
     S.APPROVED: frozenset({S.ARMED, S.CANCELLED}),
     S.ARMED: frozenset({S.WAITING, S.CANCELLED}),
-    S.WAITING: frozenset({S.TRIGGERED, S.CANCELLED, S.OUT_OF_BUDGET}),
+    S.WAITING: frozenset(
+        {S.TRIGGERED, S.CANCELLED, S.OUT_OF_BUDGET, S.PAUSED, S.STOPPED, S.COMPLETE}
+    ),
     S.TRIGGERED: frozenset(
-        {S.GUARD_CHECKED, S.ESCALATED, S.CONFLICT, S.CANCELLED, S.OUT_OF_BUDGET}
+        {S.GUARD_CHECKED, S.ESCALATED, S.RETRYING, S.CONFLICT, S.CANCELLED, S.OUT_OF_BUDGET}
     ),
     S.GUARD_CHECKED: frozenset({S.ACTING, S.CANCELLED, S.OUT_OF_BUDGET}),
     S.ACTING: frozenset({S.VERIFYING, S.RETRYING, S.OUT_OF_BUDGET, S.ESCALATED, S.CANCELLED}),
@@ -79,7 +87,7 @@ TRANSITIONS: dict[JobState, frozenset[JobState]] = {
             S.CANCELLED,
         }
     ),
-    S.RETRYING: frozenset({S.TRIGGERED, S.CANCELLED, S.OUT_OF_BUDGET}),
+    S.RETRYING: frozenset({S.TRIGGERED, S.CANCELLED, S.OUT_OF_BUDGET, S.PAUSED}),
     S.ESCALATED: frozenset(
         {
             S.GUARD_CHECKED,
@@ -87,10 +95,14 @@ TRANSITIONS: dict[JobState, frozenset[JobState]] = {
             S.WAITING,
             S.VERIFYING,
             S.TRIGGERED,
+            S.RETRYING,
             S.OUT_OF_BUDGET,
             S.CANCELLED,
+            S.PAUSED,
+            S.STOPPED,
         }
     ),
+    S.PAUSED: frozenset({S.WAITING, S.RETRYING, S.ESCALATED, S.CANCELLED}),
 }
 
 

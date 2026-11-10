@@ -9,6 +9,7 @@ from decimal import Decimal
 from typing import Any
 
 from pdm_memory.goal_loop import _json
+from pdm_memory.goal_loop.checker import ProofReceipt
 from pdm_memory.goal_loop.executor import ActionResult
 from pdm_memory.goal_loop.states import EscalationKind, JobState
 from pdm_memory.goal_loop.triggers import TriggerState
@@ -196,7 +197,10 @@ class Job:
     step: ProposedStep | None = None
     result: ActionResult | None = None
     attempts: Mapping[str, int] = field(default_factory=dict)
+    check_failures: Mapping[str, int] = field(default_factory=dict)
     actions_dispatched: int = 0
+    proven_actions: int = 0
+    last_proof: ProofReceipt | None = None
     cost_spent: Decimal = Decimal(0)
     dispatch_reserved: str | None = None
     lease_expires_at: datetime | None = None
@@ -204,6 +208,10 @@ class Job:
     proof_deadline: datetime | None = None
     escalation_kind: EscalationKind | None = None
     escalation_reason: str = ""
+    confirm_by: datetime | None = None
+    paused_from: JobState | None = None
+    pause_reason: str = ""
+    paused_at: datetime | None = None
     approved_action_id: str | None = None
     cancel_requested: bool = False
     cancel_reason: str = ""
@@ -249,7 +257,10 @@ class Job:
             "step": None if self.step is None else self.step.to_dict(),
             "result": None if self.result is None else self.result.to_dict(),
             "attempts": dict(self.attempts),
+            "check_failures": dict(self.check_failures),
             "actions_dispatched": self.actions_dispatched,
+            "proven_actions": self.proven_actions,
+            "last_proof": None if self.last_proof is None else self.last_proof.to_dict(),
             "cost_spent": str(self.cost_spent),
             "dispatch_reserved": self.dispatch_reserved,
             "lease_expires_at": _opt_iso(self.lease_expires_at),
@@ -257,6 +268,10 @@ class Job:
             "proof_deadline": _opt_iso(self.proof_deadline),
             "escalation_kind": None if self.escalation_kind is None else self.escalation_kind.value,
             "escalation_reason": self.escalation_reason,
+            "confirm_by": _opt_iso(self.confirm_by),
+            "paused_from": None if self.paused_from is None else self.paused_from.value,
+            "pause_reason": self.pause_reason,
+            "paused_at": _opt_iso(self.paused_at),
             "approved_action_id": self.approved_action_id,
             "cancel_requested": self.cancel_requested,
             "cancel_reason": self.cancel_reason,
@@ -271,6 +286,8 @@ class Job:
         step = data.get("step")
         result = data.get("result")
         kind = data.get("escalation_kind")
+        proof = data.get("last_proof")
+        paused_from = data.get("paused_from")
         return cls(
             job_id=data["job_id"],
             state=JobState(data["state"]),
@@ -287,7 +304,10 @@ class Job:
             step=None if step is None else ProposedStep.from_dict(step),
             result=None if result is None else ActionResult.from_dict(result),
             attempts=dict(data.get("attempts", {})),
+            check_failures=dict(data.get("check_failures", {})),
             actions_dispatched=data.get("actions_dispatched", 0),
+            proven_actions=data.get("proven_actions", 0),
+            last_proof=None if proof is None else ProofReceipt.from_dict(proof),
             cost_spent=_json.to_decimal(data.get("cost_spent", "0"), "cost_spent"),
             dispatch_reserved=data.get("dispatch_reserved"),
             lease_expires_at=_opt_dt(data, "lease_expires_at"),
@@ -295,6 +315,10 @@ class Job:
             proof_deadline=_opt_dt(data, "proof_deadline"),
             escalation_kind=None if kind is None else EscalationKind(kind),
             escalation_reason=data.get("escalation_reason", ""),
+            confirm_by=_opt_dt(data, "confirm_by"),
+            paused_from=None if paused_from is None else JobState(paused_from),
+            pause_reason=data.get("pause_reason", ""),
+            paused_at=_opt_dt(data, "paused_at"),
             approved_action_id=data.get("approved_action_id"),
             cancel_requested=data.get("cancel_requested", False),
             cancel_reason=data.get("cancel_reason", ""),

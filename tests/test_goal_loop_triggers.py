@@ -46,12 +46,30 @@ def test_dipping_only_to_the_reset_line_does_not_rearm():
 def test_first_reading_above_the_line_never_fires():
     fired, state = run(RISING, [41.0, 42.0])
     assert fired == []
-    assert state is TriggerState.LATCHED
+    assert state is TriggerState.UNKNOWN
 
 
 def test_first_reading_above_the_line_fires_after_a_reset():
     fired, _ = run(RISING, [41.0, 39.4, 40.0])
     assert fired == [40.0]
+
+
+def test_armed_above_then_dips_below_the_line_fires():
+    """AZUS goals/tests/test_trigger.py: a dip under fire_at is enough to arm."""
+    fired, _ = run(RISING, [42.0, 39.8, 40.5])
+    assert fired == [40.5]
+
+
+def test_azus_mu_sequence():
+    """AZUS goals/tests/test_trigger.py::test_mu_sequence, reading by reading."""
+    readings = [38.0, 40.2, 41.0, 39.7, 40.3, 39.4, 40.1]
+    fired, _ = run(RISING, readings)
+    assert fired == [40.2, 40.1]
+
+
+def test_falling_armed_below_then_rises_above_the_line_fires():
+    fired, _ = run(FALLING, [29.0, 30.2, 29.8])
+    assert fired == [29.8]
 
 
 def test_the_fire_line_itself_counts_as_crossing():
@@ -104,3 +122,17 @@ def test_readings_between_the_lines_change_nothing_for_a_latched_trigger():
     step = step_threshold(RISING, TriggerState.LATCHED, Decimal("39.7"), can_fire=True)
     assert step.state is TriggerState.LATCHED
     assert not step.changed
+
+
+def test_falling_trigger_boundaries():
+    assert in_fire_region(FALLING, Decimal("30.00"))
+    assert not in_fire_region(FALLING, Decimal("30.01"))
+    assert in_reset_region(FALLING, Decimal("30.51"))
+    assert not in_reset_region(FALLING, Decimal("30.50"))
+
+
+def test_arming_and_firing_report_a_state_change():
+    armed = step_threshold(RISING, TriggerState.UNKNOWN, Decimal("39.0"), can_fire=True)
+    assert armed.state is TriggerState.ARMED and armed.changed is True
+    fired = step_threshold(RISING, TriggerState.ARMED, Decimal("40.0"), can_fire=True)
+    assert fired.fired and fired.changed is True

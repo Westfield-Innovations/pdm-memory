@@ -31,9 +31,13 @@ drafted -> approved -> armed -> waiting -> triggered -> guard_checked
         -> acting -> verifying -> complete
 ```
 
-Final states: `complete`, `out_of_budget`, `conflict`, `cancelled`, `impossible`.
-Side states: `retrying` (waiting for its backoff) and `escalated` (waiting for a
-person).
+Final states: `complete`, `out_of_budget`, `conflict`, `cancelled`, `impossible`,
+`stopped`. Side states: `retrying` (waiting for its backoff), `escalated` (waiting
+for a person) and `paused` (suspended by the owner).
+
+`stopped` means the work ended without a proved result: the watch period closed
+with an action unproved or nothing fired, or nobody confirmed whether a step
+happened. Stopping is never a claim of success.
 
 | From | To | When |
 |---|---|---|
@@ -41,7 +45,8 @@ person).
 | approved | armed, waiting | `arm()`; both moves in one commit |
 | waiting | triggered | the trigger fired |
 | triggered | guard_checked | the guard said proceed |
-| triggered | escalated | outside the autonomy line, or `verify()` found a partial conflict |
+| triggered | escalated | outside the autonomy line, `verify()` found a partial conflict, or the guard failed on every try |
+| triggered | retrying | the guard raised: a failed check, the step did not run, tries remain |
 | triggered | conflict | `verify()` found a step contradicting a `never` rule |
 | guard_checked | acting | the dispatch is reserved and stored |
 | acting | verifying | the executor returned |
@@ -60,12 +65,40 @@ person).
 | escalated | waiting, cancelled | the owner skipped the step |
 | escalated | verifying | evidence arrived for a step that may have run |
 | escalated | triggered | the owner chose to retry after checking |
-| any live state except `acting` | out_of_budget | the deadline passed |
+| escalated | stopped | a question about a step got no answer within `confirm_expiry` (unconfirmed), or the deadline passed while a step waited for approval |
+| waiting | complete | the deadline passed and every action in the period was proved |
+| waiting | stopped | the deadline passed with an action unproved, or nothing fired |
+| waiting, retrying, escalated | paused | `pause()` |
+| paused | the state it left | `resume()`, after the checker and executor are checked again |
 | any live state except `acting` | cancelled | `cancel()` |
 
-A step that is running cannot be recalled, so the deadline and `cancel()` wait
-for it to return. `complete` has one way in: from `verifying`, with a proof
-receipt. The controller refuses the move without one.
+A step that is running cannot be recalled, so `cancel()` waits for it to return.
+`complete` always carries a proof receipt; the controller refuses the move
+without one. Closing a watch period reuses the last proof of that period.
+
+## When the deadline passes
+
+The deadline ends the watch period, as `ends_on` does in AZUS `goals`. After it
+nothing new fires. A step that fired before it is not cut off: its retry still
+runs, its proof is still accepted, and an open question to the owner still waits
+for its answer or its expiry. Once nothing is open the period closes:
+
+- every action in the period was proved: `complete`, `end_reason` starting with
+  `end_date:`;
+- an action was skipped, unproved or never ran: `stopped`;
+- nothing fired: `stopped`. AZUS marks this period complete after checking that
+  every close was observed; the controller does not know the host's observation
+  coverage, so it cannot prove that nothing crossed.
+
+## Pause
+
+`pause(job_id, reason)` suspends a job that is waiting, retrying or escalated.
+While paused nothing fires, retries or expires, and readings are ignored.
+`resume(job_id)` checks the job's grounds again (a checker for the proof source,
+an executor for the operation; `NotArmableError` otherwise, and the job stays
+paused), returns to the state it left, and closes the period if the deadline
+passed meanwhile. An armed trigger must see a reading below the line again, so a
+crossing during the pause never fires late; a latched trigger stays latched.
 
 ## Why a job escalates
 
@@ -80,6 +113,12 @@ receipt. The controller refuses the move without one.
 A retry reuses the same `action_id`, so the outside service can deduplicate, and
 it counts as another attempt.
 
+The two questions about a step that may have run (`outcome_uncertain`,
+`proof_timeout`) stay open for `confirm_expiry` (7 days by default, as in AZUS).
+Unanswered, the job ends `stopped` with `end_reason` starting with
+`unconfirmed:`. A proof that arrives later through `submit_evidence()` is still
+recorded on the stopped job as a `late_proof` receipt; the state does not change.
+
 ## Triggers
 
 A `threshold` trigger has a fire line and a reset line. For a rising trigger
@@ -88,7 +127,7 @@ with `fire_at=40.00` and `reset_at=39.50`:
 - it fires when a reading reaches 40.00 while armed, then latches;
 - it re-arms only when a reading drops below 39.50 (39.50 itself does not);
 - the first reading never fires, so a job armed while the price is already above
-  the line waits for a reset and a new crossing;
+  the line waits for a reading below `fire_at` and a new crossing;
 - while the job is busy a reset is honoured, but a crossing is not consumed: the
   trigger stays armed and the first reading above the line after the job is free
   fires it.
@@ -103,7 +142,9 @@ Version 1 runs one action at a time; an event arriving mid-action is recorded as
 - **Guard**: is this step allowed? `DefaultGuard` denies operations not listed in
   `autonomy.allowed`, then runs `verify()` against `never`. It runs on every
   step, including retries and steps an owner approved. A guard that raises fails
-  closed (the job escalates). Put only prohibitions in `never`; things the
+  closed: the step does not run, the failure counts as a try and the step is
+  checked again after the backoff. When the tries are spent the job escalates as
+  `approval_required`; a `proceed` runs the guard again. Put only prohibitions in `never`; things the
   controller enforces structurally belong in the trigger and the budget.
 - **Checker**: did it work? It looks at the world, not at what the executor said,
   and returns `PROVEN` with a `ProofReceipt` from the contract's proof source,
@@ -114,11 +155,12 @@ Version 1 runs one action at a time; an event arriving mid-action is recorded as
 | Field | Counts |
 |---|---|
 | `max_actions` | distinct actions (`action_id`) over the whole job; a retry never adds one |
-| `max_attempts` | tries of one action, including the first; defaults to `default_max_attempts` (5) |
+| `max_attempts` | tries of one action, including the first and failed guard checks; defaults to `default_max_attempts` (2: one retry, as in AZUS `goals`) |
 | `max_cost` | the sum of `ActionResult.cost`; checked before each dispatch |
-| `deadline` | checked on every `observe()`, `tick()` and `resolve()` |
+| `deadline` | ends the watch period; see "When the deadline passes" |
 
-Running out ends the job in `out_of_budget` with `end_reason`, for example
+Running out of actions, tries or money ends the job in `out_of_budget` with
+`end_reason`, never in `complete`, even when every action was proved. For example
 `max_actions=1 reached (1 dispatched)`. A failed last try ends the job at once
 instead of waiting out a backoff first. Backoff is
 `min(retry_base * 2 ** (attempt - 1), retry_cap)`.

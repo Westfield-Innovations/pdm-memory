@@ -15,9 +15,15 @@ What it enforces:
   approved. The guard asks whether the step is allowed.
 * An executor's return is not proof. The job reaches ``complete`` only when the
   checker names a proof receipt from the contract's proof source.
-* The budget and the deadline end a job in ``out_of_budget`` with the reason.
+* The budget (actions, tries, cost) ends a job in ``out_of_budget`` with the reason.
+* The deadline ends the watch period: no new firing after it, but a step already
+  fired still gets its retry and its proof. The job then ends ``complete`` only
+  if every action in the period was proved, ``stopped`` otherwise.
 * A step that may have run is never run again on its own. It escalates; a person
-  (or a delivery receipt) settles it.
+  (or a delivery receipt) settles it. A question nobody answers within
+  ``confirm_expiry`` stops the job as unconfirmed.
+* A guard that fails is a failed check: the step does not run and is checked
+  again on the next try. A person is asked only when the tries are spent.
 
 Not covered: the controller is cooperative. It cannot stop an executor or a
 caller that bypasses it, and "owner approval" means the approval names the
@@ -44,7 +50,7 @@ from pdm_memory.goal_loop.contract import (
     ensure_armable,
 )
 from pdm_memory.goal_loop.executor import ActionResult, Executor, NotExecuted
-from pdm_memory.goal_loop.guard import DefaultGuard, Guard, GuardDecision
+from pdm_memory.goal_loop.guard import DefaultGuard, Guard
 from pdm_memory.goal_loop.job import MAX_SEEN, Job, Observation, ProposedStep, StepTemplate
 from pdm_memory.goal_loop.receipts import StepReceipt, verify_chain
 from pdm_memory.goal_loop.states import (
@@ -64,12 +70,14 @@ Decision = Literal["proceed", "skip", "retry"]
 
 # A contract can be revised only while no step is in flight.
 REVISABLE = frozenset({S.DRAFTED, S.APPROVED, S.WAITING, S.ESCALATED})
-# States in which the deadline can end a job. ``acting`` is left alone: the step is running.
-DEADLINE_STATES = frozenset(
-    {S.WAITING, S.TRIGGERED, S.GUARD_CHECKED, S.RETRYING, S.VERIFYING, S.ESCALATED}
-)
 # States that read observations.
-LISTENING = DEADLINE_STATES | {S.ACTING}
+LISTENING = frozenset(
+    {S.WAITING, S.TRIGGERED, S.GUARD_CHECKED, S.ACTING, S.RETRYING, S.VERIFYING, S.ESCALATED}
+)
+# A job can be paused only while no step is in flight.
+PAUSABLE = frozenset({S.WAITING, S.RETRYING, S.ESCALATED})
+# Escalations that ask whether a step happened; they expire after ``confirm_expiry``.
+QUESTIONS = frozenset({EscalationKind.OUTCOME_UNCERTAIN, EscalationKind.PROOF_TIMEOUT})
 
 
 class ApprovalError(ValueError):
@@ -83,6 +91,7 @@ def _clear_step() -> dict[str, Any]:
         "result": None,
         "approved_action_id": None,
         "attempts": {},
+        "check_failures": {},
     }
 
 
@@ -165,13 +174,17 @@ class _Tx:
         if to is not S.ACTING:
             fields.setdefault("dispatch_reserved", None)
             fields.setdefault("lease_expires_at", None)
-        if to is not S.RETRYING:
-            fields.setdefault("retry_at", None)
         if to is not S.VERIFYING:
             fields.setdefault("proof_deadline", None)
-        if to is not S.ESCALATED:
-            fields.setdefault("escalation_kind", None)
-            fields.setdefault("escalation_reason", "")
+        if to is not S.PAUSED:  # a pause keeps what it needs to resume
+            if to is not S.RETRYING:
+                fields.setdefault("retry_at", None)
+            if to is not S.ESCALATED:
+                fields.setdefault("escalation_kind", None)
+                fields.setdefault("escalation_reason", "")
+                fields.setdefault("confirm_by", None)
+            elif fields.get("escalation_kind") in QUESTIONS and old is not S.PAUSED:
+                fields.setdefault("confirm_by", self.now + self.ctl._confirm_expiry)
         self.job = replace(self.job, state=to, **fields)
         self._record(kind, reason, old, to, guard, proof, detail)
 
@@ -197,11 +210,14 @@ class GoalLoopController:
         clock: returns the current timezone-aware time.
         retry_base, retry_cap: backoff between tries of one action:
             ``min(retry_base * 2 ** (attempt - 1), retry_cap)``, no jitter.
-        proof_timeout: how long to wait for a proof before escalating.
+        proof_timeout: how long to wait for a proof before asking the owner.
         action_timeout: how long a dispatch is presumed in flight. After that a
             job still in ``acting`` is escalated as outcome uncertain.
+        confirm_expiry: how long a question to the owner ("did it happen?")
+            stays open. Unanswered, the job stops as unconfirmed, never complete.
         default_max_attempts: tries per action when the contract's budget names
-            no ``max_attempts``, so an unbounded retry loop cannot happen by omission.
+            no ``max_attempts``: the first try and one retry, as in AZUS goals.
+            A failed guard check counts as a try.
     """
 
     def __init__(
@@ -216,7 +232,8 @@ class GoalLoopController:
         retry_cap: timedelta = timedelta(minutes=30),
         proof_timeout: timedelta = timedelta(minutes=10),
         action_timeout: timedelta = timedelta(minutes=2),
-        default_max_attempts: int = 5,
+        confirm_expiry: timedelta = timedelta(days=7),
+        default_max_attempts: int = 2,
         max_cas_retries: int = 8,
     ) -> None:
         for label, value in [
@@ -224,6 +241,7 @@ class GoalLoopController:
             ("retry_cap", retry_cap),
             ("proof_timeout", proof_timeout),
             ("action_timeout", action_timeout),
+            ("confirm_expiry", confirm_expiry),
         ]:
             if not isinstance(value, timedelta) or value <= timedelta(0):
                 raise ValueError(f"{label} must be a positive timedelta")
@@ -236,6 +254,7 @@ class GoalLoopController:
         self._clock = clock
         self._retry_base, self._retry_cap = retry_base, retry_cap
         self._proof_timeout, self._action_timeout = proof_timeout, action_timeout
+        self._confirm_expiry = confirm_expiry
         self._default_max_attempts = default_max_attempts
         self._max_cas_retries = max_cas_retries
         self._lock = threading.RLock()
@@ -280,9 +299,13 @@ class GoalLoopController:
             return None
         if job.state is S.ACTING:
             return job.lease_expires_at
+        if job.state is S.PAUSED:
+            return None
         moments: list[datetime] = []
-        if contract.budget.deadline is not None:
+        if contract.budget.deadline is not None and self._closable(job):
             moments.append(contract.budget.deadline)
+        if job.state is S.ESCALATED and job.confirm_by is not None:
+            moments.append(job.confirm_by)
         if job.state in (S.TRIGGERED, S.GUARD_CHECKED):
             moments.append(job.updated_at)
         if job.state is S.RETRYING and job.retry_at is not None:
@@ -293,6 +316,12 @@ class GoalLoopController:
 
     def _max_attempts(self, contract: GoalContract) -> int:
         return contract.budget.max_attempts or self._default_max_attempts
+
+    @staticmethod
+    def _tries(job: Job) -> int:
+        """Tries spent on the current action: dispatches plus failed guard checks."""
+        assert job.action_id is not None
+        return job.attempts.get(job.action_id, 0) + job.check_failures.get(job.action_id, 0)
 
     def _retry_delay(self, attempt: int) -> timedelta:
         return min(self._retry_base * (2 ** min(max(attempt - 1, 0), 30)), self._retry_cap)
@@ -332,15 +361,58 @@ class GoalLoopController:
     def _out_of_budget(self, tx: _Tx, reason: str, **fields: Any) -> None:
         tx.move(S.OUT_OF_BUDGET, reason, end_reason=reason, **fields)
 
+    @staticmethod
+    def _closable(job: Job) -> bool:
+        """Nothing of the period is still open: no step fired and unsettled.
+
+        A step waiting for the owner's approval has not run, so it does not hold
+        the period open.
+        """
+        return job.state is S.WAITING or (
+            job.state is S.ESCALATED and job.escalation_kind is EscalationKind.APPROVAL_REQUIRED
+        )
+
     def _check_deadline(self, tx: _Tx) -> bool:
-        """End the job if its deadline passed. True when it did."""
-        if tx.job.state not in DEADLINE_STATES:
+        """Close the watch period if the deadline passed and nothing is open. True if closed.
+
+        After the deadline nothing new fires, but a step that already fired keeps
+        its retry and its proof; the period closes once that step is settled.
+        """
+        if not self._closable(tx.job):
             return False
         reason = self._deadline_reason(tx.contract, tx.now)
         if reason is None:
             return False
-        self._out_of_budget(tx, reason)
+        self._close_period(tx, reason)
         return True
+
+    def _close_period(self, tx: _Tx, reason: str) -> None:
+        job = tx.job
+        end = f"end_date: {reason}"
+        if job.state is S.ESCALATED:
+            tx.move(
+                S.STOPPED,
+                f"{end}; the step waiting for approval never ran",
+                end_reason=end,
+            )
+        elif job.last_proof is not None and job.proven_actions == job.fire_seq:
+            tx.move(
+                S.COMPLETE,
+                f"{end}; every action in the period was proved ({job.proven_actions})",
+                proof=job.last_proof,
+                end_reason=end,
+            )
+        elif job.fire_seq == 0:
+            # No firing is not proof that nothing crossed: the controller does not
+            # know the host's observation coverage.
+            tx.move(S.STOPPED, f"{end}; nothing fired in the period", end_reason=end)
+        else:
+            unproved = job.fire_seq - job.proven_actions
+            tx.move(
+                S.STOPPED,
+                f"{end}; {unproved} of {job.fire_seq} actions were not proved",
+                end_reason=end,
+            )
 
     # ------------------------------------------------------------ lifecycle
 
@@ -580,8 +652,9 @@ class GoalLoopController:
         approved = job.approved_action_id == job.action_id
         try:
             decision = self._guard.check(contract, step, owner_approved=approved)
-        except Exception as exc:  # a broken guard must fail closed
-            decision = GuardDecision("escalate", f"guard failed: {type(exc).__name__}: {exc}")
+        except Exception as exc:  # a broken guard fails closed: the step does not run
+            self._guard_failed(tx, f"guard failed: {type(exc).__name__}: {exc}")
+            return
         report = decision.to_dict()
         if decision.verdict == "conflict":
             tx.move(
@@ -596,12 +669,38 @@ class GoalLoopController:
             tx.move(S.GUARD_CHECKED, decision.reason or "guard: proceed", guard=report)
             self._reserve(tx)
 
+    def _guard_failed(self, tx: _Tx, reason: str) -> None:
+        """A failed check, not a verdict: the step did not run; check again on the next try."""
+        job = tx.job
+        assert job.action_id is not None
+        failures = dict(job.check_failures)
+        failures[job.action_id] = failures.get(job.action_id, 0) + 1
+        tries = job.attempts.get(job.action_id, 0) + failures[job.action_id]
+        detail = {"error": reason}
+        if tries < self._max_attempts(tx.contract):
+            delay = self._retry_delay(tries)
+            tx.move(
+                S.RETRYING,
+                f"{reason}; the step did not run; checked again in {int(delay.total_seconds())}s",
+                kind="check_failed",
+                detail=detail,
+                check_failures=failures,
+                retry_at=tx.now + delay,
+            )
+            return
+        # Tries are spent: ask the owner. A "proceed" runs the guard again with
+        # fresh checks; the step still never runs without a passing guard.
+        failures[job.action_id] = 0
+        tx.note("check_failed", reason, detail=detail, check_failures=failures)
+        self._escalate(tx, f"{reason}; the guard failed on every try, so the step did not run")
+
     def _reserve(self, tx: _Tx) -> None:
         """From ``guard_checked``: write down that the step is about to run, then run it."""
         job, contract = tx.job, tx.contract
         step = job.step
         assert step is not None and job.action_id is not None
-        tries = job.attempts.get(job.action_id, 0)
+        tries = self._tries(job)
+        dispatched = job.attempts.get(job.action_id, 0)
         if tries >= self._max_attempts(contract):
             self._out_of_budget(tx, self._attempts_reason(contract, job.action_id))
             return
@@ -611,12 +710,12 @@ class GoalLoopController:
             self._out_of_budget(tx, reason)
             return
         attempts = dict(job.attempts)
-        attempts[job.action_id] = tries + 1
+        attempts[job.action_id] = dispatched + 1
         tx.move(
             S.ACTING,
             f"dispatch reserved (attempt {tries + 1})",
             attempts=attempts,
-            actions_dispatched=job.actions_dispatched + (1 if tries == 0 else 0),
+            actions_dispatched=job.actions_dispatched + (1 if dispatched == 0 else 0),
             dispatch_reserved=job.action_id,
             lease_expires_at=tx.now + self._action_timeout,
         )
@@ -727,7 +826,7 @@ class GoalLoopController:
         """After a failed try: schedule the next one, or end the job if tries are spent."""
         job, contract = tx.job, tx.contract
         assert job.action_id is not None
-        tries = job.attempts.get(job.action_id, 0)
+        tries = self._tries(job)
         if tries >= self._max_attempts(contract):
             self._out_of_budget(tx, self._attempts_reason(contract, job.action_id))
         else:
@@ -798,17 +897,20 @@ class GoalLoopController:
     def _accept_proof(self, tx: _Tx, proof: ProofReceipt, note: str) -> None:
         job, contract = tx.job, tx.contract
         label = f"proof accepted from {proof.source}" + (f": {note}" if note else "")
+        proved = {"proven_actions": job.proven_actions + 1, "last_proof": proof}
         if contract.end.on_success == "complete":
-            tx.move(S.COMPLETE, label, proof=proof, end_reason=f"proved by {proof.source}")
+            tx.move(
+                S.COMPLETE, label, proof=proof, end_reason=f"proved by {proof.source}", **proved
+            )
             return
-        # A watch goes back to waiting, unless nothing is left to spend.
-        reason = self._deadline_reason(contract, tx.now) or self._budget_reason(
-            job, contract, new_action=True
-        )
+        # A watch goes back to waiting, unless nothing is left to spend. A limit is
+        # no evidence of completion, so a spent budget ends out_of_budget.
+        reason = self._budget_reason(job, contract, new_action=True)
         if reason:
-            self._out_of_budget(tx, reason, proof=proof)
-        else:
-            tx.move(S.WAITING, f"{label}; watching again", proof=proof, **_clear_step())
+            self._out_of_budget(tx, reason, proof=proof, **proved)
+            return
+        tx.move(S.WAITING, f"{label}; watching again", proof=proof, **_clear_step(), **proved)
+        self._check_deadline(tx)
 
     def submit_evidence(self, job_id: str, action_id: str, evidence: Any = None) -> Job:
         """Hand over proof from outside (a delivery webhook, a person's check).
@@ -817,8 +919,14 @@ class GoalLoopController:
         run (outcome uncertain, proof timeout): that is how an owner who sees
         the text arrived closes the job without sending it again. ``evidence`` of
         ``None`` simply asks the checker to look again.
+
+        A job already stopped as unconfirmed keeps its state, but a late proof
+        is still recorded on it (``late_proof``).
         """
         _json.dumps(evidence, limit=65_536)
+        stopped = self._store.load(job_id)
+        if stopped.state is S.STOPPED and stopped.end_reason.startswith("unconfirmed"):
+            return self._late_proof(job_id, action_id, evidence)
 
         def handler(job: Job, history: ContractHistory, now: datetime) -> _Tx | None:
             if job.action_id != action_id:
@@ -843,6 +951,29 @@ class GoalLoopController:
 
         self._mutate(job_id, handler)
         return self._judge(job_id, action_id, evidence)
+
+    def _late_proof(self, job_id: str, action_id: str, evidence: Any) -> Job:
+        job = self._store.load(job_id)
+        if job.action_id != action_id:
+            raise InvalidTransition(f"job {job_id} has no action {action_id!r}")
+        history = ContractHistory.from_dict(self._store.contract_history(job_id))
+        verdict = self._ask_checker(history.current, job, evidence, self._now())
+        source = history.current.proof.source if history.current.proof else ""
+        if verdict.status != "PROVEN" or verdict.proof is None or verdict.proof.source != source:
+            return job
+
+        def handler(job: Job, history: ContractHistory, now: datetime) -> _Tx | None:
+            if job.state is not S.STOPPED or job.action_id != action_id:
+                return None
+            tx = _Tx(self, job, history.current, now)
+            tx.note(
+                "late_proof",
+                "proof arrived after the job stopped as unconfirmed; the job stays stopped",
+                proof=verdict.proof,
+            )
+            return tx
+
+        return self._mutate(job_id, handler)[0]
 
     # ------------------------------------------------------------ time
 
@@ -915,6 +1046,14 @@ class GoalLoopController:
                 escalation_kind=EscalationKind.PROOF_TIMEOUT,
                 escalation_reason=reason,
             )
+        elif job.state is S.ESCALATED and job.confirm_by is not None:
+            if now < job.confirm_by:
+                return None
+            reason = (
+                f"unconfirmed: nobody confirmed whether {job.action_id} happened "
+                f"by {_json.format_datetime(job.confirm_by)}"
+            )
+            tx.move(S.STOPPED, reason, end_reason=reason)
         else:
             return None
         return tx
@@ -959,7 +1098,7 @@ class GoalLoopController:
                 self._guard_and_reserve(tx)
             else:
                 assert job.action_id is not None
-                if job.attempts.get(job.action_id, 0) >= self._max_attempts(contract):
+                if self._tries(job) >= self._max_attempts(contract):
                     self._out_of_budget(tx, self._attempts_reason(contract, job.action_id))
                 else:
                     tx.move(
@@ -990,6 +1129,7 @@ class GoalLoopController:
             )
         else:
             tx.move(S.WAITING, f"{who} (skip); watching again", **_clear_step())
+            self._check_deadline(tx)
 
     def revise_contract(
         self,
@@ -1047,6 +1187,57 @@ class GoalLoopController:
                     kind="pending_step_dropped",
                     **_clear_step(),
                 )
+            return tx
+
+        return self._mutate(job_id, handler)[0]
+
+    def pause(self, job_id: str, reason: str) -> Job:
+        """Suspend a job that has no step in flight. Nothing fires, retries or
+        expires while it is paused; readings that arrive are ignored."""
+        if type(reason) is not str or not reason.strip():
+            raise ValueError("a pause needs a reason")
+
+        def handler(job: Job, history: ContractHistory, now: datetime) -> _Tx | None:
+            if job.state not in PAUSABLE:
+                raise InvalidTransition(
+                    f"job {job_id} is {job.state.value}; it can be paused only while "
+                    "waiting, retrying or escalated"
+                )
+            tx = _Tx(self, job, history.current, now)
+            tx.move(
+                S.PAUSED,
+                f"paused: {reason}",
+                kind="paused",
+                paused_from=job.state,
+                pause_reason=reason,
+                paused_at=now,
+            )
+            return tx
+
+        return self._mutate(job_id, handler)[0]
+
+    def resume(self, job_id: str, reason: str = "") -> Job:
+        """Continue a paused job from where it stopped, after checking its grounds.
+
+        The proof source still needs a checker and the operation an executor
+        (``NotArmableError`` otherwise; the job stays paused). A trigger that was
+        armed must see a reading below the line again, so a crossing during the
+        pause never fires late. If the deadline passed during the pause, the
+        watch period closes now.
+        """
+
+        def handler(job: Job, history: ContractHistory, now: datetime) -> _Tx | None:
+            if job.state is not S.PAUSED or job.paused_from is None:
+                raise InvalidTransition(f"job {job_id} is {job.state.value}, not paused")
+            contract = history.current
+            self._ensure_runnable(contract, job.step_template)
+            back = job.paused_from
+            fields: dict[str, Any] = {"paused_from": None, "pause_reason": "", "paused_at": None}
+            if job.trigger_state is TriggerState.ARMED:
+                fields["trigger_state"] = TriggerState.UNKNOWN
+            tx = _Tx(self, job, contract, now)
+            tx.move(back, "resumed" + (f": {reason}" if reason else ""), kind="resumed", **fields)
+            self._check_deadline(tx)
             return tx
 
         return self._mutate(job_id, handler)[0]

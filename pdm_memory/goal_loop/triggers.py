@@ -8,11 +8,13 @@ For a ``rising`` trigger with ``fire_at=40`` and ``reset_at=39.50``:
 
 A ``falling`` trigger mirrors this (fire at or below ``fire_at``, reset above
 ``reset_at``). The state is ``ARMED`` (a crossing would fire), ``LATCHED``
-(already fired, waiting for a reset) or ``UNKNOWN`` (no reading yet).
+(already fired, waiting for a reset) or ``UNKNOWN`` (no reading on the other
+side of the line yet).
 
 The first reading never fires: "crosses from below" needs a reading on the
-other side first. A job armed while the price already sits above the line waits
-for a reset and a new crossing.
+other side first. A job armed while the price already sits above the line stays
+``UNKNOWN`` until a reading falls below ``fire_at`` (not ``reset_at``), then the
+next crossing fires. This matches AZUS ``goals.trigger.evaluate``.
 """
 
 from __future__ import annotations
@@ -64,8 +66,9 @@ def step_threshold(
     reading above the line after the job is free again fires it.
     """
     if state is TriggerState.UNKNOWN:
-        new = TriggerState.LATCHED if in_fire_region(trigger, value) else TriggerState.ARMED
-        return TriggerStep(new, changed=True)
+        if in_fire_region(trigger, value):
+            return TriggerStep(TriggerState.UNKNOWN)
+        return TriggerStep(TriggerState.ARMED, changed=True)
     if state is TriggerState.ARMED:
         if not in_fire_region(trigger, value):
             return TriggerStep(TriggerState.ARMED)

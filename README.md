@@ -591,8 +591,8 @@ drafted -> approved -> armed -> waiting -> triggered -> guard_checked
         -> acting -> verifying -> complete
 ```
 
-with side paths `retrying`, `escalated`, `out_of_budget`, `conflict`, `cancelled`
-and `impossible`. It has no threads and no timers. Your host hands it readings
+with side paths `retrying`, `escalated`, `paused`, `out_of_budget`, `conflict`,
+`cancelled`, `impossible` and `stopped`. It has no threads and no timers. Your host hands it readings
 with `observe()` and calls `tick()` now and then; between those calls nothing
 runs and nothing is spent.
 
@@ -603,14 +603,21 @@ runs and nothing is spent.
 - **Guard before every step.** `DefaultGuard` denies any operation not listed in
   `autonomy.allowed`, then runs `verify()` against `never`. Pass only rules
   that forbid things; limits the controller enforces itself belong in the
-  trigger and budget.
+  trigger and budget. A guard that raises is a failed check: the step does not
+  run and is checked again on the next try.
 - **A checker proves the result.** An executor's return is not proof. The job
   reaches `complete` only when the checker returns a `ProofReceipt` from the
   contract's proof source; `PROVEN` without one is recorded and ignored.
-- **Honest endings.** Budget (`max_actions`, `max_attempts`, `max_cost`,
-  `deadline`) ends a job in `out_of_budget` with the reason. A step that may
-  have run is never repeated on its own: the job escalates, and the owner
-  settles it with `submit_evidence()` (it did arrive) or `resolve(..., "retry")`.
+- **Honest endings.** Budget (`max_actions`, `max_attempts`, `max_cost`) ends a
+  job in `out_of_budget` with the reason; by default an action gets one retry.
+  The `deadline` ends the watch period: nothing new fires, a step already fired
+  still gets its retry and proof, and the job ends `complete` only if every
+  action was proved, `stopped` otherwise. A step that may have run is never
+  repeated on its own: the job escalates, and the owner settles it with
+  `submit_evidence()` (it did arrive) or `resolve(..., "retry")`. A question
+  nobody answers within `confirm_expiry` (7 days) stops the job as unconfirmed.
+- **Pause.** `pause()` suspends a job between steps; `resume()` checks its
+  grounds again and never fires a crossing that happened during the pause.
 - **Every move leaves a receipt**, chained by hash; `verify_receipts()` checks it.
 
 ```python
@@ -886,13 +893,14 @@ Store-free record of one Goal Loop job. See [Goal Loop preview](#goal-loop-previ
 | `history.to_json()` / `ContractHistory.from_json(text)` | Canonical JSON; loading checks the version chain and approvals |
 | `ensure_armable(contract)` | Raises `NotArmableError` when no proof source is named |
 | `PROMISE_FIELDS` | `outcome`, `proof`, `never`, `autonomy`, `budget`, `sacrifice_order` |
-| `GoalLoopController(*, checkers, executors, store=None, guard=None, clock, retry_base, retry_cap, proof_timeout, action_timeout, default_max_attempts)` | Moves jobs through their states |
+| `GoalLoopController(*, checkers, executors, store=None, guard=None, clock, retry_base, retry_cap, proof_timeout, action_timeout, confirm_expiry, default_max_attempts)` | Moves jobs through their states |
 | `create(history, *, step)` → job id; `approve`, `arm` | `drafted` to `approved` to `waiting` |
 | `observe(job_id, Observation)` → `Job` | A reading or event; fires at most once per crossing |
 | `tick(now=None)` → `list[Job]` | Retries, deadlines, lost steps, proof timeouts |
 | `submit_evidence(job_id, action_id, evidence)` | Proof from outside; also settles an escalated step |
 | `resolve(job_id, approval, *, decision)` | Owner answers an escalation: `proceed`, `skip` or `retry` |
 | `revise_contract(job_id, *, approval=None, **changes)` | New contract version while no step is in flight |
+| `pause(job_id, reason)`, `resume(job_id, reason="")` | Suspend between steps; resume after checking the grounds again |
 | `cancel(job_id, reason)`, `job()`, `receipts()`, `verify_receipts()` | Stop, read back, check the chain |
 
 ### `Memory(store, *, user, token, refresh_token, cloud_url, store_raw)`
