@@ -38,6 +38,7 @@ from pdm_memory.storage.schema import (
     CARRIED_SQL,
     SCHEMA_SQLITE,
     apply_sqlite_migrations,
+    claim_insert_values,
     increment_set_clause,
     mapping_to_record,
     prepare_update_fields,
@@ -57,7 +58,8 @@ INSERT OR IGNORE INTO pdm_signatures (
     retrieval_count, last_retrieved, created_at,
     validation_prediction_total, validation_prediction_correct,
     decay_rate, t_deadline, t_event_at, urgency_rate, metadata,
-    is_deleted, idempotency_key
+    is_deleted, idempotency_key,
+    direction, outcome_source, due, watch_window, outcome, verdict, event_time, report_time
 ) VALUES (
     ?, ?, ?, ?, ?,
     ?, ?, ?, ?,
@@ -65,7 +67,8 @@ INSERT OR IGNORE INTO pdm_signatures (
     ?, ?, ?,
     ?, ?,
     ?, ?, ?, ?, ?,
-    ?, ?
+    ?, ?,
+    ?, ?, ?, ?, ?, ?, ?, ?
 )
 """
 
@@ -78,7 +81,8 @@ INSERT INTO pdm_signatures (
     retrieval_count, last_retrieved, created_at,
     validation_prediction_total, validation_prediction_correct,
     decay_rate, t_deadline, t_event_at, urgency_rate, metadata,
-    is_deleted, idempotency_key
+    is_deleted, idempotency_key,
+    direction, outcome_source, due, watch_window, outcome, verdict, event_time, report_time
 ) VALUES (
     ?, ?, ?, ?, ?,
     ?, ?, ?, ?,
@@ -86,7 +90,8 @@ INSERT INTO pdm_signatures (
     ?, ?, ?,
     ?, ?,
     ?, ?, ?, ?, ?,
-    ?, ?
+    ?, ?,
+    ?, ?, ?, ?, ?, ?, ?, ?
 ) ON CONFLICT(id) DO NOTHING
 """
 
@@ -220,7 +225,8 @@ class SQLiteDriver(BaseStorage):
                 retrieval_count, last_retrieved, created_at,
                 validation_prediction_total, validation_prediction_correct,
                 decay_rate, t_deadline, t_event_at, urgency_rate, metadata,
-                is_deleted, idempotency_key
+                is_deleted, idempotency_key,
+                direction, outcome_source, due, watch_window, outcome, verdict, event_time, report_time
             ) VALUES (
                 ?, ?, ?, ?, ?,
                 ?, ?, ?, ?,
@@ -228,7 +234,8 @@ class SQLiteDriver(BaseStorage):
                 ?, ?, ?,
                 ?, ?,
                 ?, ?, ?, ?, ?,
-                ?, ?
+                ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?
             )
             """,
             (
@@ -257,6 +264,7 @@ class SQLiteDriver(BaseStorage):
                 json.dumps(sig.metadata),
                 1 if sig.is_deleted else 0,
                 sig.idempotency_key,
+                *claim_insert_values(sig),
             ),
         )
         write_tags(conn, [(sig.user, sig.id, sig.intent_tags)], dialect="sqlite")
@@ -684,6 +692,15 @@ class SQLiteDriver(BaseStorage):
         params.append(limit)
         rows = self._conn().execute(query, params).fetchall()
         return [mapping_to_record(r) for r in rows]
+
+    def save_coverage_gap(
+        self, user: str, source: str, gap_from: datetime, gap_to: datetime
+    ) -> None:
+        self._conn().execute(
+            "INSERT INTO pdm_coverage_gaps (user, source, gap_from, gap_to) VALUES (?, ?, ?, ?)",
+            (user, source, gap_from.isoformat(), gap_to.isoformat()),
+        )
+        self._commit_if_idle(self._conn())
 
     def count_below_carried(self, user: str, theta: float) -> int:
         row = self._conn().execute(

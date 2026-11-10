@@ -77,6 +77,16 @@ class SignatureRecord:
     is_deleted: bool = False
     idempotency_key: str | None = None
 
+    # The claim (PDM v1.9 change 4): "" / None when the signature predicts nothing.
+    direction: str = ""                # "occurs", or "absent" (a safety claim)
+    outcome_source: str = ""           # the bound source; "" = settled only by observation
+    due: datetime | None = None        # when the prediction is read
+    watch_window: float | None = None  # days after due a late report may still amend
+    outcome: str = ""                  # occurred / observed_absent / unknown, as supplied
+    verdict: str = ""                  # the memory's one verdict; "" while open
+    event_time: datetime | None = None
+    report_time: datetime | None = None
+
     def __post_init__(self) -> None:
         if self.created_at is None:
             self.created_at = datetime.now(tz=timezone.utc)

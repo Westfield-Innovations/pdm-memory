@@ -19,6 +19,7 @@ import logging
 import threading
 from collections.abc import Generator
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Any
 
 from pdm_memory.core.signature import DrawerInfo, SignatureRecord
@@ -45,7 +46,8 @@ INSERT INTO pdm_signatures (
     retrieval_count, last_retrieved, created_at,
     validation_prediction_total, validation_prediction_correct,
     decay_rate, t_deadline, t_event_at, urgency_rate, metadata,
-    is_deleted, idempotency_key
+    is_deleted, idempotency_key,
+    direction, outcome_source, due, watch_window, outcome, verdict, event_time, report_time
 ) VALUES (
     %s, %s, %s, %s, %s,
     %s, %s, %s, %s,
@@ -53,7 +55,8 @@ INSERT INTO pdm_signatures (
     %s, %s, %s,
     %s, %s,
     %s, %s, %s, %s, %s,
-    %s, %s
+    %s, %s,
+    %s, %s, %s, %s, %s, %s, %s, %s
 )
 ON CONFLICT (id) DO NOTHING
 RETURNING id
@@ -506,6 +509,15 @@ class PostgresDriver(BaseStorage):
         params.append(limit)
         rows = self._conn().execute(query, params).fetchall()
         return [mapping_to_record(r) for r in rows]
+
+    def save_coverage_gap(
+        self, user: str, source: str, gap_from: datetime, gap_to: datetime
+    ) -> None:
+        self._conn().execute(
+            'INSERT INTO pdm_coverage_gaps ("user", source, gap_from, gap_to) VALUES (%s, %s, %s, %s)',
+            (user, source, gap_from.isoformat(), gap_to.isoformat()),
+        )
+        self._commit_if_idle(self._conn())
 
     def count_below_carried(self, user: str, theta: float) -> int:
         row = self._conn().execute(
