@@ -65,15 +65,20 @@ mem.save("User prefers metric units and short answers", source="manual",
          shape="behavioral")
 
 # Read: resonance retrieval — surfaces what's relevant, not just what matches.
+# Reading writes nothing.
 hits = mem.recall("how should I format the answer?", k=5)
 
 for h in hits:
-    print(h.text, h.pressure, h.last_reinforced)
+    print(h.text, h.pressure, h.action_status)
 
-# Reinforce a memory manually (recall() does this automatically).
+# Use: tell the memory what you acted on. This resets its fade, nothing more.
+mem.touch([hits[0].id])
+
+# Grade: when the world answers. reinforce() counts a correct prediction,
+# penalize() a wrong one. Only V moves; P is fixed when a memory is saved.
 mem.reinforce(hits[0].id)
 
-# Contrary evidence: lower active pressure/V without rewriting the stored fact.
+# Contrary evidence: lower V without rewriting the stored fact.
 result = mem.apply_contrary_evidence(
     hits[0].id,
     "User prefers imperial units",
@@ -89,10 +94,53 @@ print(report.render())
 snap = mem.decay_at(hits[0].id)
 print(snap.shape, snap.half_life_days, snap.p_effective)
 
-# Store-wide soft-delete of memories below the live P_effective threshold:
-counts = mem.decay()
-print(f"Decayed: {counts['decayed']}, Deleted: {counts['deleted']}")
+# Nothing is deleted for fading: count the silent memories instead.
+print(mem.count_silent())  # weight under 30 (0.3 of full)
 ```
+
+### Retrieve, use, grade (PDM v1.9)
+
+`retrieve()` is `recall()` with everything the call covered. It walks the tag
+index, gates on the carried number (P × V), weighs each candidate at one fixed
+time while its budget lasts, and flags what it returns:
+
+```python
+from datetime import datetime, timedelta, timezone
+from pdm_memory import Claim
+
+sensor = mem.save("North flare sensor read 9 bar", tags=["north", "flare", "sensor"])
+claim = mem.save(
+    "North flare igniter fails by Friday",
+    tags=["north", "flare", "igniter"],
+    rests_on=[sensor],  # support: a correction to the sensor re-opens this
+    claim=Claim("occurs", datetime.now(timezone.utc) + timedelta(days=4),
+                outcome_source="failure-feed"),
+)
+
+result = mem.retrieve("north flare", k=5)          # min_p=30 by default
+for h in result.hits:
+    print(h.text, h.p_effective, h.validation_status, h.context,
+          h.support_in_doubt, h.owl, h.duck, h.action_status)
+print(result.routes, result.theta, result.as_of, result.completed)
+
+# Ran out of budget? Resume under the same as-of time and order.
+if not result.completed:
+    more = mem.retrieve("north flare", continuation=result.continuation)
+
+# A search lowers only the weight gate (never under 10 without a named area).
+quiet = mem.search("north flare", min_p_lowered=12)
+
+mem.touch([h.id for h in result.hits])  # what you used
+mem.penalize(sensor)  # the sensor was stuck: returns the ids it re-opened
+mem.report_coverage_gap("failure-feed", gap_from, gap_to)  # a feed that was down
+```
+
+`action_status` is `UNVALIDATED` when the hit stands alone (`STANDALONE`), when
+something it rests on is in doubt, or when it is a safety claim nobody has
+checked (a duck). The memory returns qualified hits; the caller decides.
+
+`recall(reinforce=True)` and `decay()` still work but are deprecated: the first
+only touches the hits, the second only counts the silent set.
 
 ### Privacy-First Mode
 
