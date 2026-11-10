@@ -130,3 +130,19 @@ def test_a_plain_signature_is_neither():
     rec = SignatureRecord()
     assert not is_owl(rec, NOW + timedelta(days=999))
     assert not is_duck(rec)
+
+
+def test_a_claim_survives_a_json_round_trip(mem, tmp_path):
+    claim = Claim("absent", FRIDAY, outcome_source="pressure-feed", watch_window_days=1.5)
+    mem.save("Tank 3 will not overpressure this week", tags=["tank", "pressure", "safety"], claim=claim)
+    path = tmp_path / "export.json"
+    mem.export_json(path)
+    with Memory(store=str(tmp_path / "copy.db"), user=USER) as copy:
+        copy.import_json(path)
+        (rec,) = copy._storage.list(user=USER)
+        assert (rec.direction, rec.due, rec.outcome_source, rec.watch_window) == (
+            "absent",
+            FRIDAY,
+            "pressure-feed",
+            1.5,
+        )
