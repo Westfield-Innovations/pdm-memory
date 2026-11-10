@@ -367,11 +367,12 @@ class ExplainReport:
             f"║    p_magnitude:    {self.p_magnitude:.2f}",
             f"║    V coefficient:  {self.v_coefficient:.4f}  ({self.retrieval_count} retrievals)",
             f"║    Decay factor:   {self.decay_factor:.4f}  ({self.days_since_retrieved:.1f}d since retrieved, T½={half_life_label})",
+            "║    ─────────────────────────────",
+            f"║    P_effective:    {self.p_effective:.2f}  (P × V × fade: the weight)",
+            f"║    Eff. spike:     {self.effective_spike:.2f}",
+            "║  Match score only (after the weight gate):",
             f"║    Intent weight:  {self.intent_weight if self.intent_weight is not None else 'n/a (no query)'}",
             f"║    Quality:        {self.quality:.2f}",
-            "║    ─────────────────────────────",
-            f"║    P_effective:    {self.p_effective:.2f}",
-            f"║    Eff. spike:     {self.effective_spike:.2f}",
         ]
         if self.coupling_score is not None:
             lines += [
