@@ -77,6 +77,9 @@ class SignatureRecord:
     is_deleted: bool = False
     idempotency_key: str | None = None
 
+    # UNVALIDATED, VALIDATED or REOPENED (PDM v1.9 change 8); written by validate.
+    validation_status: str = "UNVALIDATED"
+
     # The claim (PDM v1.9 change 4): "" / None when the signature predicts nothing.
     direction: str = ""                # "occurs", or "absent" (a safety claim)
     outcome_source: str = ""           # the bound source; "" = settled only by observation
@@ -95,6 +98,29 @@ class SignatureRecord:
             self.effective_spike = calculate_effective_spike(
                 self.p_magnitude, self.t_persistence, self.phase_privilege
             )
+
+
+UNVALIDATED = "UNVALIDATED"
+VALIDATED = "VALIDATED"
+REOPENED = "REOPENED"
+
+
+@dataclass(frozen=True)
+class LinkRow:
+    """
+    One link (PDM v1.9 change 7): ``pressure_id`` rests on, or was used beside, ``neighbor_id``.
+
+    ``kind`` is ``support`` (what a signature rested on when it was made) or
+    ``coaccess`` (what it was used beside). The neighbour's status and V are
+    kept as of the write.
+    """
+
+    pressure_id: str
+    neighbor_id: str
+    kind: str
+    status_at_write: str
+    v_at_write: float
+    written_at: datetime
 
 
 # ---------------------------------------------------------------------------

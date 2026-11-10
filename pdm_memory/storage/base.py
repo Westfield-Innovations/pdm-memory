@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 
-from pdm_memory.core.signature import DrawerInfo, SignatureRecord
+from pdm_memory.core.signature import DrawerInfo, LinkRow, SignatureRecord
 from pdm_memory.storage.schema import carried_of
 
 logger = logging.getLogger(__name__)
@@ -147,6 +147,21 @@ class BaseStorage(ABC):
         ``min_carried``: only rows whose carried number (P × V, 0–100) is at least this.
         """
         ...
+
+    def write_links(self, user: str, rows: builtins.list[LinkRow]) -> int:
+        """Store *rows*; the first write of a (pressure, neighbour, kind) stands. Returns how many are new."""
+        raise NotImplementedError(f"{type(self).__name__} keeps no links")
+
+    def links(
+        self,
+        user: str,
+        ids: Sequence[str],
+        *,
+        side: str,
+        kind: str | None = None,
+    ) -> builtins.list[LinkRow]:
+        """Links of *ids*: ``side="out"`` what they rest on or were used beside, ``"in"`` the reverse."""
+        raise NotImplementedError(f"{type(self).__name__} keeps no links")
 
     def save_coverage_gap(
         self, user: str, source: str, gap_from: datetime, gap_to: datetime
