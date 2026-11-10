@@ -610,6 +610,28 @@ class CloudDriver(BaseStorage):
                 path=path,
             ) from exc
 
+    def touch(self, user: str, ids: builtins.list[str]) -> int:
+        """POST /api/v1/pdm/touch: the server stamps the rows and links them as coaccess."""
+        resp = self._post("/api/v1/pdm/touch", {"ids": list(ids)})
+        return int(resp.json().get("touched", 0) or 0)
+
+    def save_coverage_gap(
+        self, user: str, source: str, gap_from: datetime, gap_to: datetime
+    ) -> int:
+        """POST /api/v1/pdm/coverage-gaps; returns how many verdicts the server amended."""
+        resp = self._post(
+            "/api/v1/pdm/coverage-gaps",
+            {"source": source, "from": gap_from.isoformat(), "to": gap_to.isoformat()},
+        )
+        return int(resp.json().get("amended", 0) or 0)
+
+    def count_silent(self, user: str, theta: float, as_of: datetime) -> int:
+        """GET /api/v1/pdm/count-silent: counted by the server, from its own index."""
+        resp = self._get(
+            "/api/v1/pdm/count-silent", params={"theta": theta, "as_of": as_of.isoformat()}
+        )
+        return int(resp.json().get("silent", 0) or 0)
+
     def list_drawers(self, user: str = "default") -> builtins.list[DrawerInfo]:
         """GET /api/v1/pdm/drawers — raises on failure."""
         resp = self._get("/api/v1/pdm/drawers")

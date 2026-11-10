@@ -1038,6 +1038,10 @@ class Memory:
         """
         now = datetime.now(tz=timezone.utc)
         unique = list(dict.fromkeys(str(i) for i in ids if i))
+        remote = getattr(self._storage, "touch", None)
+        if callable(remote):
+            # The server stamps and links in one call.
+            return remote(self._user, unique) if unique else 0
         touched = 0
         for memory_id in unique:
             touched += self._storage.increment(
@@ -1109,8 +1113,8 @@ class Memory:
         Record that *source* did not report from *gap_from* to *gap_to* (PDM v1.9 change 4).
 
         A claim bound to *source* whose interval the gap touches is never settled
-        by a missing report. Returns how many verdicts the gap amended (none
-        until settlement is built).
+        by a missing report. Returns how many verdicts the gap amended: the
+        cloud settles claims; a local store has no settlement yet and returns 0.
         """
         source = (source or "").strip()
         if not source:
@@ -1119,8 +1123,7 @@ class Memory:
             raise ValueError("A coverage gap's bounds must be timezone-aware.")
         if gap_to <= gap_from:
             raise ValueError("A coverage gap ends after it starts.")
-        self._storage.save_coverage_gap(self._user, source, gap_from, gap_to)
-        return 0
+        return self._storage.save_coverage_gap(self._user, source, gap_from, gap_to)
 
     def reinforce(self, memory_id: str, coupling_score: float = 0.5) -> set[str]:
         """
@@ -1637,6 +1640,9 @@ class Memory:
         weighed exactly at *as_of*. Writes nothing (PDM v1.9 change 3).
         """
         as_of = as_of or datetime.now(tz=timezone.utc)
+        remote = getattr(self._storage, "count_silent", None)
+        if callable(remote):
+            return remote(self._user, theta, as_of)
         silent = self._storage.count_below_carried(self._user, theta)
         cursor: str | None = None
         while True:

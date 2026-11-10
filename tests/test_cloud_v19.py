@@ -51,6 +51,14 @@ def mem():
     m.close()
 
 
+def test_cloud_touch_posts_the_ids(mem, router):
+    route = router.post(f"{API}/touch").mock(return_value=httpx.Response(200, json={"touched": 2}))
+    patch = router.patch(url__startswith=f"{API}/signatures/")
+    assert mem.touch(["a", "b", "a", ""]) == 2
+    assert json.loads(route.calls.last.request.content) == {"ids": ["a", "b"]}
+    assert patch.call_count == 0
+
+
 def test_cloud_save_sends_the_claim_and_support(mem, router):
     router.post(f"{API}/signatures/batch-get").mock(
         return_value=httpx.Response(200, json={"signatures": [_row("s1")]})
@@ -80,6 +88,23 @@ def test_a_plain_cloud_save_sends_no_claim(mem, router):
     mem.save("Plain fact", tags=["a", "b", "c"], dedupe=False)
     body = json.loads(ingest.calls.last.request.content)
     assert not {"direction", "due", "outcome_source", "watch_window_days", "rests_on"} & set(body)
+
+
+def test_cloud_gap_and_silent_count(mem, router):
+    gaps = router.post(f"{API}/coverage-gaps").mock(
+        return_value=httpx.Response(201, json={"amended": 3})
+    )
+    silent = router.get(f"{API}/count-silent").mock(
+        return_value=httpx.Response(200, json={"theta": 30.0, "silent": 7})
+    )
+    assert mem.report_coverage_gap("failure-feed", NOW - timedelta(hours=6), NOW) == 3
+    assert json.loads(gaps.calls.last.request.content) == {
+        "source": "failure-feed",
+        "from": (NOW - timedelta(hours=6)).isoformat(),
+        "to": NOW.isoformat(),
+    }
+    assert mem.count_silent(30, as_of=NOW) == 7
+    assert silent.calls.last.request.url.params["theta"] == "30"
 
 
 def test_a_cloud_row_reads_its_status_and_claim_back():

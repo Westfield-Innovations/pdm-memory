@@ -551,12 +551,13 @@ class PostgresDriver(BaseStorage):
 
     def save_coverage_gap(
         self, user: str, source: str, gap_from: datetime, gap_to: datetime
-    ) -> None:
+    ) -> int:
         self._conn().execute(
             'INSERT INTO pdm_coverage_gaps ("user", source, gap_from, gap_to) VALUES (%s, %s, %s, %s)',
             (user, source, gap_from.isoformat(), gap_to.isoformat()),
         )
         self._commit_if_idle(self._conn())
+        return 0  # no settlement here yet, so no verdict to amend
 
     def count_below_carried(self, user: str, theta: float) -> int:
         row = self._conn().execute(
