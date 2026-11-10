@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pdm_memory import Memory
 from pdm_memory.core.signature import SignatureRecord
 from pdm_memory.storage.sqlite_driver import SQLiteDriver
 
@@ -87,3 +88,11 @@ def test_upgrade_fills_tags_from_existing_rows(tmp_path):
     assert _tags(d, live) == ["flare", "north"]
     assert _tags(d, gone) == ["silent"]
     d.close()
+
+
+def test_a_cyrillic_cue_reaches_the_tag_table(tmp_path):
+    with Memory(store=str(tmp_path / "t.db"), user=USER) as mem:
+        for i in range(3):
+            mem.save(f"Loud fact number {i} about pumps", tags=["pump", "loud", f"n{i}"], p_magnitude=90)
+        mid = mem.save("Марія живе в Києві", tags=["Київ", "Марія", "місто"], p_magnitude=60)
+        assert [h.id for h in mem.recall("Де живе Марія?", k=1)] == [mid]

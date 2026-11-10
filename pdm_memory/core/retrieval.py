@@ -50,6 +50,8 @@ from pdm_memory.models import AlignmentReport, TorsionReport
 logger = logging.getLogger(__name__)
 
 WORD_PATTERN = re.compile(r"\b[a-zA-Z]{3,}\b")
+# Recall cues in any script; torsion and alignment keep WORD_PATTERN.
+CUE_WORD_PATTERN = re.compile(r"\b[^\W\d_]{3,}\b")
 # Standalone numerics only — reject Q3 / v2 / H1 bleed into factual torsion
 NUMBER_PATTERN = re.compile(r"(?<![A-Za-z])-?\d+(?:\.\d+)?(?![A-Za-z])")
 
@@ -354,7 +356,7 @@ class RetrievalEngine:
         coupled: list[tuple[NodeCoupling, MemoryHit]] = []
 
         # Infer domain/regime from query if not specified
-        query_tags = self._tokenize_query(query) if query else []
+        query_tags = self._cue_words(query) if query else []
         effective_domain = domain or (infer_domain(query_tags) if query_tags else None)
         effective_regime = regime or (infer_regime(query_tags) if query_tags else None)
 
@@ -643,7 +645,7 @@ class RetrievalEngine:
         sig_tags = {t.lower() for t in (rec.intent_tags or []) if t}
         if RetrievalEngine._tags_overlap(cue, sig_tags):
             return 1.0
-        fact_tokens = set(RetrievalEngine._tokenize_query(rec.compressed_fact or ""))
+        fact_tokens = set(RetrievalEngine._cue_words(rec.compressed_fact or ""))
         if not fact_tokens:
             return 0.0
         if RetrievalEngine._tags_overlap(cue, fact_tokens):
@@ -754,6 +756,11 @@ class RetrievalEngine:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return max(0.0, (now - dt).total_seconds() / 86400.0)
+
+    @staticmethod
+    def _cue_words(text: str) -> list[str]:
+        """The words of a recall cue in any script, lower-cased, stopwords dropped."""
+        return [w for w in CUE_WORD_PATTERN.findall(text.lower()) if w not in _STOPWORDS]
 
     @staticmethod
     def _tokenize_query(query: str) -> list[str]:
