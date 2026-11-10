@@ -148,17 +148,27 @@ $$\text{intent\_weight} = 0.8 + 0.2 \times \frac{\text{matches}}{\text{len}(\tex
 
 ### 3.5. Розрахунок ефективного тиску ($P_{effective}$)
 
-Це підсумкове значення тиску спогаду, яке розраховується динамічно під час кожного пошуку:
+Вага спогаду (PDM v1.9, зміна 2), яку читає кожен поріг:
 
-$$P_{\text{effective}} = P_{\text{magnitude}} \times V \times (1 - \text{decay\_factor}) \times \text{intent\_weight} \times \text{quality} \times \text{comparator}$$
+$$P_{\text{effective}} = P_{\text{magnitude}} \times V \times 0.5^{t / T_{1/2}}$$
 
 Де:
-*   $P_{\text{magnitude}}$ — поточний збережений тиск у БД.
-*   $V$ — коефіцієнт валідації.
-*   $\text{decay\_factor}$ — експоненційне згасання з моменту останнього зчитування.
-*   $\text{intent\_weight}$ — вага відповідності запиту.
-*   $\text{quality}$ — коефіцієнт якості сигналу (за замовчуванням $0.80$).
-*   $\text{comparator}$ — додатковий проксі-множник для тонкого калібрування (за замовчуванням $1.0$).
+*   $P_{\text{magnitude}}$ — тиск, записаний один раз, під час збереження. Більше його ніщо не змінює.
+*   $V$ — коефіцієнт валідації. Множиться один раз, а не підноситься до степеня днів.
+*   $t$ — дні від пізнішого з `created_at` і `last_retrieved`. У межах grace `t_persistence` згасання немає.
+
+Шкала всередині SDK — 0–100. Спека пише пороги як частку повного тиску: 30 = 0.3, 10 = 0.1.
+
+$\text{intent\_weight}$, $\text{quality}$ і $\text{comparator}$ не входять у вагу. Вони діють лише після порога, у match score (`calculate_p_effective`).
+
+**Три числа — три писарі.**
+*   P пише лише `save`.
+*   Лічильники V пише лише validate: `reinforce` (правильно) і `penalize` (хибно).
+*   Годинник (`last_retrieved`, `retrieval_count`) пише лише `touch`.
+
+`recall`, `retrieve` і `search` не пишуть нічого.
+
+**Carried number** = $P \times V$, індекс на виразі. Він ніколи не менший за вагу, тож поріг по індексу не відкидає жодного рядка, який пройшов би точний поріг.
 
 ---
 
@@ -240,43 +250,48 @@ $$\text{temporal\_weight}_{\text{new}} = \text{temporal\_weight} \times (1 - \te
 
 ### 4.2. Пошук та вилучення спогадів (`Memory.recall`)
 
-Процес пошуку реалізовано як трифазову процедуру Threshold-Adjustment Search (TAS):
+`recall()` повертає хіти `retrieve()`; `search_cost` лише знижує θ (не нижче 10). Порядок PDM v1.9 (зміна 12):
 
 ```
-       Клієнт викликає Memory.recall(query, search_cost)
+   Memory.retrieve(cue, area, min_p=θ, budget, continuation)
                                │
                                ▼
-            1. Зчитування кандидатів із сховища
-            (лише ті, що мають P_magnitude >= min_pressure)
+   1. Маршрути. Слова запиту (будь-яким письмом) → pdm_tags; area обмежує все.
+      Якщо тегованих рядків над порогом менше 50, додається listing:
+      уся область, теговані першими.
                                │
                                ▼
-        2. Інкрементне згасання кожного кандидата у пам'яті
+   2. Поріг по індексу: carried number (P × V) ≥ θ
                                │
                                ▼
-        3. Фаза 1 TAS: Зниження порогу тиску (Threshold Lowering)
-           theta_eff = base_threshold * (1 - alpha * search_cost)
+   3. Точна вага кожного кандидата під одним as_of; бюджет рахує кандидатів
                                │
                                ▼
-        4. Відсікання кандидатів із P_effective < theta_eff
+   4. Match score: coupling × вага × intent_weight × (1 + терміновість), той самий θ
                                │
                                ▼
-        5. Фаза 2 TAS: Семантичне узгодження (Impedance Matching)
-           Розрахунок coupling_score для кожного кандидата
+   5. Прапорці: STANDALONE / RECOVERY, support in doubt, owl, duck → action_status
                                │
                                ▼
-        6. Ранжування за формулою: coupling_score * P_effective
-                               │
-                               ▼
-        7. Фаза 3 TAS: Автоматичне підсилення (Reinforcement)
-           Для відібраних спогадів викликається:
-           new_P = P + REINF_BASE * (1 + log(1 + count)) * coupling_score
-                               │
-                               ▼
-           Пакетний запис оновлених значень P_magnitude в базу даних
-                               │
-                               ▼
-                  Повернення List[MemoryHit]
+   RetrieveResult: hits, routes, area, θ, as_of, completed, continuation
 ```
+
+Нічого не записується. Викликач сам повідомляє про використання (`touch`) і про результат (`reinforce` / `penalize`).
+
+**Зв'язки (зміни 7, 8).**
+*   `save(rests_on=[...])` пише support-зв'язки.
+*   `touch` пише coaccess між рядками, використаними разом (до 5 найкращих).
+*   `penalize` на `VALIDATED` — це корекція: усе, що спирається на рядок по support, стає `REOPENED`, хоч як далеко. Цикли обходяться один раз.
+*   Coaccess корекцію не переносить.
+
+**Claim (зміни 4, 6).**
+*   `save(claim=Claim(direction, due, outcome_source, watch_window_days))`.
+*   Owl — claim `occurs` після due, без зафіксованої події.
+*   Duck — claim `absent`, яку не перевірило жодне спостереження.
+
+**Тиша замість видалення.** `decay()` нічого не видаляє, `count_silent()` рахує тихих. Апгрейд повертає рядки, які міг видалити старий `decay()` (вага < 37.5); решта видалень лишається.
+
+**Ще не зроблено.** Settlement (зміна 5) і curve sweep (зміна 13) чекають рішення. Sill S, I2, cross-drawer resonance і `require_tri` у SDK відсутні. На cloud store `context` і `support_in_doubt` не рахуються (None), тож хіт там завжди `UNVALIDATED` для дії.
 
 ---
 
@@ -338,10 +353,25 @@ $$\text{temporal\_weight}_{\text{new}} = \text{temporal\_weight} \times (1 - \te
 | `t_deadline` | TEXT | Дата і час дедлайну для PDM-T (опціонально) |
 | `urgency_rate` | REAL | Коефіцієнт зростання терміновості (для часової геометрії) |
 | `metadata` | TEXT | JSON-рядок із будь-якими додатковими метаданими |
+| `validation_status` | TEXT | `UNVALIDATED`, `VALIDATED` або `REOPENED` (пише лише validate) |
+| `direction` | TEXT | Claim: `occurs`, `absent` або `''` (немає claim) |
+| `outcome_source` | TEXT | Прив'язане джерело claim (`''` — лише спостереження) |
+| `due` | TEXT | Коли claim читається (ISO 8601) |
+| `watch_window` | REAL | Днів після due, коли пізній звіт ще може змінити вердикт |
+| `outcome`, `verdict` | TEXT | Спостереження і єдиний вердикт claim (`''`, поки відкрита) |
+| `event_time`, `report_time` | TEXT | Коли подія сталася і коли пам'ять про неї дізналася |
 
 #### Індекси:
 1.  `idx_pdm_user_pressure` на полях `(user, p_magnitude DESC)`: оптимізує вибірку найважливіших спогадів користувача при початковому скануванні в `recall()`.
 2.  `idx_pdm_user_drawer` на полях `(user, drawer_domain)`: прискорює пошук спогадів у розрізі окремої категорії.
+3.  `idx_pdm_user_carried` на `(user, P × V)`: поріг θ без обчислення ваги кожного рядка.
+4.  `idx_pdm_open_claims` на `(user, due)` для відкритих claim.
+
+### 5.3. Таблиці v1.9
+
+*   `pdm_tags(user, word, pressure_id)`, PK `(user, word, pressure_id)`. Теги в нижньому регістрі, пишуться разом із рядком; запит іде по індексу, а не скануванням `intent_tags`.
+*   `pdm_links(user, pressure_id, neighbor_id, kind, status_at_write, v_at_write, written_at)`, PK `(pressure_id, neighbor_id, kind)`, індекси з обох боків. `kind`: `support` або `coaccess`.
+*   `pdm_coverage_gaps(user, source, gap_from, gap_to)` — проміжки, коли джерело не звітувало.
 
 ### 5.2. Таблиця `pdm_drawers`
 

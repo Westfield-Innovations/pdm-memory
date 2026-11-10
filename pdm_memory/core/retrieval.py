@@ -321,6 +321,7 @@ class RetrievalEngine:
         regime: str | None = None,
         diversity_bias: float | None = DEFAULT_DIVERSITY_BIAS,
         theta: float | None = None,
+        as_of: datetime | None = None,
     ) -> list[MemoryHit]:
         """
         Retrieve top-k memories from a list of SignatureRecords.
@@ -338,6 +339,7 @@ class RetrievalEngine:
                              (default ``0.4``). Pass ``None`` for pure
                              score order; ``1.0`` disables the cap.
             theta:           Weight gate (0–100); replaces the one search_cost derives.
+            as_of:           The one time every weight is read at (default: now).
 
         Returns:
             List[MemoryHit] ranked by relevance, length ≤ k.
@@ -345,7 +347,7 @@ class RetrievalEngine:
         if not records:
             return []
 
-        now = datetime.now(tz=timezone.utc)
+        now = as_of or datetime.now(tz=timezone.utc)
         event_window = self._parse_relative_event_window(query, now)
 
         # Phase 1: threshold lowering

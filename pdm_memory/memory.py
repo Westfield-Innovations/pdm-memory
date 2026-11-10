@@ -33,6 +33,7 @@ Wrapper (zero-config LLM integration):
 from __future__ import annotations
 
 import builtins
+import itertools
 import logging
 import math
 import os
@@ -45,11 +46,12 @@ from typing import Any, Mapping
 
 from typing_extensions import Self
 
-from pdm_memory.claims import Claim
+from pdm_memory.claims import Claim, is_duck, is_owl
 from pdm_memory.core.alignment import verify_records
 from pdm_memory.core.math import (
     DEFAULT_MIN_P,
     MEMORY_SHAPE_KEY,
+    SEARCH_FLOOR,
     SHAPE_HALF_LIVES,
     calculate_effective_spike,
     calculate_intent_weight,
@@ -61,7 +63,11 @@ from pdm_memory.core.math import (
     resolve_memory_shape,
     weight_of,
 )
-from pdm_memory.core.retrieval import DEFAULT_DIVERSITY_BIAS, RetrievalEngine
+from pdm_memory.core.retrieval import (
+    DEFAULT_DIVERSITY_BIAS,
+    THETA_BASE_DEFAULT,
+    RetrievalEngine,
+)
 from pdm_memory.core.signature import (
     REOPENED,
     UNVALIDATED,
@@ -82,6 +88,7 @@ from pdm_memory.models import (
     RecordedProjection,
     RelationshipChannelResolution,
     RelationshipState,
+    RetrieveResult,
     SurfaceReport,
     TorsionReport,
     Trajectory,
@@ -100,6 +107,13 @@ logger = logging.getLogger(__name__)
 
 # How many of the rows one touch used get coaccess links: the best-matching.
 COACCESS_PER_TOUCH = 5
+# Candidates a retrieve weighs exactly, unless the caller sets its budget.
+DEFAULT_BUDGET = 200
+# Under this many tagged candidates over the gate, the listing route joins.
+LISTING_MIN = 50
+ROUTE_TAGS = "tags"
+ROUTE_AREA = "area"
+ROUTE_LISTING = "listing"
 
 
 class Memory:
@@ -713,13 +727,9 @@ class Memory:
         """
         Retrieve the top-k most relevant memories for a query.
 
-        Retrieval works via Threshold-Adjustment Search (TAS):
-        pressure thresholds are lowered based on search_cost, then
-        coupling scores rank memories by tag/domain/regime resonance.
-
-        Decay is applied at recall time via the canonical domain half-life
-        law (P_effective = P × … × (1 - decay_factor)). Stored p_magnitude
-        is not rewritten on read — no second power-law decay.
+        :meth:`retrieve` in the PDM v1.9 order, returning only the hits:
+        ``search_cost`` lowers the one weight gate θ (0.0 strict, 1.0 loose,
+        never under 10 = 0.1 of full) and ``drawer`` is the area. Writes nothing.
 
         Args:
             query:       The recall query / current context.
@@ -729,7 +739,7 @@ class Memory:
             drawer:      Optional: filter by drawer name.
             reinforce:   Deprecated. Recall writes nothing (PDM v1.9 change 3); True
                          only touches the hits. Call :meth:`touch` with what you used.
-            candidate_limit: Max signatures loaded from storage for ranking (default 2_000).
+            candidate_limit: Budget: max candidates weighed exactly (default 2_000).
             page_size:       Keyset page size when loading candidates (default 500).
             diversity_bias:  Max fraction of top-k from one drawer (default ``0.4``).
                              Pass ``None`` for pure score order.
@@ -738,34 +748,16 @@ class Memory:
         Returns:
             List[MemoryHit] ranked by relevance, length ≤ k.
         """
-        records = self._load_recall_candidates(
-            query=query,
-            min_pressure=min_pressure,
-            drawer=drawer,
-            candidate_limit=candidate_limit,
-            page_size=page_size,
-        )
-        if not records:
-            ctx: dict[str, Any] = {
-                "query": query,
-                "k": k,
-                "hits": [],
-                "reinforced": False,
-                "min_pressure": min_pressure,
-                "search_cost": search_cost,
-                "drawer": drawer,
-                "diversity_bias": diversity_bias,
-            }
-            self._run_post_recall_hooks(ctx)
-            return []
-
-        hits = self._engine.recall(
-            records=records,
-            query=query,
+        hits = self._retrieve(
+            query,
+            area=drawer,
+            theta=self._engine._compute_threshold(THETA_BASE_DEFAULT, search_cost),
             k=k,
-            search_cost=search_cost,
+            budget=candidate_limit,
+            min_pressure=min_pressure,
+            page_size=page_size,
             diversity_bias=diversity_bias,
-        )
+        ).hits
 
         if on_recall:
             for hit in hits:
@@ -789,6 +781,171 @@ class Memory:
         }
         self._run_post_recall_hooks(ctx)
         return hits
+
+    def retrieve(
+        self,
+        cue: str = "",
+        *,
+        area: str | None = None,
+        min_p: float = DEFAULT_MIN_P,
+        k: int = 5,
+        budget: int = DEFAULT_BUDGET,
+        as_of: datetime | None = None,
+        continuation: str | None = None,
+    ) -> RetrieveResult:
+        """
+        Qualified memories for *cue* (PDM v1.9 changes 12 and 14). Writes nothing.
+
+        In order: activate ids by route (the cue's words in the tag table; the
+        area; the whole scope when the tags reach too few), keep those whose
+        carried number may clear θ = *min_p* (0–100, default 30 = 0.3 of full),
+        weigh each exactly at one as-of time while the *budget* lasts, rank the
+        survivors by match score, and flag them. A result stopped on budget
+        carries a continuation that resumes under the same as-of time and order.
+        Call :meth:`touch` with what you used.
+        """
+        return self._retrieve(
+            cue, area=area, theta=float(min_p), k=k, budget=budget,
+            as_of=as_of, continuation=continuation,
+        )
+
+    def search(
+        self,
+        cue: str = "",
+        *,
+        min_p_lowered: float,
+        area: str | None = None,
+        k: int = 5,
+        budget: int = DEFAULT_BUDGET,
+        as_of: datetime | None = None,
+        continuation: str | None = None,
+    ) -> RetrieveResult:
+        """
+        As :meth:`retrieve`, with the weight gate lowered to *min_p_lowered* at every gate.
+
+        Without a named *area* the gate never goes below 10 (0.1 of full), so
+        the silent set stays out of an unnamed search; an area sets its own bound.
+        Nothing else is loosened. Writes nothing.
+        """
+        theta = float(min_p_lowered)
+        if not area:
+            theta = max(theta, SEARCH_FLOOR)
+        return self._retrieve(
+            cue, area=area, theta=theta, k=k, budget=budget,
+            as_of=as_of, continuation=continuation,
+        )
+
+    def _retrieve(
+        self,
+        cue: str,
+        *,
+        area: str | None,
+        theta: float,
+        k: int,
+        budget: int,
+        as_of: datetime | None = None,
+        continuation: str | None = None,
+        min_pressure: float = 0.0,
+        page_size: int = 500,
+        diversity_bias: float | None = DEFAULT_DIVERSITY_BIAS,
+    ) -> RetrieveResult:
+        resumed_at, phase, after = _resume(continuation)
+        as_of = resumed_at or as_of or datetime.now(tz=timezone.utc)
+        page_size = max(1, page_size)
+        words = RetrievalEngine._cue_words(cue) if cue else []
+
+        def pages(tags: builtins.list[str] | None, cursor: str | None):
+            while True:
+                batch = self._storage.list(
+                    user=self._user, limit=page_size, min_pressure=min_pressure,
+                    drawer=area, cursor_id=cursor, tag_any=tags, min_carried=theta,
+                )
+                yield from batch
+                if len(batch) < page_size:
+                    return
+                cursor = batch[-1].id
+
+        # Too few tagged rows over the gate: the whole scope joins, tagged rows first.
+        probe: builtins.list[SignatureRecord] = []
+        if words and phase in (None, "P", "L"):
+            probe = list(itertools.islice(pages(words, None), LISTING_MIN))
+        listing = not words or phase in ("P", "L") or (phase is None and len(probe) < LISTING_MIN)
+        routes = ([ROUTE_TAGS] if words else []) + ([ROUTE_AREA] if area else [])
+        if listing:
+            routes.append(ROUTE_LISTING)
+
+        def stream():
+            if not listing:
+                yield from (("T", r) for r in pages(words, after))
+                return
+            if phase != "L":
+                ids = [r.id for r in probe]
+                start = ids.index(after) + 1 if phase == "P" and after in ids else 0
+                yield from (("P", r) for r in probe[start:])
+            tagged = {r.id for r in probe}
+            yield from (
+                ("L", r)
+                for r in pages(None, after if phase == "L" else None)
+                if r.id not in tagged
+            )
+
+        survivors: builtins.list[SignatureRecord] = []
+        evaluated, last, completed = 0, None, True
+        for step, rec in stream():
+            if evaluated >= budget:
+                completed = False
+                break
+            evaluated += 1
+            last = (step, rec.id)
+            if weight_of(rec, as_of)[0] >= theta:
+                survivors.append(rec)
+
+        hits = self._engine.recall(
+            records=survivors, query=cue, k=k, theta=theta, as_of=as_of,
+            diversity_bias=diversity_bias,
+        ) if survivors else []
+        self._flag(hits, {r.id: r for r in survivors}, theta, as_of)
+        return RetrieveResult(
+            hits=hits,
+            routes=routes,
+            area=area,
+            theta=theta,
+            as_of=as_of,
+            completed=completed,
+            continuation=None if completed or last is None
+            else f"{as_of.isoformat()}|{last[0]}|{last[1]}",
+            evaluated=evaluated,
+        )
+
+    def _flag(
+        self,
+        hits: builtins.list[MemoryHit],
+        records: dict[str, SignatureRecord],
+        theta: float,
+        as_of: datetime,
+    ) -> None:
+        """Owl, duck, STANDALONE / RECOVERY and support in doubt (changes 6, 8, 9)."""
+        for hit in hits:
+            hit.owl = is_owl(records[hit.id], as_of)
+            hit.duck = is_duck(records[hit.id])
+        if not hits:
+            return
+        try:
+            links = self._storage.links(self._user, [h.id for h in hits], side="out")
+        except NotImplementedError:
+            return  # not computed: action_status stays UNVALIDATED
+        neighbours = self._storage.get_many(
+            list({link.neighbor_id for link in links}), user=self._user
+        )
+        loud = {nid for nid, rec in neighbours.items() if weight_of(rec, as_of)[0] >= theta}
+        for hit in hits:
+            mine = [link for link in links if link.pressure_id == hit.id]
+            hit.context = "RECOVERY" if any(lk.neighbor_id in loud for lk in mine) else "STANDALONE"
+            hit.support_in_doubt = any(
+                _support_doubted(neighbours.get(lk.neighbor_id), lk)
+                for lk in mine
+                if lk.kind == "support"
+            )
 
     def surface(
         self,
@@ -2379,6 +2536,31 @@ class Memory:
                         logger.warning("[PDM] torsion V penalty failed for %s: %s", res.id, res.error)
             except Exception as e:
                 logger.warning("[PDM] torsion V penalty batch failed: %s", e)
+
+
+def _resume(token: str | None) -> tuple[datetime | None, str | None, str | None]:
+    """``(as_of, phase, last_id)`` from a continuation this memory wrote."""
+    if not token:
+        return None, None, None
+    as_of, _, rest = token.partition("|")
+    phase, _, last = rest.partition("|")
+    try:
+        parsed = datetime.fromisoformat(as_of)
+    except ValueError:
+        parsed = None
+    if parsed is None or phase not in ("T", "P", "L") or not last:
+        raise ValueError("Not a continuation this memory wrote.")
+    return parsed, phase, last
+
+
+def _support_doubted(support: SignatureRecord | None, link: LinkRow) -> bool:
+    """Something rested on is REOPENED, or its V fell below the V on the link."""
+    if support is None:
+        return False
+    if support.validation_status == REOPENED:
+        return True
+    v = calculate_v(support.validation_prediction_correct, support.validation_prediction_total)
+    return v < link.v_at_write
 
 
 def _link(pressure_id: str, neighbor: SignatureRecord, kind: str, now: datetime) -> LinkRow:
