@@ -220,6 +220,7 @@ def apply_sqlite_migrations(conn: Any) -> None:
     )
     if upgrading:
         restore_silent(conn, dialect="sqlite")
+    _create_tag_table(conn, dialect="sqlite")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pdm_user_carried "
         f"ON pdm_signatures (user, {CARRIED_SQL})"
@@ -262,6 +263,7 @@ def apply_postgres_migrations(conn: Any) -> None:
     )
     if upgrading:
         restore_silent(conn, dialect="postgres")
+    _create_tag_table(conn, dialect="postgres")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pdm_user_carried "
         f'ON pdm_signatures ("user", {CARRIED_SQL})'
@@ -359,6 +361,54 @@ def prepare_update_fields(fields: dict) -> dict:
         else:
             prepared[col] = value
     return prepared
+
+
+def tag_words(tags: Any) -> list[str]:
+    """The words a signature is found by: its tags, stripped and lower-cased, once each."""
+    return list(dict.fromkeys(w for w in (str(t).strip().lower() for t in tags or ()) if w))
+
+
+def write_tags(conn: Any, rows: Any, *, dialect: str) -> None:
+    """Rewrite the tag rows of each ``(user, pressure_id, tags)`` in *rows* (PDM v1.9 change 11)."""
+    ph, user_col = ("?", "user") if dialect == "sqlite" else ("%s", '"user"')
+    rows = list(rows)
+    if not rows:
+        return
+    cur = conn.cursor()
+    cur.executemany(
+        f"DELETE FROM pdm_tags WHERE pressure_id = {ph}", [(pid,) for _, pid, _ in rows]
+    )
+    words = [(user, w, pid) for user, pid, tags in rows for w in tag_words(tags)]
+    if words:
+        cur.executemany(
+            f"INSERT INTO pdm_tags ({user_col}, word, pressure_id) VALUES ({ph}, {ph}, {ph})",
+            words,
+        )
+
+
+def _create_tag_table(conn: Any, *, dialect: str) -> None:
+    """Create ``pdm_tags`` and, the first time, fill it from every row's ``intent_tags``."""
+    if dialect == "sqlite":
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pdm_tags'"
+        ).fetchone()
+        user_col = "user"
+    else:
+        exists = conn.execute("SELECT to_regclass('pdm_tags') AS t").fetchone()["t"]
+        user_col = '"user"'
+    if exists:
+        return
+    conn.execute(
+        f"CREATE TABLE pdm_tags ({user_col} TEXT NOT NULL, word TEXT NOT NULL, "
+        f"pressure_id TEXT NOT NULL, PRIMARY KEY ({user_col}, word, pressure_id))"
+    )
+    conn.execute("CREATE INDEX idx_pdm_tags_pressure ON pdm_tags (pressure_id)")
+    rows = conn.execute(f"SELECT id, {user_col} AS u, intent_tags FROM pdm_signatures").fetchall()
+    write_tags(
+        conn,
+        ((r["u"], r["id"], json.loads(r["intent_tags"] or "[]")) for r in rows),
+        dialect=dialect,
+    )
 
 
 def increment_set_clause(

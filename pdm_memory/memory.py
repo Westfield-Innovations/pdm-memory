@@ -2126,7 +2126,7 @@ class Memory:
             return []
 
         page_size = max(1, min(page_size, candidate_limit))
-        query_tokens = RetrievalEngine._tokenize_query(query) if query else []
+        query_tokens = RetrievalEngine._cue_words(query) if query else []
 
         def _paginate(tag_any: builtins.list[str] | None) -> builtins.list[SignatureRecord]:
             records: list[SignatureRecord] = []

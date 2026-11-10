@@ -31,6 +31,8 @@ from pdm_memory.storage.schema import (
     mapping_to_record,
     prepare_update_fields,
     signature_insert_row,
+    tag_words,
+    write_tags,
 )
 
 logger = logging.getLogger(__name__)
@@ -140,6 +142,7 @@ class PostgresDriver(BaseStorage):
         row = cur.fetchone() if hasattr(cur, "fetchone") else None
         if not row and hasattr(cur, "rowcount") and cur.rowcount == 0:
             raise ValueError(f"Signature record with id '{sig.id}' already exists")
+        write_tags(conn, [(sig.user, sig.id, sig.intent_tags)], dialect="postgres")
         conn.execute(_INSERT_DRAWER_SQL, (sig.drawer_domain, sig.user, ""))
         self._commit_if_idle(conn)
         logger.debug("[PDM-Postgres] Saved signature %s (P=%.1f)", sig.id, sig.p_magnitude)
@@ -185,6 +188,15 @@ class PostgresDriver(BaseStorage):
                     if not cur.nextset():
                         break
 
+                write_tags(
+                    conn,
+                    [
+                        (sig.user, sig.id, sig.intent_tags)
+                        for (_, sig), row in zip(chunk, rows)
+                        if row is not None
+                    ],
+                    dialect="postgres",
+                )
                 drawer_rows: list[tuple[str, str, str]] = []
                 for (index, sig), row in zip(chunk, rows):
                     if row is not None:
@@ -327,6 +339,8 @@ class PostgresDriver(BaseStorage):
             f'UPDATE pdm_signatures SET {set_clause} WHERE id = %s AND "user" = %s',
             values,
         )
+        if cur.rowcount and "intent_tags" in fields:
+            write_tags(self._conn(), [(user, memory_id, fields["intent_tags"])], dialect="postgres")
         self._commit_if_idle(self._conn())
         if cur.rowcount == 0:
             logger.warning(
@@ -415,6 +429,16 @@ class PostgresDriver(BaseStorage):
                             len(touched), len(chunk), user, list(columns), missing[:20],
                         )
 
+            write_tags(
+                conn,
+                [
+                    (user, mid, fields["intent_tags"])
+                    for i, (mid, fields) in enumerate(updates)
+                    if "intent_tags" in fields and not results[i].error
+                ],
+                dialect="postgres",
+            )
+
         return results
 
     def delete(self, memory_id: str, user: str = "default") -> None:
@@ -431,6 +455,9 @@ class PostgresDriver(BaseStorage):
         conn.execute(
             'DELETE FROM pdm_signatures WHERE id = %s AND "user" = %s',
             (memory_id, user),
+        )
+        conn.execute(
+            'DELETE FROM pdm_tags WHERE pressure_id = %s AND "user" = %s', (memory_id, user)
         )
         self._commit_if_idle(conn)
 
@@ -455,13 +482,13 @@ class PostgresDriver(BaseStorage):
         if drawer:
             where.append("drawer_domain = %s")
             params.append(drawer)
-        tags = [t.strip().lower() for t in (tag_any or ()) if t and str(t).strip()]
+        tags = tag_words(tag_any)[:32]
         if tags:
-            tag_clauses: list[str] = []
-            for tag in tags[:32]:
-                tag_clauses.append("LOWER(intent_tags) LIKE %s")
-                params.append(f'%"{tag}"%')
-            where.append("(" + " OR ".join(tag_clauses) + ")")
+            where.append(
+                'id IN (SELECT pressure_id FROM pdm_tags WHERE "user" = %s '
+                "AND word = ANY(%s))"
+            )
+            params.extend([user, tags])
         if cursor_id:
             cursor = self._conn().execute(
                 'SELECT p_magnitude FROM pdm_signatures WHERE id = %s AND "user" = %s',

@@ -42,6 +42,8 @@ from pdm_memory.storage.schema import (
     mapping_to_record,
     prepare_update_fields,
     signature_insert_row,
+    tag_words,
+    write_tags,
 )
 
 logger = logging.getLogger(__name__)
@@ -257,6 +259,7 @@ class SQLiteDriver(BaseStorage):
                 sig.idempotency_key,
             ),
         )
+        write_tags(conn, [(sig.user, sig.id, sig.intent_tags)], dialect="sqlite")
         # Upsert drawer record
         conn.execute(
             "INSERT OR IGNORE INTO pdm_drawers (domain, user, description) VALUES (?, ?, ?)",
@@ -353,6 +356,11 @@ class SQLiteDriver(BaseStorage):
                         [sig.id for _, sig in to_insert],
                     )
 
+                write_tags(
+                    conn,
+                    [(sig.user, sig.id, sig.intent_tags) for _, sig in to_insert],
+                    dialect="sqlite",
+                )
                 for idx, sig in to_insert:
                     results[idx] = SaveBatchResult(index=idx, id=sig.id)
                     drawer_key = (sig.drawer_domain, sig.user)
@@ -493,6 +501,8 @@ class SQLiteDriver(BaseStorage):
             f"UPDATE pdm_signatures SET {set_clause} WHERE id = ? AND user = ?",
             values,
         )
+        if cur.rowcount and "intent_tags" in fields:
+            write_tags(self._conn(), [(user, memory_id, fields["intent_tags"])], dialect="sqlite")
         self._commit_if_idle(self._conn())
         if cur.rowcount == 0:
             logger.warning(
@@ -600,6 +610,16 @@ class SQLiteDriver(BaseStorage):
                         [mid for mid, _ in confirmed],
                     )
 
+            write_tags(
+                conn,
+                [
+                    (user, mid, fields["intent_tags"])
+                    for i, (mid, fields) in enumerate(updates)
+                    if "intent_tags" in fields and mid in existing_ids and not results[i].error
+                ],
+                dialect="sqlite",
+            )
+
         return results
 
     def delete(self, memory_id: str, user: str = "default") -> None:
@@ -616,6 +636,7 @@ class SQLiteDriver(BaseStorage):
             "DELETE FROM pdm_signatures WHERE id = ? AND user = ?",
             (memory_id, user),
         )
+        conn.execute("DELETE FROM pdm_tags WHERE pressure_id = ? AND user = ?", (memory_id, user))
         self._commit_if_idle(conn)
 
     def list(
@@ -639,14 +660,13 @@ class SQLiteDriver(BaseStorage):
         if drawer:
             where.append("drawer_domain = ?")
             params.append(drawer)
-        tags = [t.strip().lower() for t in (tag_any or ()) if t and str(t).strip()]
+        tags = tag_words(tag_any)[:32]
         if tags:
-            # intent_tags stored as JSON array text — substring match on quoted token.
-            tag_clauses: list[str] = []
-            for tag in tags[:32]:
-                tag_clauses.append("LOWER(intent_tags) LIKE ?")
-                params.append(f'%"{tag}"%')
-            where.append("(" + " OR ".join(tag_clauses) + ")")
+            where.append(
+                "id IN (SELECT pressure_id FROM pdm_tags WHERE user = ? "
+                f"AND word IN ({', '.join('?' * len(tags))}))"
+            )
+            params.extend([user, *tags])
         if cursor_id:
             cursor = self._conn().execute(
                 "SELECT p_magnitude FROM pdm_signatures WHERE id = ? AND user = ?",
