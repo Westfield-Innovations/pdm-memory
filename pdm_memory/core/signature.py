@@ -173,6 +173,25 @@ class MemoryHit:
     t_event_at: datetime | None = None
     t_deadline: datetime | None = None
 
+    # PDM v1.9 change 14: the record's status and claim, and flags computed at
+    # retrieve (never stored). context and support_in_doubt are None when the
+    # store keeps no links: not computed, so not a clearance.
+    validation_status: str = UNVALIDATED
+    context: str | None = None  # STANDALONE or RECOVERY
+    support_in_doubt: bool | None = None
+    owl: bool = False
+    duck: bool = False
+    direction: str = ""
+    due: datetime | None = None
+    verdict: str = ""
+
+    @property
+    def action_status(self) -> str:
+        """What the hit may be acted on as: UNVALIDATED whenever a flag says so."""
+        if self.context != "RECOVERY" or self.support_in_doubt is not False or self.duck:
+            return UNVALIDATED
+        return self.validation_status
+
     @classmethod
     def from_record(
         cls,
@@ -214,6 +233,10 @@ class MemoryHit:
             is_urgent=is_urgent,
             t_event_at=record.t_event_at,
             t_deadline=record.t_deadline,
+            validation_status=record.validation_status,
+            direction=record.direction,
+            due=record.due,
+            verdict=record.verdict,
         )
 
 
