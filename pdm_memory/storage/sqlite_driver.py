@@ -28,17 +28,20 @@ import json
 import logging
 import sqlite3
 import threading
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from typing import Any
 
-from pdm_memory.core.signature import DrawerInfo, SignatureRecord
+from pdm_memory.core.signature import DrawerInfo, LinkRow, SignatureRecord
 from pdm_memory.storage.base import BaseStorage, SaveBatchResult, UpdateBatchResult
 from pdm_memory.storage.schema import (
     CARRIED_SQL,
     SCHEMA_SQLITE,
     apply_sqlite_migrations,
     increment_set_clause,
+    link_insert_row,
+    mapping_to_link,
     mapping_to_record,
     prepare_update_fields,
     signature_insert_row,
@@ -55,7 +58,7 @@ INSERT OR IGNORE INTO pdm_signatures (
     retrieval_count, last_retrieved, created_at,
     validation_prediction_total, validation_prediction_correct,
     decay_rate, t_deadline, t_event_at, urgency_rate, metadata,
-    is_deleted, idempotency_key
+    is_deleted, idempotency_key, validation_status
 ) VALUES (
     ?, ?, ?, ?, ?,
     ?, ?, ?, ?,
@@ -63,7 +66,7 @@ INSERT OR IGNORE INTO pdm_signatures (
     ?, ?, ?,
     ?, ?,
     ?, ?, ?, ?, ?,
-    ?, ?
+    ?, ?, ?
 )
 """
 
@@ -76,7 +79,7 @@ INSERT INTO pdm_signatures (
     retrieval_count, last_retrieved, created_at,
     validation_prediction_total, validation_prediction_correct,
     decay_rate, t_deadline, t_event_at, urgency_rate, metadata,
-    is_deleted, idempotency_key
+    is_deleted, idempotency_key, validation_status
 ) VALUES (
     ?, ?, ?, ?, ?,
     ?, ?, ?, ?,
@@ -84,7 +87,7 @@ INSERT INTO pdm_signatures (
     ?, ?, ?,
     ?, ?,
     ?, ?, ?, ?, ?,
-    ?, ?
+    ?, ?, ?
 ) ON CONFLICT(id) DO NOTHING
 """
 
@@ -218,7 +221,7 @@ class SQLiteDriver(BaseStorage):
                 retrieval_count, last_retrieved, created_at,
                 validation_prediction_total, validation_prediction_correct,
                 decay_rate, t_deadline, t_event_at, urgency_rate, metadata,
-                is_deleted, idempotency_key
+                is_deleted, idempotency_key, validation_status
             ) VALUES (
                 ?, ?, ?, ?, ?,
                 ?, ?, ?, ?,
@@ -226,7 +229,7 @@ class SQLiteDriver(BaseStorage):
                 ?, ?, ?,
                 ?, ?,
                 ?, ?, ?, ?, ?,
-                ?, ?
+                ?, ?, ?
             )
             """,
             (
@@ -255,6 +258,7 @@ class SQLiteDriver(BaseStorage):
                 json.dumps(sig.metadata),
                 1 if sig.is_deleted else 0,
                 sig.idempotency_key,
+                sig.validation_status,
             ),
         )
         # Upsert drawer record
@@ -616,6 +620,10 @@ class SQLiteDriver(BaseStorage):
             "DELETE FROM pdm_signatures WHERE id = ? AND user = ?",
             (memory_id, user),
         )
+        conn.execute(
+            "DELETE FROM pdm_links WHERE user = ? AND (pressure_id = ? OR neighbor_id = ?)",
+            (user, memory_id, memory_id),
+        )
         self._commit_if_idle(conn)
 
     def list(
@@ -664,6 +672,40 @@ class SQLiteDriver(BaseStorage):
         params.append(limit)
         rows = self._conn().execute(query, params).fetchall()
         return [mapping_to_record(r) for r in rows]
+
+    def write_links(self, user: str, rows: builtins.list[LinkRow]) -> int:
+        if not rows:
+            return 0
+        cur = self._conn().cursor()
+        cur.executemany(
+            "INSERT OR IGNORE INTO pdm_links (user, pressure_id, neighbor_id, kind, status_at_write, "
+            "v_at_write, written_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [link_insert_row(user, link) for link in rows],
+        )
+        self._commit_if_idle(self._conn())
+        return max(0, cur.rowcount)
+
+    def links(
+        self,
+        user: str,
+        ids: Sequence[str],
+        *,
+        side: str,
+        kind: str | None = None,
+    ) -> builtins.list[LinkRow]:
+        column = "pressure_id" if side == "out" else "neighbor_id"
+        ids = list(dict.fromkeys(ids))
+        found: builtins.list[LinkRow] = []
+        for i in range(0, len(ids), 500):
+            chunk = ids[i : i + 500]
+            marks = ", ".join("?" * len(chunk))
+            sql = f"SELECT * FROM pdm_links WHERE user = ? AND {column} IN ({marks})"
+            params: list[Any] = [user, *chunk]
+            if kind:
+                sql += " AND kind = ?"
+                params.append(kind)
+            found += [mapping_to_link(r) for r in self._conn().execute(sql, params)]
+        return found
 
     def count_below_carried(self, user: str, theta: float) -> int:
         row = self._conn().execute(

@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from pdm_memory.core.math import DEFAULT_MIN_P, weight_of
-from pdm_memory.core.signature import SignatureRecord
+from pdm_memory.core.signature import LinkRow, SignatureRecord
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,7 @@ UPDATABLE_COLUMNS: frozenset[str] = frozenset(
         "metadata",
         "is_deleted",
         "idempotency_key",
+        "validation_status",
     }
 )
 
@@ -96,7 +97,8 @@ CREATE TABLE IF NOT EXISTS pdm_signatures (
     urgency_rate                    REAL NOT NULL DEFAULT 2.0,
     metadata                        TEXT NOT NULL DEFAULT '{}',
     is_deleted                      INTEGER NOT NULL DEFAULT 0,
-    idempotency_key                 TEXT
+    idempotency_key                 TEXT,
+    validation_status               TEXT NOT NULL DEFAULT 'UNVALIDATED'
 );
 
 CREATE INDEX IF NOT EXISTS idx_pdm_user_pressure
@@ -152,7 +154,8 @@ CREATE TABLE IF NOT EXISTS pdm_signatures (
     urgency_rate                    DOUBLE PRECISION NOT NULL DEFAULT 2.0,
     metadata                        TEXT NOT NULL DEFAULT '{}',
     is_deleted                      INTEGER NOT NULL DEFAULT 0,
-    idempotency_key                 TEXT
+    idempotency_key                 TEXT,
+    validation_status               TEXT NOT NULL DEFAULT 'UNVALIDATED'
 );
 
 CREATE INDEX IF NOT EXISTS idx_pdm_user_pressure
@@ -194,6 +197,11 @@ def apply_sqlite_migrations(conn: Any) -> None:
         conn.execute("ALTER TABLE pdm_signatures ADD COLUMN idempotency_key TEXT")
     if "t_event_at" not in cols:
         conn.execute("ALTER TABLE pdm_signatures ADD COLUMN t_event_at TEXT")
+    if "validation_status" not in cols:
+        conn.execute(
+            "ALTER TABLE pdm_signatures ADD COLUMN "
+            "validation_status TEXT NOT NULL DEFAULT 'UNVALIDATED'"
+        )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pdm_user_active_pressure "
         "ON pdm_signatures (user, is_deleted, p_magnitude DESC, id DESC)"
@@ -224,6 +232,7 @@ def apply_sqlite_migrations(conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_pdm_user_carried "
         f"ON pdm_signatures (user, {CARRIED_SQL})"
     )
+    _create_link_table(conn, user_col="user", real="REAL")
 
 
 def apply_postgres_migrations(conn: Any) -> None:
@@ -236,6 +245,10 @@ def apply_postgres_migrations(conn: Any) -> None:
     )
     conn.execute(
         "ALTER TABLE pdm_signatures ADD COLUMN IF NOT EXISTS t_event_at TEXT"
+    )
+    conn.execute(
+        "ALTER TABLE pdm_signatures ADD COLUMN IF NOT EXISTS "
+        "validation_status TEXT NOT NULL DEFAULT 'UNVALIDATED'"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pdm_user_active_pressure "
@@ -266,11 +279,51 @@ def apply_postgres_migrations(conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_pdm_user_carried "
         f'ON pdm_signatures ("user", {CARRIED_SQL})'
     )
+    _create_link_table(conn, user_col='"user"', real="DOUBLE PRECISION")
 
 
 # The old decay() deleted below P × V × fade × 0.80 < 30, i.e. weight < 37.5;
 # weight only falls with disuse, so a deleted row at or over this was a caller's.
 OLD_DECAY_REACH: float = DEFAULT_MIN_P / 0.80
+
+
+def _create_link_table(conn: Any, *, user_col: str, real: str) -> None:
+    """``pdm_links`` (PDM v1.9 change 7): read both ways by index."""
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS pdm_links ({user_col} TEXT NOT NULL, "
+        "pressure_id TEXT NOT NULL, neighbor_id TEXT NOT NULL, kind TEXT NOT NULL, "
+        f"status_at_write TEXT NOT NULL, v_at_write {real} NOT NULL, "
+        "written_at TEXT NOT NULL, PRIMARY KEY (pressure_id, neighbor_id, kind))"
+    )
+    conn.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_pdm_links_out ON pdm_links ({user_col}, pressure_id)"
+    )
+    conn.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_pdm_links_in ON pdm_links ({user_col}, neighbor_id)"
+    )
+
+
+def link_insert_row(user: str, link: LinkRow) -> tuple[Any, ...]:
+    return (
+        user,
+        link.pressure_id,
+        link.neighbor_id,
+        link.kind,
+        link.status_at_write,
+        link.v_at_write,
+        link.written_at.isoformat(),
+    )
+
+
+def mapping_to_link(row: Mapping[str, Any]) -> LinkRow:
+    return LinkRow(
+        pressure_id=row["pressure_id"],
+        neighbor_id=row["neighbor_id"],
+        kind=row["kind"],
+        status_at_write=row["status_at_write"],
+        v_at_write=float(row["v_at_write"]),
+        written_at=parse_dt(row["written_at"]) or datetime.now(tz=timezone.utc),
+    )
 
 
 def restore_silent(conn: Any, *, dialect: str) -> tuple[int, int]:
@@ -405,6 +458,7 @@ def signature_insert_row(sig: SignatureRecord, *, store_raw: bool) -> tuple[Any,
         json.dumps(sig.metadata),
         1 if getattr(sig, "is_deleted", False) else 0,
         getattr(sig, "idempotency_key", None),
+        sig.validation_status,
     )
 
 
@@ -444,4 +498,5 @@ def mapping_to_record(row: Mapping[str, Any]) -> SignatureRecord:
         metadata=json.loads(col("metadata") or "{}"),
         is_deleted=bool(col("is_deleted", 0)),
         idempotency_key=col("idempotency_key"),
+        validation_status=col("validation_status") or "UNVALIDATED",
     )
