@@ -580,8 +580,78 @@ history = ContractHistory.from_json(saved)
 No PDM store, account or network is needed. Prices and costs are `Decimal` and
 are serialized as text; every datetime must be timezone-aware. Owner approval
 is cooperative: the SDK checks that the approval names the contract's owner,
-and the host decides whether a person really gave it. The controller that moves
-a job through its states ships separately.
+and the host decides whether a person really gave it.
+
+### Goal Loop preview: the controller
+
+`GoalLoopController` carries one contract from `drafted` to a final state:
+
+```
+drafted -> approved -> armed -> waiting -> triggered -> guard_checked
+        -> acting -> verifying -> complete
+```
+
+with side paths `retrying`, `escalated`, `out_of_budget`, `conflict`, `cancelled`
+and `impossible`. It has no threads and no timers. Your host hands it readings
+with `observe()` and calls `tick()` now and then; between those calls nothing
+runs and nothing is spent.
+
+- **One crossing, one action.** A threshold trigger fires when the value crosses
+  `fire_at` and re-arms only after it drops below `reset_at` (the first reading
+  never fires). Each firing has a fixed `action_id`, which is also the
+  executor's idempotency key, and a repeated `observation_id` is ignored.
+- **Guard before every step.** `DefaultGuard` denies any operation not listed in
+  `autonomy.allowed`, then runs `verify()` against `never`. Pass only rules
+  that forbid things; limits the controller enforces itself belong in the
+  trigger and budget.
+- **A checker proves the result.** An executor's return is not proof. The job
+  reaches `complete` only when the checker returns a `ProofReceipt` from the
+  contract's proof source; `PROVEN` without one is recorded and ignored.
+- **Honest endings.** Budget (`max_actions`, `max_attempts`, `max_cost`,
+  `deadline`) ends a job in `out_of_budget` with the reason. A step that may
+  have run is never repeated on its own: the job escalates, and the owner
+  settles it with `submit_evidence()` (it did arrive) or `resolve(..., "retry")`.
+- **Every move leaves a receipt**, chained by hash; `verify_receipts()` checks it.
+
+```python
+from pdm_memory.goal_loop import (
+    ActionResult, CallableChecker, GoalLoopController, Observation, OwnerApproval,
+    ProofReceipt, ProofVerdict, SqliteJobStore, StepTemplate,
+)
+
+def send_sms(step, *, idempotency_key):                    # your hands
+    ...
+    return ActionResult(reference="msg-1")
+
+def delivered(contract, step, result, evidence, now):      # your proof of the result
+    return ProofVerdict("PROVEN", "delivered",
+                        ProofReceipt("sms_delivery_receipt", "dlr-1", now))
+
+controller = GoalLoopController(
+    store=SqliteJobStore("jobs.db"),                       # omit for an in-memory store
+    checkers={"sms_delivery_receipt": CallableChecker("sms_delivery_receipt", delivered)},
+    executors={"sms.send": send_sms},
+)
+job_id = controller.create(history, step=StepTemplate("sms.send", "+15550100",
+                           "Send SMS to owner: {metric} crossed {fire_at}"))
+controller.approve(job_id, OwnerApproval("eric"))
+controller.arm(job_id)                                     # needs a proof source and a checker
+controller.observe(job_id, Observation(observation_id="t1", observed_at=now,
+                                       metric="MU.price", value="40.12"))
+controller.tick()                                          # retries, deadlines, stuck steps
+```
+
+Run `python -m pdm_memory.examples.goal_loop_watch_price` for the full MU
+example. Backends implement `JobStore`; check yours with
+`pdm_memory.goal_loop.testing.run_job_store_contract`. See
+[Goal Loop v1](docs/GOAL_LOOP_V1.md) for the state table, escalation kinds and
+the store contract.
+
+The controller is cooperative, like the Boundary Lock preview: it cannot stop an
+executor that bypasses it or a caller that edits the store, and the guard,
+checker and executor run on your thread. Version 1 runs one action at a time per
+job; an event that arrives mid-action is recorded as `fire_suppressed_busy` for
+the host to replay.
 
 ---
 
@@ -803,9 +873,9 @@ Store-free Goal-Anchor Alignment. Pass a proposed action and one or more rule st
 
 Use `report.is_safe_to_act` (True only when `status == "ALIGNED"`) before triggering ACT.
 
-### `GoalContract` and `ContractHistory` (preview)
+### `GoalContract`, `ContractHistory` and `GoalLoopController` (preview)
 
-Store-free record of one Goal Loop job. See [Goal Loop preview](#goal-loop-preview-the-goal-contract).
+Store-free record of one Goal Loop job. See [Goal Loop preview](#goal-loop-preview-the-goal-contract) and [the controller](#goal-loop-preview-the-controller).
 
 | Name | Description |
 |------|-------------|
@@ -816,6 +886,14 @@ Store-free record of one Goal Loop job. See [Goal Loop preview](#goal-loop-previ
 | `history.to_json()` / `ContractHistory.from_json(text)` | Canonical JSON; loading checks the version chain and approvals |
 | `ensure_armable(contract)` | Raises `NotArmableError` when no proof source is named |
 | `PROMISE_FIELDS` | `outcome`, `proof`, `never`, `autonomy`, `budget`, `sacrifice_order` |
+| `GoalLoopController(*, checkers, executors, store=None, guard=None, clock, retry_base, retry_cap, proof_timeout, action_timeout, default_max_attempts)` | Moves jobs through their states |
+| `create(history, *, step)` → job id; `approve`, `arm` | `drafted` to `approved` to `waiting` |
+| `observe(job_id, Observation)` → `Job` | A reading or event; fires at most once per crossing |
+| `tick(now=None)` → `list[Job]` | Retries, deadlines, lost steps, proof timeouts |
+| `submit_evidence(job_id, action_id, evidence)` | Proof from outside; also settles an escalated step |
+| `resolve(job_id, approval, *, decision)` | Owner answers an escalation: `proceed`, `skip` or `retry` |
+| `revise_contract(job_id, *, approval=None, **changes)` | New contract version while no step is in flight |
+| `cancel(job_id, reason)`, `job()`, `receipts()`, `verify_receipts()` | Stop, read back, check the chain |
 
 ### `Memory(store, *, user, token, refresh_token, cloud_url, store_raw)`
 
