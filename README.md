@@ -84,7 +84,7 @@ result = mem.apply_contrary_evidence(
     "User prefers imperial units",
     evidence_tags=["units", "formatting", "preferences"],
 )
-print(result.p_before, "→", result.p_after)
+print(result.v_before, "→", result.v_after)  # P stays; V falls
 
 # Inspect why a memory surfaced.
 report = mem.explain(hits[0].id, query="how should I format the answer?")
@@ -108,10 +108,13 @@ time while its budget lasts, and flags what it returns:
 from datetime import datetime, timedelta, timezone
 from pdm_memory import Claim
 
-sensor = mem.save("North flare sensor read 9 bar", tags=["north", "flare", "sensor"])
+# Weight = P × V × fade; with no verdicts V = 0.5, so P 80 weighs 40 (gate: 30).
+sensor = mem.save("North flare sensor read 9 bar", tags=["north", "flare", "sensor"],
+                  p_magnitude=80)
 claim = mem.save(
     "North flare igniter fails by Friday",
     tags=["north", "flare", "igniter"],
+    p_magnitude=80,
     rests_on=[sensor],  # support: a correction to the sensor re-opens this
     claim=Claim("occurs", datetime.now(timezone.utc) + timedelta(days=4),
                 outcome_source="failure-feed"),
@@ -132,7 +135,8 @@ quiet = mem.search("north flare", min_p_lowered=12)
 
 mem.touch([h.id for h in result.hits])  # what you used
 mem.penalize(sensor)  # the sensor was stuck: returns the ids it re-opened
-mem.report_coverage_gap("failure-feed", gap_from, gap_to)  # a feed that was down
+now = datetime.now(timezone.utc)
+mem.report_coverage_gap("failure-feed", now - timedelta(hours=6), now)  # a feed that was down
 ```
 
 `action_status` is `UNVALIDATED` when the hit stands alone (`STANDALONE`), when
