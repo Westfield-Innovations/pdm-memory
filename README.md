@@ -729,6 +729,38 @@ Opens `http://localhost:8080` with a D3 force graph:
 
 API endpoints used by the UI: `GET /api/v1/memory-map`, `GET /api/v1/torsion`.
 
+### Use it as a connector (Claude and other MCP assistants)
+
+The connector gives your PDM to the chat assistant you already use, with no code. The assistant recalls before it answers and saves what lands.
+
+```bash
+pip install "pdm-memory[connector]"
+```
+
+Add it to a desktop app that speaks MCP (for example, the `mcpServers` section of Claude Desktop's config):
+
+```json
+{
+  "mcpServers": {
+    "pdm": {
+      "command": "pdm-memory-connector",
+      "env": { "PDM_STORE": "/path/to/my_pdm.db", "PDM_USER": "me" }
+    }
+  }
+}
+```
+
+For the cloud store use `"PDM_STORE": "cloud"` and add `"PDM_TOKEN"`. The token lives only in this config on your machine and never passes through a chat.
+
+Four tools:
+
+- `pdm_recall` — the memories that resonate with a query. A lookup is not a use: recall through the connector does not reinforce the memories it returns.
+- `pdm_save` — one durable memory, with a drawer, tags and a pressure. Saved memories carry the source label `connector` (`PDM_CONNECTOR_SOURCE` to change it).
+- `pdm_drawers` — the drawers with their counts and average pressure.
+- `pdm_explain` — why one memory holds the pressure it holds.
+
+It runs over stdio by default. `PDM_CONNECTOR_TRANSPORT=streamable-http` serves it at an address instead. `python -m pdm_memory.connector` works too.
+
 ---
 
 ## 📖 API Reference

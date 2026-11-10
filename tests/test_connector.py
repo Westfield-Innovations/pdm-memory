@@ -2,6 +2,9 @@
 
 import asyncio
 import json
+import os
+import sys
+from importlib.metadata import entry_points, requires
 
 import pytest
 
@@ -159,3 +162,37 @@ def test_build_server_from_env(tmp_path, monkeypatch):
     monkeypatch.setenv("PDM_USER", "owner")
     result = call(build_server(), "pdm_drawers")
     assert not result.is_error
+
+
+def test_main_without_mcp_prints_install_hint(monkeypatch, capsys):
+    from pdm_memory.connector import server
+
+    for module in ("mcp", "mcp.server", "mcp.server.mcpserver", "mcp.server.fastmcp"):
+        monkeypatch.setitem(sys.modules, module, None)
+    with pytest.raises(SystemExit) as stopped:
+        server.main()
+    assert stopped.value.code == 1
+    assert 'pip install "pdm-memory[connector]"' in capsys.readouterr().err
+
+
+def test_console_script_is_declared():
+    scripts = {e.name: e.value for e in entry_points(group="console_scripts")}
+    assert scripts.get("pdm-memory-connector") == "pdm_memory.connector:main"
+    needs = [r.replace(" ", "") for r in requires("pdm-memory") or []]
+    assert 'mcp>=1.8;extra=="connector"' in needs
+
+
+def test_stdio_subprocess_lists_tools(tmp_path):
+    from mcp.client.stdio import StdioServerParameters
+
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "pdm_memory.connector"],
+        env={**os.environ, "PDM_STORE": str(tmp_path / "s.db"), "PDM_USER": "owner"},
+    )
+
+    async def go():
+        async with Client(params) as client:
+            return {t.name for t in (await client.list_tools()).tools}
+
+    assert asyncio.run(asyncio.wait_for(go(), 60)) == TOOLS
