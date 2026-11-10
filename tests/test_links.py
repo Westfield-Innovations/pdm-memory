@@ -123,3 +123,14 @@ def test_contrary_evidence_on_a_validated_row_reopens(mem):
     mem.reinforce(a)
     mem.apply_contrary_evidence(a, "User lives in Kyiv", evidence_tags=["x", "y", "z"])
     assert _status(mem, b) == "REOPENED"
+
+
+def test_the_status_survives_a_json_round_trip(mem, tmp_path):
+    a = _save(mem, "validated fact")
+    mem.reinforce(a)
+    path = tmp_path / "export.json"
+    mem.export_json(path)
+    with Memory(store=str(tmp_path / "copy.db"), user=USER) as copy:
+        copy.import_json(path)
+        (rec,) = copy._storage.list(user=USER)
+        assert rec.validation_status == "VALIDATED"
