@@ -53,6 +53,7 @@ dev = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
     "psycopg[binary]>=3.1",   # the Postgres suite is skipped without it
+    "mcp>=1.8",               # the connector suite is skipped without it
 ]
 
 [project.scripts]
