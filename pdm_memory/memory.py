@@ -62,10 +62,14 @@ from pdm_memory.core.math import (
 )
 from pdm_memory.core.retrieval import DEFAULT_DIVERSITY_BIAS, RetrievalEngine
 from pdm_memory.core.signature import (
+    REOPENED,
+    UNVALIDATED,
+    VALIDATED,
     ContraryEvidenceResult,
     DecaySnapshot,
     DrawerInfo,
     ExplainReport,
+    LinkRow,
     MemoryHit,
     SignatureRecord,
 )
@@ -92,6 +96,9 @@ from pdm_memory.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+# How many of the rows one touch used get coaccess links: the best-matching.
+COACCESS_PER_TOUCH = 5
 
 
 class Memory:
@@ -252,6 +259,7 @@ class Memory:
         dedupe: bool = True,
         dedupe_reinforce: bool = False,
         idempotency_key: str | None = None,
+        rests_on: Sequence[str] | None = None,
     ) -> str:
         """
         Store a new memory.
@@ -281,6 +289,9 @@ class Memory:
             dedupe:         If True, return existing ID when fact hash already stored.
             dedupe_reinforce: When dedupe hits, touch() the existing memory (a use, not a grade).
             idempotency_key:  If set, repeated saves with the same key return the existing ID.
+            rests_on:       Ids this memory rests on: support links (PDM v1.9 change 7).
+                            A correction to one re-opens this memory. Unknown ids and
+                            the memory itself are skipped; ignored on a dedupe hit.
 
         Returns:
             The new memory ID (UUID string), or existing ID if dedupe matched.
@@ -325,6 +336,8 @@ class Memory:
         )
         sig = self._run_pre_save_hooks(sig)
         memory_id = self._storage.save(sig)
+        if rests_on:
+            self._write_support(memory_id, rests_on)
         self._run_post_save_hooks(sig, memory_id)
         logger.debug("[PDM] save() → %s (P=%.1f)", memory_id, p_magnitude)
         return memory_id
@@ -843,15 +856,77 @@ class Memory:
         """Record that the caller used *ids*: resets their disuse clock. Returns how many.
 
         The only writer of ``last_retrieved`` and ``retrieval_count`` (PDM v1.9
-        change 3). Never a grade: P and V stay where they are.
+        change 3). Never a grade: P and V stay where they are. Rows used together
+        are linked as coaccess, the ``COACCESS_PER_TOUCH`` best by *match_scores*
+        (else in the order given).
         """
         now = datetime.now(tz=timezone.utc)
+        unique = list(dict.fromkeys(str(i) for i in ids if i))
         touched = 0
-        for memory_id in dict.fromkeys(str(i) for i in ids if i):
+        for memory_id in unique:
             touched += self._storage.increment(
                 memory_id, self._user, {"retrieval_count": 1}, last_retrieved=now
             )
+        if len(unique) > 1:
+            # Links are a side effect of the caller's use: log, never raise into it.
+            try:
+                self._write_coaccess(unique, match_scores or {}, now)
+            except Exception as exc:
+                logger.warning("[PDM] touch: coaccess links not written: %s", exc)
         return touched
+
+    def root_count(self, memory_id: str) -> int:
+        """How many memories rest directly on *memory_id*: a correction's first ring."""
+        return len(self._storage.links(self._user, [memory_id], side="in", kind="support"))
+
+    def _write_support(self, memory_id: str, rests_on: Sequence[str]) -> int:
+        ids = [i for i in dict.fromkeys(str(x) for x in rests_on if x) if i != memory_id]
+        supports = self._storage.get_many(ids, user=self._user)
+        now = datetime.now(tz=timezone.utc)
+        return self._storage.write_links(
+            self._user,
+            [_link(memory_id, rec, "support", now) for _, rec in sorted(supports.items())],
+        )
+
+    def _write_coaccess(
+        self, ids: builtins.list[str], match_scores: dict[str, float], now: datetime
+    ) -> int:
+        order = {mid: i for i, mid in enumerate(ids)}
+        top = sorted(ids, key=lambda i: (-float(match_scores.get(i, 0.0)), order[i]))
+        used = self._storage.get_many(top[:COACCESS_PER_TOUCH], user=self._user)
+        return self._storage.write_links(
+            self._user,
+            [
+                _link(a, b, "coaccess", now)
+                for a in used
+                for b in used.values()
+                if b.id != a
+            ],
+        )
+
+    def _reopen_dependents(self, memory_id: str) -> set[str]:
+        """Mark REOPENED everything resting on *memory_id* along support, however far up."""
+        seen: set[str] = set()
+        frontier = {memory_id}
+        try:
+            while frontier:
+                ring = {
+                    link.pressure_id
+                    for link in self._storage.links(
+                        self._user, sorted(frontier), side="in", kind="support"
+                    )
+                }
+                frontier = ring - seen
+                seen |= ring
+        except NotImplementedError:
+            return set()  # a store without links has nothing resting on anything
+        affected = seen - {memory_id}
+        if affected:
+            self._storage.update_batch(
+                [(mid, {"validation_status": REOPENED}) for mid in sorted(affected)],
+                user=self._user,
+            )
+        return affected
 
     def reinforce(self, memory_id: str, coupling_score: float = 0.5) -> set[str]:
         """
@@ -868,6 +943,7 @@ class Memory:
             memory_id,
             self._user,
             {"validation_prediction_total": 1, "validation_prediction_correct": 1},
+            validation_status=VALIDATED,
         )
         if not found:
             raise ValueError(f"Memory '{memory_id}' not found for user '{self._user}'")
@@ -878,15 +954,15 @@ class Memory:
         Validate a memory's prediction as wrong: ``total + 1``, ``correct`` unchanged.
 
         V falls, so the weight falls; P and the disuse clock do not move (PDM
-        v1.9 change 3). ``coupling_score`` is accepted and ignored. Returns the
-        ids a correction re-opened.
+        v1.9 change 3). On a VALIDATED memory this is a correction: it leaves
+        VALIDATED and everything resting on it is REOPENED (change 8).
+        ``coupling_score`` is accepted and ignored. Returns the re-opened ids.
         """
         rec = self._storage.get(memory_id, user=self._user)
         if rec is None:
             logger.warning("[PDM] penalize(%s): not found", memory_id)
             return set()
-        self._apply_prediction_miss(rec)
-        return set()
+        return self._apply_prediction_miss(rec)[1]
 
     def apply_contrary_evidence(
         self,
@@ -968,7 +1044,7 @@ class Memory:
                 dedupe=False,
             )
 
-        updated = self._apply_prediction_miss(rec)
+        updated, _ = self._apply_prediction_miss(rec)
         v_after = calculate_v(
             updated.validation_prediction_correct,
             updated.validation_prediction_total,
@@ -998,14 +1074,19 @@ class Memory:
             validation_prediction_correct=correct_before,
         )
 
-    def _apply_prediction_miss(self, rec: SignatureRecord) -> SignatureRecord:
-        """Record a wrong prediction: ``total + 1``. P, text and clock stay."""
-        self._storage.increment(rec.id, self._user, {"validation_prediction_total": 1})
+    def _apply_prediction_miss(
+        self, rec: SignatureRecord
+    ) -> tuple[SignatureRecord, set[str]]:
+        """Record a wrong prediction: ``total + 1``, re-opening on a correction. P, text, clock stay."""
+        corrected = rec.validation_status == VALIDATED
+        fields = {"validation_status": UNVALIDATED} if corrected else {}
+        self._storage.increment(rec.id, self._user, {"validation_prediction_total": 1}, **fields)
+        reopened = self._reopen_dependents(rec.id) if corrected else set()
         updated = self._storage.get(rec.id, user=self._user)
         if updated is None:
             rec.validation_prediction_total = (rec.validation_prediction_total or 0) + 1
-            return rec
-        return updated
+            return rec, reopened
+        return updated, reopened
 
     @staticmethod
     def _normalize_contrary_evidence(
@@ -2268,6 +2349,19 @@ class Memory:
                         logger.warning("[PDM] torsion V penalty failed for %s: %s", res.id, res.error)
             except Exception as e:
                 logger.warning("[PDM] torsion V penalty batch failed: %s", e)
+
+
+def _link(pressure_id: str, neighbor: SignatureRecord, kind: str, now: datetime) -> LinkRow:
+    return LinkRow(
+        pressure_id=pressure_id,
+        neighbor_id=neighbor.id,
+        kind=kind,
+        status_at_write=neighbor.validation_status,
+        v_at_write=calculate_v(
+            neighbor.validation_prediction_correct, neighbor.validation_prediction_total
+        ),
+        written_at=now,
+    )
 
 
 def _warn_reinforce(where: str) -> None:
