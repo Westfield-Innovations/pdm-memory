@@ -45,6 +45,7 @@ from typing import Any, Mapping
 
 from typing_extensions import Self
 
+from pdm_memory.claims import Claim
 from pdm_memory.core.alignment import verify_records
 from pdm_memory.core.math import (
     DEFAULT_MIN_P,
@@ -260,6 +261,7 @@ class Memory:
         dedupe_reinforce: bool = False,
         idempotency_key: str | None = None,
         rests_on: Sequence[str] | None = None,
+        claim: Claim | None = None,
     ) -> str:
         """
         Store a new memory.
@@ -292,6 +294,9 @@ class Memory:
             rests_on:       Ids this memory rests on: support links (PDM v1.9 change 7).
                             A correction to one re-opens this memory. Unknown ids and
                             the memory itself are skipped; ignored on a dedupe hit.
+            claim:          A prediction on this memory: direction, due, bound source
+                            (PDM v1.9 change 4). A claim is never deduped: each is its
+                            own prediction.
 
         Returns:
             The new memory ID (UUID string), or existing ID if dedupe matched.
@@ -300,6 +305,8 @@ class Memory:
             raise ValueError("Memory text cannot be empty.")
 
         text = text.strip()[:500]
+        if claim is not None:
+            dedupe = False
 
         if idempotency_key:
             key = idempotency_key.strip()
@@ -334,6 +341,11 @@ class Memory:
             shape=shape,
             idempotency_key=idempotency_key,
         )
+        if claim is not None:
+            sig.direction = claim.direction
+            sig.due = claim.due
+            sig.outcome_source = (claim.outcome_source or "").strip()
+            sig.watch_window = claim.watch_window_days
         sig = self._run_pre_save_hooks(sig)
         memory_id = self._storage.save(sig)
         if rests_on:
@@ -927,6 +939,24 @@ class Memory:
                 user=self._user,
             )
         return affected
+
+    def report_coverage_gap(self, source: str, gap_from: datetime, gap_to: datetime) -> int:
+        """
+        Record that *source* did not report from *gap_from* to *gap_to* (PDM v1.9 change 4).
+
+        A claim bound to *source* whose interval the gap touches is never settled
+        by a missing report. Returns how many verdicts the gap amended (none
+        until settlement is built).
+        """
+        source = (source or "").strip()
+        if not source:
+            raise ValueError("A coverage gap names its source.")
+        if gap_from.tzinfo is None or gap_to.tzinfo is None:
+            raise ValueError("A coverage gap's bounds must be timezone-aware.")
+        if gap_to <= gap_from:
+            raise ValueError("A coverage gap ends after it starts.")
+        self._storage.save_coverage_gap(self._user, source, gap_from, gap_to)
+        return 0
 
     def reinforce(self, memory_id: str, coupling_score: float = 0.5) -> set[str]:
         """
@@ -2207,7 +2237,7 @@ class Memory:
             return []
 
         page_size = max(1, min(page_size, candidate_limit))
-        query_tokens = RetrievalEngine._tokenize_query(query) if query else []
+        query_tokens = RetrievalEngine._cue_words(query) if query else []
 
         def _paginate(tag_any: builtins.list[str] | None) -> builtins.list[SignatureRecord]:
             records: list[SignatureRecord] = []

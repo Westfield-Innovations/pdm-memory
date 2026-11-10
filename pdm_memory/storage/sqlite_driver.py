@@ -39,12 +39,15 @@ from pdm_memory.storage.schema import (
     CARRIED_SQL,
     SCHEMA_SQLITE,
     apply_sqlite_migrations,
+    claim_insert_values,
     increment_set_clause,
     link_insert_row,
     mapping_to_link,
     mapping_to_record,
     prepare_update_fields,
     signature_insert_row,
+    tag_words,
+    write_tags,
 )
 
 logger = logging.getLogger(__name__)
@@ -58,7 +61,8 @@ INSERT OR IGNORE INTO pdm_signatures (
     retrieval_count, last_retrieved, created_at,
     validation_prediction_total, validation_prediction_correct,
     decay_rate, t_deadline, t_event_at, urgency_rate, metadata,
-    is_deleted, idempotency_key, validation_status
+    is_deleted, idempotency_key, validation_status,
+    direction, outcome_source, due, watch_window, outcome, verdict, event_time, report_time
 ) VALUES (
     ?, ?, ?, ?, ?,
     ?, ?, ?, ?,
@@ -66,7 +70,8 @@ INSERT OR IGNORE INTO pdm_signatures (
     ?, ?, ?,
     ?, ?,
     ?, ?, ?, ?, ?,
-    ?, ?, ?
+    ?, ?, ?,
+    ?, ?, ?, ?, ?, ?, ?, ?
 )
 """
 
@@ -79,7 +84,8 @@ INSERT INTO pdm_signatures (
     retrieval_count, last_retrieved, created_at,
     validation_prediction_total, validation_prediction_correct,
     decay_rate, t_deadline, t_event_at, urgency_rate, metadata,
-    is_deleted, idempotency_key, validation_status
+    is_deleted, idempotency_key, validation_status,
+    direction, outcome_source, due, watch_window, outcome, verdict, event_time, report_time
 ) VALUES (
     ?, ?, ?, ?, ?,
     ?, ?, ?, ?,
@@ -87,7 +93,8 @@ INSERT INTO pdm_signatures (
     ?, ?, ?,
     ?, ?,
     ?, ?, ?, ?, ?,
-    ?, ?, ?
+    ?, ?, ?,
+    ?, ?, ?, ?, ?, ?, ?, ?
 ) ON CONFLICT(id) DO NOTHING
 """
 
@@ -221,7 +228,8 @@ class SQLiteDriver(BaseStorage):
                 retrieval_count, last_retrieved, created_at,
                 validation_prediction_total, validation_prediction_correct,
                 decay_rate, t_deadline, t_event_at, urgency_rate, metadata,
-                is_deleted, idempotency_key, validation_status
+                is_deleted, idempotency_key, validation_status,
+                direction, outcome_source, due, watch_window, outcome, verdict, event_time, report_time
             ) VALUES (
                 ?, ?, ?, ?, ?,
                 ?, ?, ?, ?,
@@ -229,7 +237,8 @@ class SQLiteDriver(BaseStorage):
                 ?, ?, ?,
                 ?, ?,
                 ?, ?, ?, ?, ?,
-                ?, ?, ?
+                ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?
             )
             """,
             (
@@ -259,8 +268,10 @@ class SQLiteDriver(BaseStorage):
                 1 if sig.is_deleted else 0,
                 sig.idempotency_key,
                 sig.validation_status,
+                *claim_insert_values(sig),
             ),
         )
+        write_tags(conn, [(sig.user, sig.id, sig.intent_tags)], dialect="sqlite")
         # Upsert drawer record
         conn.execute(
             "INSERT OR IGNORE INTO pdm_drawers (domain, user, description) VALUES (?, ?, ?)",
@@ -357,6 +368,11 @@ class SQLiteDriver(BaseStorage):
                         [sig.id for _, sig in to_insert],
                     )
 
+                write_tags(
+                    conn,
+                    [(sig.user, sig.id, sig.intent_tags) for _, sig in to_insert],
+                    dialect="sqlite",
+                )
                 for idx, sig in to_insert:
                     results[idx] = SaveBatchResult(index=idx, id=sig.id)
                     drawer_key = (sig.drawer_domain, sig.user)
@@ -497,6 +513,8 @@ class SQLiteDriver(BaseStorage):
             f"UPDATE pdm_signatures SET {set_clause} WHERE id = ? AND user = ?",
             values,
         )
+        if cur.rowcount and "intent_tags" in fields:
+            write_tags(self._conn(), [(user, memory_id, fields["intent_tags"])], dialect="sqlite")
         self._commit_if_idle(self._conn())
         if cur.rowcount == 0:
             logger.warning(
@@ -604,6 +622,16 @@ class SQLiteDriver(BaseStorage):
                         [mid for mid, _ in confirmed],
                     )
 
+            write_tags(
+                conn,
+                [
+                    (user, mid, fields["intent_tags"])
+                    for i, (mid, fields) in enumerate(updates)
+                    if "intent_tags" in fields and mid in existing_ids and not results[i].error
+                ],
+                dialect="sqlite",
+            )
+
         return results
 
     def delete(self, memory_id: str, user: str = "default") -> None:
@@ -624,6 +652,7 @@ class SQLiteDriver(BaseStorage):
             "DELETE FROM pdm_links WHERE user = ? AND (pressure_id = ? OR neighbor_id = ?)",
             (user, memory_id, memory_id),
         )
+        conn.execute("DELETE FROM pdm_tags WHERE pressure_id = ? AND user = ?", (memory_id, user))
         self._commit_if_idle(conn)
 
     def list(
@@ -647,14 +676,13 @@ class SQLiteDriver(BaseStorage):
         if drawer:
             where.append("drawer_domain = ?")
             params.append(drawer)
-        tags = [t.strip().lower() for t in (tag_any or ()) if t and str(t).strip()]
+        tags = tag_words(tag_any)[:32]
         if tags:
-            # intent_tags stored as JSON array text — substring match on quoted token.
-            tag_clauses: list[str] = []
-            for tag in tags[:32]:
-                tag_clauses.append("LOWER(intent_tags) LIKE ?")
-                params.append(f'%"{tag}"%')
-            where.append("(" + " OR ".join(tag_clauses) + ")")
+            where.append(
+                "id IN (SELECT pressure_id FROM pdm_tags WHERE user = ? "
+                f"AND word IN ({', '.join('?' * len(tags))}))"
+            )
+            params.extend([user, *tags])
         if cursor_id:
             cursor = self._conn().execute(
                 "SELECT p_magnitude FROM pdm_signatures WHERE id = ? AND user = ?",
@@ -706,6 +734,15 @@ class SQLiteDriver(BaseStorage):
                 params.append(kind)
             found += [mapping_to_link(r) for r in self._conn().execute(sql, params)]
         return found
+
+    def save_coverage_gap(
+        self, user: str, source: str, gap_from: datetime, gap_to: datetime
+    ) -> None:
+        self._conn().execute(
+            "INSERT INTO pdm_coverage_gaps (user, source, gap_from, gap_to) VALUES (?, ?, ?, ?)",
+            (user, source, gap_from.isoformat(), gap_to.isoformat()),
+        )
+        self._commit_if_idle(self._conn())
 
     def count_below_carried(self, user: str, theta: float) -> int:
         row = self._conn().execute(

@@ -19,6 +19,7 @@ import logging
 import threading
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Any
 
 from pdm_memory.core.signature import DrawerInfo, LinkRow, SignatureRecord
@@ -33,6 +34,8 @@ from pdm_memory.storage.schema import (
     mapping_to_record,
     prepare_update_fields,
     signature_insert_row,
+    tag_words,
+    write_tags,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,7 +48,8 @@ INSERT INTO pdm_signatures (
     retrieval_count, last_retrieved, created_at,
     validation_prediction_total, validation_prediction_correct,
     decay_rate, t_deadline, t_event_at, urgency_rate, metadata,
-    is_deleted, idempotency_key, validation_status
+    is_deleted, idempotency_key, validation_status,
+    direction, outcome_source, due, watch_window, outcome, verdict, event_time, report_time
 ) VALUES (
     %s, %s, %s, %s, %s,
     %s, %s, %s, %s,
@@ -53,7 +57,8 @@ INSERT INTO pdm_signatures (
     %s, %s, %s,
     %s, %s,
     %s, %s, %s, %s, %s,
-    %s, %s, %s
+    %s, %s, %s,
+    %s, %s, %s, %s, %s, %s, %s, %s
 )
 ON CONFLICT (id) DO NOTHING
 RETURNING id
@@ -142,6 +147,7 @@ class PostgresDriver(BaseStorage):
         row = cur.fetchone() if hasattr(cur, "fetchone") else None
         if not row and hasattr(cur, "rowcount") and cur.rowcount == 0:
             raise ValueError(f"Signature record with id '{sig.id}' already exists")
+        write_tags(conn, [(sig.user, sig.id, sig.intent_tags)], dialect="postgres")
         conn.execute(_INSERT_DRAWER_SQL, (sig.drawer_domain, sig.user, ""))
         self._commit_if_idle(conn)
         logger.debug("[PDM-Postgres] Saved signature %s (P=%.1f)", sig.id, sig.p_magnitude)
@@ -187,6 +193,15 @@ class PostgresDriver(BaseStorage):
                     if not cur.nextset():
                         break
 
+                write_tags(
+                    conn,
+                    [
+                        (sig.user, sig.id, sig.intent_tags)
+                        for (_, sig), row in zip(chunk, rows)
+                        if row is not None
+                    ],
+                    dialect="postgres",
+                )
                 drawer_rows: list[tuple[str, str, str]] = []
                 for (index, sig), row in zip(chunk, rows):
                     if row is not None:
@@ -329,6 +344,8 @@ class PostgresDriver(BaseStorage):
             f'UPDATE pdm_signatures SET {set_clause} WHERE id = %s AND "user" = %s',
             values,
         )
+        if cur.rowcount and "intent_tags" in fields:
+            write_tags(self._conn(), [(user, memory_id, fields["intent_tags"])], dialect="postgres")
         self._commit_if_idle(self._conn())
         if cur.rowcount == 0:
             logger.warning(
@@ -417,6 +434,16 @@ class PostgresDriver(BaseStorage):
                             len(touched), len(chunk), user, list(columns), missing[:20],
                         )
 
+            write_tags(
+                conn,
+                [
+                    (user, mid, fields["intent_tags"])
+                    for i, (mid, fields) in enumerate(updates)
+                    if "intent_tags" in fields and not results[i].error
+                ],
+                dialect="postgres",
+            )
+
         return results
 
     def delete(self, memory_id: str, user: str = "default") -> None:
@@ -437,6 +464,9 @@ class PostgresDriver(BaseStorage):
         conn.execute(
             'DELETE FROM pdm_links WHERE "user" = %s AND (pressure_id = %s OR neighbor_id = %s)',
             (user, memory_id, memory_id),
+        )
+        conn.execute(
+            'DELETE FROM pdm_tags WHERE pressure_id = %s AND "user" = %s', (memory_id, user)
         )
         self._commit_if_idle(conn)
 
@@ -461,13 +491,13 @@ class PostgresDriver(BaseStorage):
         if drawer:
             where.append("drawer_domain = %s")
             params.append(drawer)
-        tags = [t.strip().lower() for t in (tag_any or ()) if t and str(t).strip()]
+        tags = tag_words(tag_any)[:32]
         if tags:
-            tag_clauses: list[str] = []
-            for tag in tags[:32]:
-                tag_clauses.append("LOWER(intent_tags) LIKE %s")
-                params.append(f'%"{tag}"%')
-            where.append("(" + " OR ".join(tag_clauses) + ")")
+            where.append(
+                'id IN (SELECT pressure_id FROM pdm_tags WHERE "user" = %s '
+                "AND word = ANY(%s))"
+            )
+            params.extend([user, tags])
         if cursor_id:
             cursor = self._conn().execute(
                 'SELECT p_magnitude FROM pdm_signatures WHERE id = %s AND "user" = %s',
@@ -518,6 +548,15 @@ class PostgresDriver(BaseStorage):
                 params.append(kind)
             found += [mapping_to_link(r) for r in self._conn().execute(sql, params)]
         return found
+
+    def save_coverage_gap(
+        self, user: str, source: str, gap_from: datetime, gap_to: datetime
+    ) -> None:
+        self._conn().execute(
+            'INSERT INTO pdm_coverage_gaps ("user", source, gap_from, gap_to) VALUES (%s, %s, %s, %s)',
+            (user, source, gap_from.isoformat(), gap_to.isoformat()),
+        )
+        self._commit_if_idle(self._conn())
 
     def count_below_carried(self, user: str, theta: float) -> int:
         row = self._conn().execute(

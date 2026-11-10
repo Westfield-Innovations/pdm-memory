@@ -44,7 +44,27 @@ UPDATABLE_COLUMNS: frozenset[str] = frozenset(
         "is_deleted",
         "idempotency_key",
         "validation_status",
+        "direction",
+        "outcome_source",
+        "due",
+        "watch_window",
+        "outcome",
+        "verdict",
+        "event_time",
+        "report_time",
     }
+)
+
+# The claim on a signature (PDM v1.9 change 4); '' means none. Added by migration.
+CLAIM_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("direction", "TEXT NOT NULL DEFAULT ''"),
+    ("outcome_source", "TEXT NOT NULL DEFAULT ''"),
+    ("due", "TEXT"),
+    ("watch_window", "REAL"),
+    ("outcome", "TEXT NOT NULL DEFAULT ''"),
+    ("verdict", "TEXT NOT NULL DEFAULT ''"),
+    ("event_time", "TEXT"),
+    ("report_time", "TEXT"),
 )
 
 # The carried number (PDM v1.9 change 10): P × V on the 0–100 scale. The fade
@@ -202,6 +222,10 @@ def apply_sqlite_migrations(conn: Any) -> None:
             "ALTER TABLE pdm_signatures ADD COLUMN "
             "validation_status TEXT NOT NULL DEFAULT 'UNVALIDATED'"
         )
+    for name, ddl in CLAIM_COLUMNS:
+        if name not in cols:
+            conn.execute(f"ALTER TABLE pdm_signatures ADD COLUMN {name} {ddl}")
+    _create_claim_tables(conn, user_col="user")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pdm_user_active_pressure "
         "ON pdm_signatures (user, is_deleted, p_magnitude DESC, id DESC)"
@@ -228,6 +252,7 @@ def apply_sqlite_migrations(conn: Any) -> None:
     )
     if upgrading:
         restore_silent(conn, dialect="sqlite")
+    _create_tag_table(conn, dialect="sqlite")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pdm_user_carried "
         f"ON pdm_signatures (user, {CARRIED_SQL})"
@@ -246,6 +271,10 @@ def apply_postgres_migrations(conn: Any) -> None:
     conn.execute(
         "ALTER TABLE pdm_signatures ADD COLUMN IF NOT EXISTS t_event_at TEXT"
     )
+    for name, ddl in CLAIM_COLUMNS:
+        ddl = ddl.replace("REAL", "DOUBLE PRECISION")
+        conn.execute(f"ALTER TABLE pdm_signatures ADD COLUMN IF NOT EXISTS {name} {ddl}")
+    _create_claim_tables(conn, user_col='"user"')
     conn.execute(
         "ALTER TABLE pdm_signatures ADD COLUMN IF NOT EXISTS "
         "validation_status TEXT NOT NULL DEFAULT 'UNVALIDATED'"
@@ -275,6 +304,7 @@ def apply_postgres_migrations(conn: Any) -> None:
     )
     if upgrading:
         restore_silent(conn, dialect="postgres")
+    _create_tag_table(conn, dialect="postgres")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pdm_user_carried "
         f'ON pdm_signatures ("user", {CARRIED_SQL})'
@@ -366,6 +396,22 @@ def restore_silent(conn: Any, *, dialect: str) -> tuple[int, int]:
     return len(quiet), kept
 
 
+def _create_claim_tables(conn: Any, *, user_col: str) -> None:
+    """Open claims by due, and the caller's coverage gaps (PDM v1.9 change 4)."""
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pdm_open_claims "
+        f"ON pdm_signatures ({user_col}, due) WHERE direction != '' AND verdict = ''"
+    )
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS pdm_coverage_gaps ({user_col} TEXT NOT NULL, "
+        "source TEXT NOT NULL, gap_from TEXT NOT NULL, gap_to TEXT NOT NULL)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pdm_coverage_gaps "
+        f"ON pdm_coverage_gaps ({user_col}, source)"
+    )
+
+
 def parse_dt(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -407,11 +453,62 @@ def prepare_update_fields(fields: dict) -> dict:
             "created_at",
             "t_deadline",
             "t_event_at",
+            "due",
+            "event_time",
+            "report_time",
         ) and isinstance(value, datetime):
             prepared[col] = value.isoformat()
         else:
             prepared[col] = value
     return prepared
+
+
+def tag_words(tags: Any) -> list[str]:
+    """The words a signature is found by: its tags, stripped and lower-cased, once each."""
+    return list(dict.fromkeys(w for w in (str(t).strip().lower() for t in tags or ()) if w))
+
+
+def write_tags(conn: Any, rows: Any, *, dialect: str) -> None:
+    """Rewrite the tag rows of each ``(user, pressure_id, tags)`` in *rows* (PDM v1.9 change 11)."""
+    ph, user_col = ("?", "user") if dialect == "sqlite" else ("%s", '"user"')
+    rows = list(rows)
+    if not rows:
+        return
+    cur = conn.cursor()
+    cur.executemany(
+        f"DELETE FROM pdm_tags WHERE pressure_id = {ph}", [(pid,) for _, pid, _ in rows]
+    )
+    words = [(user, w, pid) for user, pid, tags in rows for w in tag_words(tags)]
+    if words:
+        cur.executemany(
+            f"INSERT INTO pdm_tags ({user_col}, word, pressure_id) VALUES ({ph}, {ph}, {ph})",
+            words,
+        )
+
+
+def _create_tag_table(conn: Any, *, dialect: str) -> None:
+    """Create ``pdm_tags`` and, the first time, fill it from every row's ``intent_tags``."""
+    if dialect == "sqlite":
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pdm_tags'"
+        ).fetchone()
+        user_col = "user"
+    else:
+        exists = conn.execute("SELECT to_regclass('pdm_tags') AS t").fetchone()["t"]
+        user_col = '"user"'
+    if exists:
+        return
+    conn.execute(
+        f"CREATE TABLE pdm_tags ({user_col} TEXT NOT NULL, word TEXT NOT NULL, "
+        f"pressure_id TEXT NOT NULL, PRIMARY KEY ({user_col}, word, pressure_id))"
+    )
+    conn.execute("CREATE INDEX idx_pdm_tags_pressure ON pdm_tags (pressure_id)")
+    rows = conn.execute(f"SELECT id, {user_col} AS u, intent_tags FROM pdm_signatures").fetchall()
+    write_tags(
+        conn,
+        ((r["u"], r["id"], json.loads(r["intent_tags"] or "[]")) for r in rows),
+        dialect=dialect,
+    )
 
 
 def increment_set_clause(
@@ -459,6 +556,25 @@ def signature_insert_row(sig: SignatureRecord, *, store_raw: bool) -> tuple[Any,
         1 if getattr(sig, "is_deleted", False) else 0,
         getattr(sig, "idempotency_key", None),
         sig.validation_status,
+        *claim_insert_values(sig),
+    )
+
+
+def claim_insert_values(sig: SignatureRecord) -> tuple[Any, ...]:
+    """The claim columns of *sig*, in :data:`CLAIM_COLUMNS` order."""
+
+    def iso(dt: datetime | None) -> str | None:
+        return dt.isoformat() if dt else None
+
+    return (
+        sig.direction,
+        sig.outcome_source,
+        iso(sig.due),
+        sig.watch_window,
+        sig.outcome,
+        sig.verdict,
+        iso(sig.event_time),
+        iso(sig.report_time),
     )
 
 
@@ -499,4 +615,12 @@ def mapping_to_record(row: Mapping[str, Any]) -> SignatureRecord:
         is_deleted=bool(col("is_deleted", 0)),
         idempotency_key=col("idempotency_key"),
         validation_status=col("validation_status") or "UNVALIDATED",
+        direction=col("direction") or "",
+        outcome_source=col("outcome_source") or "",
+        due=parse_dt(col("due")),
+        watch_window=col("watch_window"),
+        outcome=col("outcome") or "",
+        verdict=col("verdict") or "",
+        event_time=parse_dt(col("event_time")),
+        report_time=parse_dt(col("report_time")),
     )
