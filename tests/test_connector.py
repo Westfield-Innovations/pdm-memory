@@ -8,9 +8,8 @@ from importlib.metadata import entry_points, requires
 
 import pytest
 
-pytest.importorskip("mcp")
-
-from mcp.client.client import Client
+# The client these tests drive the server with is MCP 2.x; 1.x is checked by hand.
+Client = pytest.importorskip("mcp.client.client").Client
 
 from pdm_memory import Memory
 from pdm_memory.connector import build_server
