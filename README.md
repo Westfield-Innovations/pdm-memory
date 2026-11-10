@@ -526,6 +526,63 @@ for the theme, lifecycle and integration responsibilities. The OpenClaw plugin
 also now defaults to blocking when its checker cannot complete; see its
 [configuration and migration notes](plugins/openclaw/README.md).
 
+### Goal Loop preview: the Goal Contract
+
+A Goal Loop job is written down once, as one `GoalContract` record that every
+part of the loop reads: what should be true when it is done (`outcome`), the
+measurement that proves it (`proof`), what must never happen (`never`), what to
+protect if possible (`preferences`), what is cheap to give up
+(`sacrifice_order`), what wakes it up (`trigger`), what it may do without asking
+(`autonomy`), how much it may spend (`budget`), who gets told (`notify`) and how
+it can end (`end`).
+
+The system may rewrite the plan. It may not rewrite the promise. A contract is
+frozen, and every change goes through `ContractHistory.revise()`, which writes a
+new dated version and keeps the earlier ones on record:
+
+- `outcome`, `proof`, `never`, `autonomy`, `budget` and `sacrifice_order` are
+  the promise. Changing any of them without an `OwnerApproval` from the
+  contract's owner raises `PromiseChangeError`.
+- `preferences`, `trigger`, `notify` and `end` are the plan. Changing them needs
+  no approval but still creates a new version.
+- A contract with no named proof source cannot be armed: `ensure_armable()`
+  raises `NotArmableError`.
+
+```python
+from datetime import datetime, timezone
+
+from pdm_memory.goal_loop import (
+    Autonomy, Budget, ContractHistory, GoalContract, OwnerApproval, Trigger, ensure_armable,
+)
+
+contract = GoalContract(
+    contract_id="watch-mu",
+    owner="eric",
+    outcome="Eric gets a text when MU crosses $40 from below",
+    proof="sms_delivery_receipt",
+    never=["Never trade MU shares"],
+    trigger=Trigger(kind="threshold", metric="MU.price", direction="rising",
+                    fire_at="40.00", reset_at="39.50"),
+    autonomy=Autonomy(allowed=["sms.send"]),
+    budget=Budget(deadline=datetime(2026, 9, 30, tzinfo=timezone.utc)),
+)
+ensure_armable(contract)
+
+history = ContractHistory(contract)
+history.revise(outcome="Eric gets a text at $45")                 # PromiseChangeError
+history.revise(approval=OwnerApproval("eric", "new line"),
+               outcome="Eric gets a text at $45")                 # version 2, version 1 kept
+
+saved = history.to_json()                                         # store it anywhere
+history = ContractHistory.from_json(saved)
+```
+
+No PDM store, account or network is needed. Prices and costs are `Decimal` and
+are serialized as text; every datetime must be timezone-aware. Owner approval
+is cooperative: the SDK checks that the approval names the contract's owner,
+and the host decides whether a person really gave it. The controller that moves
+a job through its states ships separately.
+
 ---
 
 ## 📥 Data Ingestion
@@ -745,6 +802,20 @@ Store-free Goal-Anchor Alignment. Pass a proposed action and one or more rule st
 | `conflict_threshold` | Soft-mismatch floor for `CONFLICT` (default `0.40`) |
 
 Use `report.is_safe_to_act` (True only when `status == "ALIGNED"`) before triggering ACT.
+
+### `GoalContract` and `ContractHistory` (preview)
+
+Store-free record of one Goal Loop job. See [Goal Loop preview](#goal-loop-preview-the-goal-contract).
+
+| Name | Description |
+|------|-------------|
+| `GoalContract(contract_id, owner, outcome, trigger, proof, never, preferences, sacrifice_order, autonomy, budget, notify, end)` | Frozen record; `proof` may be a `Proof` or a source name |
+| `ContractHistory(first)` | All versions of one contract, starting at version 1 |
+| `history.revise(*, approval=None, reason="", now=None, **changes)` → `GoalContract` | Writes version N+1; promise changes need `OwnerApproval` from the owner |
+| `history.current`, `history.versions()`, `history.version(n)` | Read versions; earlier versions never change |
+| `history.to_json()` / `ContractHistory.from_json(text)` | Canonical JSON; loading checks the version chain and approvals |
+| `ensure_armable(contract)` | Raises `NotArmableError` when no proof source is named |
+| `PROMISE_FIELDS` | `outcome`, `proof`, `never`, `autonomy`, `budget`, `sacrifice_order` |
 
 ### `Memory(store, *, user, token, refresh_token, cloud_url, store_raw)`
 

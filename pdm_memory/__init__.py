@@ -46,6 +46,7 @@ from pdm_memory.guarded_effects import (
     RecoveryContext,
     ResourceLimitError,
 )
+from pdm_memory.goal_loop import ContractHistory, GoalContract, OwnerApproval
 from pdm_memory.models import (
     AlignmentReport,
     RelationshipChannelResolution,
@@ -63,9 +64,11 @@ __all__ = [
     "ConditionVerdict",
     "ConfigurationError",
     "ContraryEvidenceResult",
+    "ContractHistory",
     "DecaySnapshot",
     "DrawerInfo",
     "EffectRequest",
+    "GoalContract",
     "GuardedEffects",
     "IdReuseError",
     "LedgerIntegrityError",
@@ -73,6 +76,7 @@ __all__ = [
     "Memory",
     "MemoryHit",
     "Opening",
+    "OwnerApproval",
     "RecoveryContext",
     "RelationshipChannelResolution",
     "ResourceLimitError",
