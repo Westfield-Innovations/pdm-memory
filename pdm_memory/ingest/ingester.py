@@ -27,11 +27,13 @@ from __future__ import annotations
 
 import csv
 import logging
+from collections.abc import Callable
 from io import StringIO
 from typing import Any
 
 from pdm_memory.core.math import calculate_effective_spike, infer_domain
 from pdm_memory.core.signature import SignatureRecord
+from pdm_memory.filters import FilterRefused
 from pdm_memory.storage.base import BaseStorage
 
 logger = logging.getLogger(__name__)
@@ -83,6 +85,9 @@ class DataIngester:
                     If None, auto-detect via _FIELD_ALIASES.
         llm_client: Optional LLM client for auto-signature generation.
                     If provided, missing fields are filled via the LLM.
+        check:      Optional ``text -> marks`` gate run before each save; it raises
+                    FilterRefused for a row that must not be stored (counted as
+                    ``blocked``), and its marks land in ``metadata["filters"]``.
     """
 
     def __init__(
@@ -91,17 +96,22 @@ class DataIngester:
         user: str = "default",
         mapping: dict[str, str] | None = None,
         llm_client: Any | None = None,
+        check: Callable[[str], dict[str, Any]] | None = None,
     ) -> None:
         self._storage = storage
         self._user = user
         self._mapping = mapping
         self._llm_client = llm_client
+        self._check = check
 
     def ingest_rows(self, rows: list[dict[str, Any]]) -> dict[str, int]:
         """
-        Ingest a list of dicts.  Returns {'saved': N, 'skipped': N, 'errors': N}.
+        Ingest a list of dicts.  Returns {'saved': N, 'skipped': N, 'errors': N},
+        plus 'blocked' when a check is set.
         """
         counts = {"saved": 0, "skipped": 0, "errors": 0}
+        if self._check is not None:
+            counts["blocked"] = 0
 
         for i, row in enumerate(rows):
             try:
@@ -109,8 +119,14 @@ class DataIngester:
                 if sig is None:
                     counts["skipped"] += 1
                     continue
+                if self._check is not None:
+                    marks = self._check(sig.compressed_fact)
+                    if marks:
+                        sig.metadata = {**sig.metadata, "filters": marks}
                 self._storage.save(sig)
                 counts["saved"] += 1
+            except FilterRefused:
+                counts["blocked"] += 1
             except Exception as e:
                 logger.warning("[PDM-Ingest] Row %d failed: %s", i, e)
                 counts["errors"] += 1
