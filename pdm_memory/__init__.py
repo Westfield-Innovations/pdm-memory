@@ -31,7 +31,7 @@ from pdm_memory.core.signature import (
     DrawerInfo,
     MemoryHit,
 )
-from pdm_memory.filters import FilterRefused, FilterVerdict, SaveFilter
+from pdm_memory.filters import FilterRefused, FilterVerdict, NounProbeFilter, SaveFilter
 from pdm_memory.memory import Memory
 from pdm_memory.guarded_effects import (
     ActionReceipt,
@@ -75,6 +75,7 @@ __all__ = [
     "MEMORY_SHAPE_KEY",
     "Memory",
     "MemoryHit",
+    "NounProbeFilter",
     "Opening",
     "RecoveryContext",
     "RelationshipChannelResolution",

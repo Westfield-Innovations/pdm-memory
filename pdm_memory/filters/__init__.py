@@ -5,5 +5,6 @@
 """Opt-in filters a Memory runs on every write."""
 
 from pdm_memory.filters.base import FilterRefused, FilterVerdict, SaveFilter
+from pdm_memory.filters.noun_probe import NounProbeFilter
 
-__all__ = ["FilterRefused", "FilterVerdict", "SaveFilter"]
+__all__ = ["FilterRefused", "FilterVerdict", "NounProbeFilter", "SaveFilter"]
