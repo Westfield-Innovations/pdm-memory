@@ -13,6 +13,7 @@ python -m pdm_memory.examples.industrial_safety_gate
 python -m pdm_memory.examples.field_state_demo
 python -m pdm_memory.examples.guarded_effects
 python -m pdm_memory.examples.guarded_pdm_write
+python -m pdm_memory.examples.goal_loop_watch_price
 ```
 
 From a source checkout you can also use the repo wrappers:
@@ -33,6 +34,7 @@ python examples/hello_pdm.py
 | `field_state_demo.py` | `state_at` / `current_state` — time-indexed fields, ecosystem only |
 | `guarded_effects.py` | Owner-held operations, non-time conditions and retained recovery history |
 | `guarded_pdm_write.py` | A real PDM save held for owner-reviewed evidence; recovery does not repeat it |
+| `goal_loop_watch_price.py` | Goal Contract + controller: one text per crossing, delivery receipt as proof, hash-chained receipts |
 
 `standalone_guard.py` takes a plain list of rules. The other scripts use `with Memory(...) as mem:` and a fresh temp SQLite file.
 
