@@ -526,6 +526,140 @@ for the theme, lifecycle and integration responsibilities. The OpenClaw plugin
 also now defaults to blocking when its checker cannot complete; see its
 [configuration and migration notes](plugins/openclaw/README.md).
 
+### Goal Loop preview: the Goal Contract
+
+A Goal Loop job is written down once, as one `GoalContract` record that every
+part of the loop reads: what should be true when it is done (`outcome`), the
+measurement that proves it (`proof`), what must never happen (`never`), what to
+protect if possible (`preferences`), what is cheap to give up
+(`sacrifice_order`), what wakes it up (`trigger`), what it may do without asking
+(`autonomy`), how much it may spend (`budget`), who gets told (`notify`) and how
+it can end (`end`).
+
+The system may rewrite the plan. It may not rewrite the promise. A contract is
+frozen, and every change goes through `ContractHistory.revise()`, which writes a
+new dated version and keeps the earlier ones on record:
+
+- `outcome`, `proof`, `never`, `autonomy`, `budget` and `sacrifice_order` are
+  the promise. Changing any of them without an `OwnerApproval` from the
+  contract's owner raises `PromiseChangeError`.
+- `preferences`, `trigger`, `notify` and `end` are the plan. Changing them needs
+  no approval but still creates a new version.
+- A contract with no named proof source cannot be armed: `ensure_armable()`
+  raises `NotArmableError`.
+
+```python
+from datetime import datetime, timezone
+
+from pdm_memory.goal_loop import (
+    Autonomy, Budget, ContractHistory, GoalContract, OwnerApproval, Trigger, ensure_armable,
+)
+
+contract = GoalContract(
+    contract_id="watch-mu",
+    owner="eric",
+    outcome="Eric gets a text when MU crosses $40 from below",
+    proof="sms_delivery_receipt",
+    never=["Never trade MU shares"],
+    trigger=Trigger(kind="threshold", metric="MU.price", direction="rising",
+                    fire_at="40.00", reset_at="39.50"),
+    autonomy=Autonomy(allowed=["sms.send"]),
+    budget=Budget(deadline=datetime(2026, 9, 30, tzinfo=timezone.utc)),
+)
+ensure_armable(contract)
+
+history = ContractHistory(contract)
+history.revise(outcome="Eric gets a text at $45")                 # PromiseChangeError
+history.revise(approval=OwnerApproval("eric", "new line"),
+               outcome="Eric gets a text at $45")                 # version 2, version 1 kept
+
+saved = history.to_json()                                         # store it anywhere
+history = ContractHistory.from_json(saved)
+```
+
+No PDM store, account or network is needed. Prices and costs are `Decimal` and
+are serialized as text; every datetime must be timezone-aware. Owner approval
+is cooperative: the SDK checks that the approval names the contract's owner,
+and the host decides whether a person really gave it.
+
+### Goal Loop preview: the controller
+
+`GoalLoopController` carries one contract from `drafted` to a final state:
+
+```
+drafted -> approved -> armed -> waiting -> triggered -> guard_checked
+        -> acting -> verifying -> complete
+```
+
+with side paths `retrying`, `escalated`, `paused`, `out_of_budget`, `conflict`,
+`cancelled`, `impossible` and `stopped`. It has no threads and no timers. Your host hands it readings
+with `observe()` and calls `tick()` now and then; between those calls nothing
+runs and nothing is spent.
+
+- **One crossing, one action.** A threshold trigger fires when the value crosses
+  `fire_at` and re-arms only after it drops below `reset_at` (the first reading
+  never fires). Each firing has a fixed `action_id`, which is also the
+  executor's idempotency key, and a repeated `observation_id` is ignored.
+- **Guard before every step.** `DefaultGuard` denies any operation not listed in
+  `autonomy.allowed`, then runs `verify()` against `never`. Pass only rules
+  that forbid things; limits the controller enforces itself belong in the
+  trigger and budget. A guard that raises is a failed check: the step does not
+  run and is checked again on the next try.
+- **A checker proves the result.** An executor's return is not proof. The job
+  reaches `complete` only when the checker returns a `ProofReceipt` from the
+  contract's proof source; `PROVEN` without one is recorded and ignored.
+- **Honest endings.** Budget (`max_actions`, `max_attempts`, `max_cost`) ends a
+  job in `out_of_budget` with the reason; by default an action gets one retry.
+  The `deadline` ends the watch period: nothing new fires, a step already fired
+  still gets its retry and proof, and the job ends `complete` only if every
+  action was proved, `stopped` otherwise. A step that may have run is never
+  repeated on its own: the job escalates, and the owner settles it with
+  `submit_evidence()` (it did arrive) or `resolve(..., "retry")`. A question
+  nobody answers within `confirm_expiry` (7 days) stops the job as unconfirmed.
+- **Pause.** `pause()` suspends a job between steps; `resume()` checks its
+  grounds again and never fires a crossing that happened during the pause.
+- **Every move leaves a receipt**, chained by hash; `verify_receipts()` checks it.
+
+```python
+from pdm_memory.goal_loop import (
+    ActionResult, CallableChecker, GoalLoopController, Observation, OwnerApproval,
+    ProofReceipt, ProofVerdict, SqliteJobStore, StepTemplate,
+)
+
+def send_sms(step, *, idempotency_key):                    # your hands
+    ...
+    return ActionResult(reference="msg-1")
+
+def delivered(contract, step, result, evidence, now):      # your proof of the result
+    return ProofVerdict("PROVEN", "delivered",
+                        ProofReceipt("sms_delivery_receipt", "dlr-1", now))
+
+controller = GoalLoopController(
+    store=SqliteJobStore("jobs.db"),                       # omit for an in-memory store
+    checkers={"sms_delivery_receipt": CallableChecker("sms_delivery_receipt", delivered)},
+    executors={"sms.send": send_sms},
+)
+job_id = controller.create(history, step=StepTemplate("sms.send", "+15550100",
+                           "Send SMS to owner: {metric} crossed {fire_at}"))
+controller.approve(job_id, OwnerApproval("eric"))
+controller.arm(job_id)                                     # needs a proof source and a checker
+controller.observe(job_id, Observation(observation_id="t1", observed_at=now,
+                                       metric="MU.price", value="40.12"))
+controller.tick()                                          # retries, deadlines, stuck steps
+```
+
+Run `python -m pdm_memory.examples.goal_loop_watch_price` for the full MU
+example. Backends implement `JobStore`; check yours with
+`pdm_memory.goal_loop.testing.run_job_store_contract`. See
+[Goal Loop v1](docs/GOAL_LOOP_V1.md) for the state table, escalation kinds and
+the store contract.
+
+The controller is cooperative, like the Boundary Lock preview: it cannot stop an
+executor that bypasses it or a caller that edits the store, and the guard,
+checker and executor run on your thread. Version 1 runs one action at a time per
+job; an event that arrives mid-action is recorded as `fire_suppressed_busy` for
+the host to replay.
+
 ---
 
 ## 📥 Data Ingestion
@@ -777,6 +911,29 @@ Store-free Goal-Anchor Alignment. Pass a proposed action and one or more rule st
 | `conflict_threshold` | Soft-mismatch floor for `CONFLICT` (default `0.40`) |
 
 Use `report.is_safe_to_act` (True only when `status == "ALIGNED"`) before triggering ACT.
+
+### `GoalContract`, `ContractHistory` and `GoalLoopController` (preview)
+
+Store-free record of one Goal Loop job. See [Goal Loop preview](#goal-loop-preview-the-goal-contract) and [the controller](#goal-loop-preview-the-controller).
+
+| Name | Description |
+|------|-------------|
+| `GoalContract(contract_id, owner, outcome, trigger, proof, never, preferences, sacrifice_order, autonomy, budget, notify, end)` | Frozen record; `proof` may be a `Proof` or a source name |
+| `ContractHistory(first)` | All versions of one contract, starting at version 1 |
+| `history.revise(*, approval=None, reason="", now=None, **changes)` → `GoalContract` | Writes version N+1; promise changes need `OwnerApproval` from the owner |
+| `history.current`, `history.versions()`, `history.version(n)` | Read versions; earlier versions never change |
+| `history.to_json()` / `ContractHistory.from_json(text)` | Canonical JSON; loading checks the version chain and approvals |
+| `ensure_armable(contract)` | Raises `NotArmableError` when no proof source is named |
+| `PROMISE_FIELDS` | `outcome`, `proof`, `never`, `autonomy`, `budget`, `sacrifice_order` |
+| `GoalLoopController(*, checkers, executors, store=None, guard=None, clock, retry_base, retry_cap, proof_timeout, action_timeout, confirm_expiry, default_max_attempts)` | Moves jobs through their states |
+| `create(history, *, step)` → job id; `approve`, `arm` | `drafted` to `approved` to `waiting` |
+| `observe(job_id, Observation)` → `Job` | A reading or event; fires at most once per crossing |
+| `tick(now=None)` → `list[Job]` | Retries, deadlines, lost steps, proof timeouts |
+| `submit_evidence(job_id, action_id, evidence)` | Proof from outside; also settles an escalated step |
+| `resolve(job_id, approval, *, decision)` | Owner answers an escalation: `proceed`, `skip` or `retry` |
+| `revise_contract(job_id, *, approval=None, **changes)` | New contract version while no step is in flight |
+| `pause(job_id, reason)`, `resume(job_id, reason="")` | Suspend between steps; resume after checking the grounds again |
+| `cancel(job_id, reason)`, `job()`, `receipts()`, `verify_receipts()` | Stop, read back, check the chain |
 
 ### `Memory(store, *, user, token, refresh_token, cloud_url, store_raw)`
 
