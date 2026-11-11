@@ -142,6 +142,33 @@ except FilterRefused as err:
 Without `filters`, nothing changes: no calls, no extra metadata, the same
 result dicts.
 
+#### Noun Probe filter
+
+`NounProbeFilter` runs a Noun Probe AUDIT pass on each fact and refuses one
+that uses a noun against its class (an actor that is only acted upon, a word
+doing another class's job). The method itself is published at
+<https://azus.ai/tools/noun-probe/>.
+
+```python
+from pdm_memory import FilterRefused, Memory, NounProbeFilter
+
+mem = Memory(store="./my_app.db", user="alice", filters=[NounProbeFilter()])
+
+mem.save("The budget accumulates.", tags=["budget", "planning", "finance"])
+
+try:
+    mem.save("The operator is deployed and the budget fails.", tags=["ops", "budget", "risk"])
+except FilterRefused as err:
+    print(err.verdict.terms)   # ('operator',)
+```
+
+- Deterministic: word lists and rules, no model calls, no network.
+- The word lists are English. Text it finds no structure in is written and
+  marked as passed.
+- Settings come from the environment: `PDM_NOUN_PROBE_ENABLED` (off → every
+  fact is written with `"ran": False`), `PDM_NOUN_PROBE_TOP_N` (12),
+  `PDM_NOUN_PROBE_SUBSTITUTES_PER_NOUN` (1).
+
 ---
 
 ## ☁️ Ecosystem Mode (AZUS Cloud)
