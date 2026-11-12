@@ -47,6 +47,7 @@ from pdm_memory.consequence.records import (
     ReconcileFirst,
     Response,
     Route,
+    Significance,
     SourceDecl,
     SourceValue,
     TaskRef,
@@ -833,17 +834,64 @@ class ConsequenceLedger:
             totals[key] = totals.get(key, Decimal(0)) + Decimal(data["quantity"])
             units.add(data["unit"])
         rules = self.policy.exchange_rules
+        ordering = self.policy.priority_ordering
+        if ordering:
+            rank = {a: i for i, a in enumerate(ordering)}
+            totals = dict(sorted(totals.items(), key=lambda kv: rank.get(kv[0][0], len(rank))))
+
+        def summary(combined: Decimal | None, reason: str) -> AccountSummary:
+            return AccountSummary(totals, unknown, combined, reason, ordering)
+
         if not rows:
-            return AccountSummary(totals, unknown, None, "no consequences recorded")
+            return summary(None, "no consequences recorded")
         if violated:
-            return AccountSummary(totals, unknown, None, "a hard boundary was violated")
+            return summary(None, "a hard boundary was violated")
         if unknown:
-            return AccountSummary(totals, unknown, None, "some quantities are unknown")
+            return summary(None, "some quantities are unknown")
         missing = sorted(units - set(rules or {}))
         if rules is None or missing:
-            return AccountSummary(totals, unknown, None, f"no owner exchange rule for {missing}")
-        combined = sum((q * rules[unit] for (_, unit, _), q in totals.items()), Decimal(0))
-        return AccountSummary(totals, unknown, combined, "")
+            return summary(None, f"no owner exchange rule for {missing}")
+        return summary(sum((q * rules[unit] for (_, unit, _), q in totals.items()), Decimal(0)), "")
+
+    def significance(self, expectation_id: str) -> Significance:
+        """Priority, persistence, reach and permitted interruption, for inspection."""
+        expectation, _ = self.expectation(expectation_id)
+        with self._lock:
+            responses = [
+                json.loads(r[0])["response"]
+                for r in self._conn.execute(
+                    "SELECT record_json FROM cl_evaluations WHERE owner=? AND expectation_id=?"
+                    " ORDER BY revision DESC",
+                    (self.owner, expectation_id),
+                )
+            ]
+            entries = [
+                json.loads(r[0])
+                for r in self._conn.execute(
+                    "SELECT record_json FROM cl_consequences WHERE owner=? AND expectation_id=?",
+                    (self.owner, expectation_id),
+                )
+            ]
+        persistence = 0
+        for response in responses:
+            if response == Response.CONTINUE.value:
+                break
+            persistence += 1
+        response = Response(responses[0]) if responses else None
+        priority = self.policy.priority(expectation.task.task_id)
+        threshold = self.policy.interruption_priority
+        return Significance(
+            expectation_id=expectation_id,
+            priority=priority,
+            response=response,
+            persistence=persistence,
+            reach=tuple(sorted({e["path"]["scope"] for e in entries if e.get("path")})),
+            interruption=(
+                threshold is not None
+                and priority >= threshold
+                and response not in (None, Response.CONTINUE)
+            ),
+        )
 
     # --- observation proposals -----------------------------------------------
 

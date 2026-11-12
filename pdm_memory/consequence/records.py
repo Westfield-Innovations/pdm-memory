@@ -51,6 +51,7 @@ __all__ = [
     "Response",
     "ReviewLimits",
     "Route",
+    "Significance",
     "SourceDecl",
     "SourceValue",
     "Stage",
@@ -513,6 +514,12 @@ class OwnerPolicy:
     limits: ReviewLimits
     escalation: str
     exchange_rules: Mapping[str, Decimal] | None = None
+    # Review priority per task id; a task not listed is 0. Priority may permit an
+    # interruption at or above ``interruption_priority``; it never moves an actuator.
+    priorities: Mapping[str, int] | None = None
+    interruption_priority: int | None = None
+    # Accounts most important first, reported in that order when no exchange rule combines them.
+    priority_ordering: tuple[Account, ...] = ()
 
     def __post_init__(self) -> None:
         _name(self.policy_version, "policy_version")
@@ -545,6 +552,22 @@ class OwnerPolicy:
                     {_name(k, "unit"): to_decimal(v, "exchange rate") for k, v in self.exchange_rules.items()}
                 ),
             )
+        if self.priorities is not None:
+            for task_id, rank in self.priorities.items():
+                _name(task_id, "task_id")
+                if type(rank) is not int or rank < 0:
+                    raise ConfigurationError("a priority is a nonnegative integer")
+            object.__setattr__(self, "priorities", MappingProxyType(dict(self.priorities)))
+        threshold = self.interruption_priority
+        if threshold is not None and (type(threshold) is not int or threshold < 0):
+            raise ConfigurationError("interruption_priority is a nonnegative integer")
+        ordering = tuple(Account(a) for a in self.priority_ordering)
+        if len(set(ordering)) != len(ordering):
+            raise ConfigurationError("an account appears once in the priority ordering")
+        object.__setattr__(self, "priority_ordering", ordering)
+
+    def priority(self, task_id: str) -> int:
+        return (self.priorities or {}).get(task_id, 0)
 
     def source(self, name: str) -> SourceDecl | None:
         return next((s for s in self.sources if s.name == name), None)
@@ -741,6 +764,24 @@ class AccountSummary:
     unknown: dict[Account, int]
     combined: Decimal | None
     combined_reason: str
+    priority_ordering: tuple[Account, ...] = ()
+
+
+@dataclass(frozen=True)
+class Significance:
+    """How much review an expectation warrants, from retained records only.
+
+    ``persistence`` counts the latest evaluation revisions in a row that did not
+    continue; ``reach`` lists the scopes of recorded influence paths. Neither the
+    priority nor this record changes an evaluation's response.
+    """
+
+    expectation_id: str
+    priority: int
+    response: Response | None
+    persistence: int
+    reach: tuple[str, ...]
+    interruption: bool
 
 
 @dataclass(frozen=True)
