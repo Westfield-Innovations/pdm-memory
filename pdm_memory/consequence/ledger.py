@@ -388,16 +388,20 @@ class ConsequenceLedger:
         expectation_id: str,
         *,
         task: TaskRef,
-        causes: tuple[CauseHypothesis, ...] = (),
+        causes: tuple[CauseHypothesis, ...] | None = None,
     ) -> Evaluation:
         """Grade each criterion against admissible evidence, for these exact revisions.
 
         The same evidence, comparators and policy return the same evaluation;
-        restating a cause without new evidence is not new evidence.
+        restating a cause without new evidence is not new evidence. Without
+        *causes* the current evaluation's hypotheses carry forward; ``()`` drops them.
         """
         expectation, committed_at = self.expectation(expectation_id)
         if task != expectation.task:
             raise ValueError("an evaluation is bound to the expectation's own task")
+        if causes is None:
+            current = self.current_evaluation(expectation_id)
+            causes = current.causes if current is not None else ()
         causes = tuple(causes)
         if not all(isinstance(h, CauseHypothesis) for h in causes):
             raise TypeError("causes must be CauseHypothesis records")
