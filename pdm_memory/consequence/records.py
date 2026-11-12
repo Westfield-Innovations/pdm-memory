@@ -32,6 +32,7 @@ __all__ = [
     "EvidenceKind",
     "Expectation",
     "Finding",
+    "ForecastRow",
     "Horizon",
     "NotSupported",
     "Observation",
@@ -548,3 +549,23 @@ class Evaluation:
             response=Response(data["response"]),
             superseded_by=superseded_by,
         )
+
+
+@dataclass(frozen=True)
+class ForecastRow:
+    """How one predictor held for one comparable case, with its sample counts."""
+
+    predictor: str
+    predictor_version: str
+    observable: str
+    conditions_key: str
+    evidence_kind: EvidenceKind | None
+    horizon_s: float
+    tolerance: str
+    n: int
+    match: int
+    miss: int
+    unresolved: int
+    conflict: int
+    retrospective: int
+    mean_probability: float | None

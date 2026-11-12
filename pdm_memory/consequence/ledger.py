@@ -28,6 +28,7 @@ from pdm_memory.consequence.records import (
     EvidenceKind,
     Expectation,
     Finding,
+    ForecastRow,
     Observation,
     Ordering,
     OwnerPolicy,
@@ -42,11 +43,20 @@ from pdm_memory.guarded_effects import (
     EffectRequest,
     IdReuseError,
     LedgerIntegrityError,
+    ResourceLimitError,
     _hash,
     _name,
 )
 
 __all__ = ["ConsequenceLedger"]
+
+_COUNT = {
+    Comparison.CONFIRMED_MATCH: "match",
+    Comparison.CONFIRMED_MISS: "miss",
+    Comparison.UNRESOLVED: "unresolved",
+    Comparison.CONFLICT: "conflict",
+}
+_GRADED = (Comparison.CONFIRMED_MATCH, Comparison.CONFIRMED_MISS)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cl_expectations (
@@ -356,7 +366,9 @@ class ConsequenceLedger:
         observables = {c.observable for c in expectation.criteria}
         latest = self.observations()
         by_id = {o.observation_id: o for o in latest}
-        relevant = [o for o in latest if o.observable in observables]
+        relevant = [
+            o for o in latest if o.observable in observables and _in_window(o, expectation)
+        ]
         cited = {ref for h in causes for ref in h.support if ref in by_id}
         inputs = sorted(
             {(o.observation_id, o.revision) for o in relevant}
@@ -384,6 +396,11 @@ class ConsequenceLedger:
                 ).fetchone()[0]
                 + 1
             )
+            if revision > self.policy.limits.max_revisions:
+                raise ResourceLimitError(
+                    f"{expectation_id} reached {self.policy.limits.max_revisions} evaluation"
+                    f" revisions; escalate: {self.policy.escalation}"
+                )
             findings = tuple(
                 _finding(expectation, committed_at, c, relevant, self.policy)
                 for c in expectation.criteria
@@ -402,12 +419,111 @@ class ConsequenceLedger:
                 response=_response(findings),
             )
             record = evaluation.to_dict()
+            previous = self._conn.execute(
+                "SELECT evaluation_id FROM cl_evaluations"
+                " WHERE owner=? AND expectation_id=? AND superseded_by IS NULL",
+                (self.owner, expectation_id),
+            ).fetchone()
             self._conn.execute(
                 "INSERT INTO cl_evaluations VALUES (?, ?, ?, ?, ?, NULL)",
                 (self.owner, evaluation_id, expectation_id, revision, dumps(record)),
             )
             self._append("EVALUATED", {"evaluation": record}, expectation_id)
+            if previous is not None:
+                # Marked, never deleted: the earlier finding stays readable.
+                self._conn.execute(
+                    "UPDATE cl_evaluations SET superseded_by=? WHERE owner=? AND evaluation_id=?",
+                    (evaluation_id, self.owner, previous[0]),
+                )
+                self._append(
+                    "EVALUATION_SUPERSEDED",
+                    {"superseded": previous[0], "by": evaluation_id},
+                    expectation_id,
+                )
         return evaluation
+
+    def current_evaluation(self, expectation_id: str) -> Evaluation | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM cl_evaluations"
+                " WHERE owner=? AND expectation_id=? AND superseded_by IS NULL",
+                (self.owner, expectation_id),
+            ).fetchone()
+        return None if row is None else self._evaluation_from(row)
+
+    def forecast_record(self, predictor: str, *, version: str | None = None) -> list[ForecastRow]:
+        """Confirmation and error counts of current evaluations, per comparable case.
+
+        Retrospective findings are counted apart: they grade, but they were not forecasts.
+        """
+        rows: dict[tuple[Any, ...], dict[str, Any]] = {}
+        with self._lock:
+            current = self._conn.execute(
+                "SELECT e.record_json, v.record_json AS evaluation_json FROM cl_expectations e"
+                " JOIN cl_evaluations v ON v.owner=e.owner AND v.expectation_id=e.expectation_id"
+                " WHERE e.owner=? AND v.superseded_by IS NULL ORDER BY v.rowid",
+                (self.owner,),
+            ).fetchall()
+            kinds = {
+                (r["observation_id"], r["revision"]): json.loads(r["record_json"])["kind"]
+                for r in self._conn.execute(
+                    "SELECT observation_id, revision, record_json FROM cl_observations WHERE owner=?",
+                    (self.owner,),
+                )
+            }
+        for row in current:
+            expectation = Expectation.from_dict(json.loads(row["record_json"]))
+            if expectation.predictor != predictor or version not in (
+                None,
+                expectation.predictor_version,
+            ):
+                continue
+            evaluation = Evaluation.from_dict(json.loads(row["evaluation_json"]))
+            h = expectation.horizon
+            for f in evaluation.findings:
+                c = expectation.criterion(f.criterion)
+                used_kinds = sorted({kinds[u] for u in f.used})
+                key = (
+                    expectation.predictor_version,
+                    c.observable,
+                    _hash(dumps(expectation.to_dict()["conditions"])),
+                    EvidenceKind(used_kinds[0]) if len(used_kinds) == 1 else None,
+                    (h.window_end - h.window_start).total_seconds(),
+                    dumps(c.expected),
+                )
+                counts = rows.setdefault(
+                    key,
+                    {"n": 0, "match": 0, "miss": 0, "unresolved": 0, "conflict": 0,
+                     "retrospective": 0, "probabilities": []},
+                )
+                if f.ordering is Ordering.RETROSPECTIVE:
+                    counts["retrospective"] += 1
+                    continue
+                counts["n"] += 1
+                counts[_COUNT[f.comparison]] += 1
+                if c.comparator[0] == "probabilistic" and f.comparison in _GRADED:
+                    counts["probabilities"].append(float(c.expected["probability"]))
+        return [
+            ForecastRow(
+                predictor=predictor,
+                predictor_version=k[0],
+                observable=k[1],
+                conditions_key=k[2],
+                evidence_kind=k[3],
+                horizon_s=k[4],
+                tolerance=k[5],
+                n=v["n"],
+                match=v["match"],
+                miss=v["miss"],
+                unresolved=v["unresolved"],
+                conflict=v["conflict"],
+                retrospective=v["retrospective"],
+                mean_probability=(
+                    sum(v["probabilities"]) / len(v["probabilities"]) if v["probabilities"] else None
+                ),
+            )
+            for k, v in rows.items()
+        ]
 
     def evaluation(self, evaluation_id: str) -> Evaluation:
         with self._lock:
@@ -501,9 +617,15 @@ def _inadmissible(o: Observation, c: Criterion, e: Expectation, policy: OwnerPol
     if o.value is None:
         covered = o.coverage is not None and o.coverage[0] <= h.window_start
         return "" if covered and o.coverage[1] >= h.window_end else "coverage"
-    if not h.window_start <= o.event_time <= h.window_end:
-        return "window"
     return ""
+
+
+def _in_window(o: Observation, e: Expectation) -> bool:
+    """Readings outside the window are not this expectation's evidence at all."""
+    h = e.horizon
+    if o.value is None:
+        return o.coverage is not None and o.coverage[0] < h.window_end and o.coverage[1] > h.window_start
+    return h.window_start <= o.event_time <= h.window_end
 
 
 def _ordering(o: Observation, e: Expectation, committed_at: datetime) -> Ordering:

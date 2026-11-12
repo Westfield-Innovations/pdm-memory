@@ -155,7 +155,6 @@ def test_a_source_sequence_beats_the_clock(ledger):
         ({"kind": EvidenceKind.SIMULATED}, "simulated"),
         ({"source": "unknown-feed"}, "source"),
         ({"valid": False}, "invalid"),
-        ({"event_time": START - HOUR}, "window"),
         ({"value": "warm"}, "value"),
     ],
 )
@@ -165,6 +164,12 @@ def test_inadmissible_evidence_is_kept_out_with_its_reason(ledger, change, reaso
     assert f.comparison is Comparison.UNRESOLVED
     assert ("obs-temp", reason) in f.excluded
     assert reason in f.missing
+
+
+def test_a_reading_outside_the_window_is_not_evidence(ledger):
+    _with(ledger, replace(TEMP, value=21.0, event_time=START - HOUR))
+    f = _finding(ledger, "room_temp")
+    assert (f.comparison, f.used, f.excluded) == (Comparison.UNRESOLVED, (), ())
 
 
 def test_a_changed_condition_is_out_of_scope(ledger):
@@ -243,3 +248,85 @@ def test_a_policy_cannot_register_a_comparator_with_no_implementation():
 
     with pytest.raises(ConfigurationError, match="implementation"):
         replace(POLICY, comparators=POLICY.comparators | {("fuzzy", "1")})
+
+
+# --- revisions and the forecast record ----------------------------------------
+
+
+def _kinds(ledger):
+    return [e["kind"] for e in ledger.history("exp-valve-1")]
+
+
+def test_the_same_inputs_return_the_same_evaluation(ledger):
+    _with(ledger, replace(TEMP, value=21.0))
+    a = ledger.evaluate("exp-valve-1", task=TASK)
+    b = ledger.evaluate("exp-valve-1", task=TASK)
+    assert a == b
+    assert _kinds(ledger).count("EVALUATED") == 1
+
+
+def test_a_corrected_observation_supersedes_without_deleting(ledger):
+    _with(ledger, replace(TEMP, value=25.0))
+    old = ledger.evaluate("exp-valve-1", task=TASK)
+    ledger.observe(replace(TEMP, revision=2, supersedes=1, value=21.0))
+    new = ledger.evaluate("exp-valve-1", task=TASK)
+    assert new.revision == 2
+    assert new.finding("room_temp").comparison is Comparison.CONFIRMED_MATCH
+    kept = ledger.evaluation(old.evaluation_id)
+    assert kept.superseded_by == new.evaluation_id
+    assert kept.finding("room_temp").comparison is Comparison.CONFIRMED_MISS
+    assert ledger.current_evaluation("exp-valve-1") == new
+    assert _kinds(ledger)[-1] == "EVALUATION_SUPERSEDED"
+
+
+def test_a_late_reading_grades_the_past_window(ledger):
+    _with(ledger, replace(TEMP, value=21.0, arrival_time=END + 24 * HOUR))
+    f = _finding(ledger, "room_temp")
+    assert (f.comparison, f.ordering) == (Comparison.CONFIRMED_MATCH, Ordering.PROSPECTIVE)
+
+
+def test_revisions_are_bounded(ledger_at):
+    from pdm_memory.guarded_effects import ResourceLimitError
+
+    ledger = ledger_at(policy=replace(POLICY, limits=replace(POLICY.limits, max_revisions=2)))
+    _with(ledger, replace(TEMP, value=25.0))
+    ledger.evaluate("exp-valve-1", task=TASK)
+    ledger.observe(replace(TEMP, revision=2, supersedes=1, value=24.0))
+    ledger.evaluate("exp-valve-1", task=TASK)
+    ledger.observe(replace(TEMP, revision=3, supersedes=2, value=23.0))
+    with pytest.raises(ResourceLimitError, match="notify owner-1"):
+        ledger.evaluate("exp-valve-1", task=TASK)
+    assert ledger.current_evaluation("exp-valve-1").revision == 2
+
+
+def _episode(ledger, n, *, start, value=None, event_time=None):
+    window = replace(HORIZON, window_start=start, window_end=start + HOUR)
+    exp = replace(VALVE, expectation_id=f"exp-{n}", action_id=None, criteria=(VALVE.criteria[1],),
+                  horizon=window)
+    ledger.prepare(exp)
+    if value is not None:
+        ledger.observe(replace(TEMP, observation_id=f"obs-{n}", value=value,
+                               event_time=event_time or start + MINUTE))
+    return exp.expectation_id
+
+
+def test_the_forecast_record_counts_current_prospective_findings_only(ledger):
+    ids = [
+        _episode(ledger, 1, start=COMMIT + MINUTE, value=21.0),
+        _episode(ledger, 2, start=COMMIT + 2 * HOUR, value=25.0),
+        _episode(ledger, 3, start=COMMIT + 4 * HOUR),
+        _episode(ledger, 4, start=COMMIT - 3 * HOUR, value=21.0),
+        _episode(ledger, 5, start=COMMIT + 6 * HOUR, value=25.0),
+    ]
+    for i in ids:
+        ledger.evaluate(i, task=TASK)
+    ledger.observe(replace(TEMP, observation_id="obs-5", revision=2, supersedes=1, value=21.5,
+                           event_time=COMMIT + 6 * HOUR + MINUTE))
+    ledger.evaluate("exp-5", task=TASK)
+    rows = {r.evidence_kind: r for r in ledger.forecast_record("valve-model")}
+    graded, unresolved = rows[EvidenceKind.MEASURED], rows[None]
+    assert (graded.n, graded.match, graded.miss, graded.retrospective) == (3, 2, 1, 1)
+    assert (unresolved.n, unresolved.unresolved) == (1, 1)
+    assert graded.horizon_s == 3600.0 and graded.observable == "room_temp_c"
+    assert ledger.forecast_record("valve-model", version="2") == []
+    assert ledger.forecast_record("other-model") == []
