@@ -47,6 +47,8 @@ from pdm_memory.consequence.records import (
     ReconcileFirst,
     Response,
     Route,
+    SourceDecl,
+    SourceValue,
     TaskRef,
     UnauthorizedChange,
     UpdateState,
@@ -884,6 +886,13 @@ class ConsequenceLedger:
                 ordered = len({(s.cost_unit, s.burden_unit) for s in sources}) == 1
                 if ordered:
                     sources.sort(key=lambda s: (s.cost, s.burden, s.latency_s))
+                values = [_value(c, s, now, deadline, self.policy) for s in sources]
+                if values and all(v.net is not None for v in values):
+                    # On one owner basis the best net value goes first; otherwise
+                    # the qualitative order above stands.
+                    pairs = sorted(zip(sources, values), key=lambda p: -p[1].net)
+                    sources, values = [p[0] for p in pairs], [p[1] for p in pairs]
+                    ordered = True
                 if now > deadline:
                     status = "TOO_LATE"
                 elif self._count_proposals(expectation_id, name) >= limits.max_repeats or (
@@ -903,6 +912,7 @@ class ConsequenceLedger:
                     deadline=deadline,
                     status=status,
                     escalation=self.policy.escalation if status == "EXHAUSTED" else "",
+                    values=tuple(values),
                 )
                 if status == "TOO_LATE":
                     out.append(proposal)
@@ -1194,6 +1204,32 @@ def _finding(
         allowed_by_model=comparison is Comparison.CONFIRMED_MISS and all(a for *_, a in graded),
         missing="",
     )
+
+
+def _value(
+    c: Criterion, s: SourceDecl, now: datetime, deadline: datetime, policy: OwnerPolicy
+) -> SourceValue:
+    """Avoided consequence against cost, burden, delay and perturbation, on the owner's basis."""
+    if now + timedelta(seconds=s.latency_s) > deadline:
+        return SourceValue(s.name, "TOO_LATE", None, "arrives after the latest decision point")
+    if c.avoided is None:
+        return SourceValue(s.name, "UNRESOLVED", None, "no expected avoided consequence declared")
+    costs = [(s.cost, s.cost_unit), (s.burden, s.burden_unit), (Decimal(str(s.latency_s)), "s")]
+    if s.perturbation is not None:
+        costs.append((s.perturbation, s.perturbation_unit))
+    rules = policy.exchange_rules or {}
+    # A zero needs no exchange rule: nothing of any unit is still nothing.
+    missing = sorted({u for q, u in [(c.avoided, c.avoided_unit), *costs] if q != 0 and u not in rules})
+    if missing:
+        return SourceValue(s.name, "UNRESOLVED", None, f"no owner exchange rule for {missing}")
+
+    def basis(q: Decimal, unit: str) -> Decimal:
+        return q * rules[unit] if q != 0 else Decimal(0)
+
+    net = basis(c.avoided, c.avoided_unit) - sum((basis(q, u) for q, u in costs), Decimal(0))
+    if net > 0:
+        return SourceValue(s.name, "WORTH", net, "")
+    return SourceValue(s.name, "NOT_WORTH", net, "costs at least what it could avoid")
 
 
 def _response(findings: tuple[Finding, ...]) -> Response:

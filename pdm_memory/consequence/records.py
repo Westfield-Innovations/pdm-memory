@@ -52,6 +52,7 @@ __all__ = [
     "ReviewLimits",
     "Route",
     "SourceDecl",
+    "SourceValue",
     "Stage",
     "TaskRef",
     "UnauthorizedChange",
@@ -195,6 +196,18 @@ def _opt_dt(value: Any) -> datetime | None:
     return None if value is None else parse_datetime(value, "datetime")
 
 
+_OPTIONAL = {"optional": True}
+
+
+def _paired(record: Any, amount: str, unit: str) -> None:
+    """An optional quantity is declared with its unit, or not at all."""
+    if (getattr(record, amount) is None) != (getattr(record, unit) is None):
+        raise ValueError(f"{amount} and {unit} are declared together")
+    if getattr(record, amount) is not None:
+        object.__setattr__(record, amount, to_decimal(getattr(record, amount), amount))
+        _name(getattr(record, unit), unit)
+
+
 def _texts(value: Any, label: str) -> tuple[str, ...]:
     out = tuple(value)
     for v in out:
@@ -228,6 +241,9 @@ class Criterion:
     comparator: tuple[str, str]
     unit: str
     expected: Any
+    # What settling this criterion in time could avoid, for weighing an observation's cost.
+    avoided: Decimal | None = field(default=None, metadata=_OPTIONAL)
+    avoided_unit: str | None = field(default=None, metadata=_OPTIONAL)
 
     def __post_init__(self) -> None:
         _name(self.name, "criterion name")
@@ -238,13 +254,11 @@ class Criterion:
             raise ValueError("comparator must be a (name, version) pair")
         object.__setattr__(self, "comparator", _texts(comparator, "comparator"))
         _name(self.unit, "unit")
+        _paired(self, "avoided", "avoided_unit")
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Criterion:
         return cls(**{**data, "comparator": tuple(data["comparator"])})
-
-
-_OPTIONAL = {"optional": True}
 
 
 @dataclass(frozen=True)
@@ -453,16 +467,22 @@ class SourceDecl:
     cost_unit: str
     burden: Decimal
     burden_unit: str
+    # A change the reading itself makes to what it measures.
+    perturbation: Decimal | None = field(default=None, metadata=_OPTIONAL)
+    perturbation_unit: str | None = field(default=None, metadata=_OPTIONAL)
 
     def __post_init__(self) -> None:
         _name(self.name, "source name")
         object.__setattr__(self, "observables", frozenset(_texts(self.observables, "observable")))
         if type(self.latency_s) not in (int, float) or not math.isfinite(self.latency_s):
             raise ValueError("latency_s must be a finite number")
+        if self.latency_s < 0:
+            raise ValueError("latency_s must not be negative")
         object.__setattr__(self, "cost", to_decimal(self.cost, "cost"))
         object.__setattr__(self, "burden", to_decimal(self.burden, "burden"))
         _name(self.cost_unit, "cost_unit")
         _name(self.burden_unit, "burden_unit")
+        _paired(self, "perturbation", "perturbation_unit")
 
 
 @dataclass(frozen=True)
@@ -746,6 +766,25 @@ def compare_to_capacity(
 
 
 @dataclass(frozen=True)
+class SourceValue:
+    """One source's expected avoided consequence net of its cost, delay and perturbation.
+
+    ``net`` exists only when every nonzero term has an owner exchange rule;
+    otherwise the comparison stays UNRESOLVED and ``reason`` names what is missing.
+    """
+
+    source: str
+    verdict: Literal["WORTH", "NOT_WORTH", "TOO_LATE", "UNRESOLVED"]
+    net: Decimal | None
+    reason: str
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> SourceValue:
+        net = data["net"]
+        return cls(data["source"], data["verdict"], None if net is None else Decimal(net), data["reason"])
+
+
+@dataclass(frozen=True)
 class ObservationProposal:
     """The next reading that could settle a criterion, and when it stops helping."""
 
@@ -759,6 +798,7 @@ class ObservationProposal:
     deadline: datetime
     status: Literal["OPEN", "EXHAUSTED", "TOO_LATE", "CLOSED"]
     escalation: str = ""
+    values: tuple[SourceValue, ...] = field(default=(), metadata=_OPTIONAL)
 
     def to_dict(self) -> dict[str, Any]:
         return _plain(self)
@@ -774,6 +814,7 @@ class ObservationProposal:
                     for s in data["sources"]
                 ),
                 "deadline": parse_datetime(data["deadline"], "deadline"),
+                "values": tuple(SourceValue.from_dict(v) for v in data.get("values", ())),
                 "status": status,
             }
         )
