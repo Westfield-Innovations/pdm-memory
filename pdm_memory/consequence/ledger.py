@@ -46,6 +46,7 @@ from pdm_memory.consequence.records import (
     QuantityStatus,
     ReconcileFirst,
     Response,
+    Revoked,
     Route,
     Significance,
     SourceDecl,
@@ -84,8 +85,9 @@ _NEXT = {
                            UpdateState.NOT_APPLIED},
     UpdateState.UNCERTAIN: {UpdateState.APPLIED, UpdateState.NOT_APPLIED},
     UpdateState.REJECTED: set(),
-    UpdateState.APPLIED: set(),
+    UpdateState.APPLIED: {UpdateState.REVOKED},
     UpdateState.NOT_APPLIED: set(),
+    UpdateState.REVOKED: set(),
 }
 
 _SCHEMA = """
@@ -119,6 +121,10 @@ CREATE TABLE IF NOT EXISTS cl_proposals (
   owner TEXT NOT NULL, proposal_id TEXT NOT NULL, expectation_id TEXT NOT NULL,
   criterion TEXT NOT NULL, status TEXT NOT NULL, record_json TEXT NOT NULL,
   PRIMARY KEY(owner, proposal_id));
+CREATE TABLE IF NOT EXISTS cl_revocations (
+  owner TEXT NOT NULL, kind TEXT NOT NULL, record_id TEXT NOT NULL,
+  expectation_id TEXT NOT NULL, record_json TEXT NOT NULL,
+  PRIMARY KEY(owner, kind, record_id));
 CREATE TABLE IF NOT EXISTS cl_events (
   sequence INTEGER PRIMARY KEY, owner TEXT NOT NULL, expectation_id TEXT,
   kind TEXT NOT NULL, payload_json TEXT NOT NULL, previous_hash TEXT NOT NULL,
@@ -284,8 +290,13 @@ class ConsequenceLedger:
         """
         with self._lock:
             expectation_id = self._expectation_for(request.action_id)
+            revoked = expectation_id is not None and self._is_revoked(expectation_id)
         if expectation_id is None:
             return ConditionVerdict(CheckResult.UNKNOWN, "no retained expectation for this action")
+        if revoked:
+            return ConditionVerdict(
+                CheckResult.UNKNOWN, "the expectation was revoked", {"expectation_id": expectation_id}
+            )
         return ConditionVerdict(
             CheckResult.SATISFIED, "expectation retained", {"expectation_id": expectation_id}
         )
@@ -413,6 +424,7 @@ class ConsequenceLedger:
         # Evidence is read under the write lock, so a slower caller can never
         # supersede a revision built from newer readings.
         with self._transaction():
+            self._refuse_revoked(expectation_id)
             return self._evaluate(expectation, committed_at, causes)
 
     def _evaluate(
@@ -680,6 +692,7 @@ class ConsequenceLedger:
             ).fetchone()
             if old is not None:
                 return LearningProposal.from_dict(json.loads(old[0]))
+            self._refuse_revoked(expectation.expectation_id)
             same_target = (self.owner, expectation.expectation_id, criterion, target_kind, target_id)
             uncertain = self._conn.execute(
                 "SELECT update_id FROM cl_updates WHERE owner=? AND expectation_id=?"
@@ -878,6 +891,8 @@ class ConsequenceLedger:
                 break
             persistence += 1
         response = Response(responses[0]) if responses else None
+        with self._lock:
+            revoked = self._is_revoked(expectation_id)
         priority = self.policy.priority(expectation.task.task_id)
         threshold = self.policy.interruption_priority
         return Significance(
@@ -887,10 +902,12 @@ class ConsequenceLedger:
             persistence=persistence,
             reach=tuple(sorted({e["path"]["scope"] for e in entries if e.get("path")})),
             interruption=(
-                threshold is not None
+                not revoked
+                and threshold is not None
                 and priority >= threshold
                 and response not in (None, Response.CONTINUE)
             ),
+            revoked=revoked,
         )
 
     # --- observation proposals -----------------------------------------------
@@ -914,6 +931,8 @@ class ConsequenceLedger:
         deadline = expectation.horizon.latest_decision_point
         out = []
         with self._transaction():
+            if self._is_revoked(expectation_id):
+                return ()
             for name in names:
                 c = expectation.criterion(name)
                 proposal_id = _hash(
@@ -1013,6 +1032,94 @@ class ConsequenceLedger:
                 {"proposal_id": proposal_id, "by": reason},
                 expectation_id,
             )
+
+    # --- revocations ---------------------------------------------------------
+
+    def revoke_expectation(self, expectation_id: str, *, controller_ref: str, reason: str) -> None:
+        """The owner withdraws an expectation: no further evaluation or proposal.
+
+        Its records stay; observations, receipts and consequences still append.
+        """
+        self.expectation(expectation_id)
+        with self._transaction():
+            if self._revoke("expectation", expectation_id, expectation_id, controller_ref, reason):
+                for (criterion,) in self._conn.execute(
+                    "SELECT DISTINCT criterion FROM cl_proposals WHERE owner=? AND expectation_id=?",
+                    (self.owner, expectation_id),
+                ).fetchall():
+                    self._close_proposals(expectation_id, criterion, "revoked")
+
+    def revoke_update(self, update_id: str, *, controller_ref: str, reason: str) -> UpdateState:
+        """Record that the owner's controller withdrew an applied update.
+
+        An update without an application receipt is reconciled first.
+        """
+        with self._transaction():
+            row = self._update_row(update_id)
+            state = UpdateState(row["state"])
+            if state is UpdateState.UNCERTAIN:
+                raise ReconcileFirst(f"update {update_id} has no application receipt")
+            if state not in (UpdateState.APPLIED, UpdateState.REVOKED):
+                raise ValueError(f"only an applied update can be revoked, not a {state.value} one")
+            if self._revoke("update", update_id, row["expectation_id"], controller_ref, reason):
+                self._conn.execute(
+                    "UPDATE cl_updates SET state=? WHERE owner=? AND update_id=?",
+                    (UpdateState.REVOKED.value, self.owner, update_id),
+                )
+        return UpdateState.REVOKED
+
+    def revocations(self, expectation_id: str | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT record_json FROM cl_revocations WHERE owner=?"
+        args: list[Any] = [self.owner]
+        if expectation_id is not None:
+            sql += " AND expectation_id=?"
+            args.append(_name(expectation_id, "expectation_id"))
+        with self._lock:
+            rows = self._conn.execute(sql + " ORDER BY rowid", args).fetchall()
+        return [json.loads(r[0]) for r in rows]
+
+    def _revoke(
+        self, kind: str, record_id: str, expectation_id: str, controller_ref: str, reason: str
+    ) -> bool:
+        """Append one revocation; False when the same one is already retained."""
+        _name(controller_ref, "controller_ref")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("a revocation states its reason")
+        record = {
+            "kind": kind,
+            "record_id": record_id,
+            "expectation_id": expectation_id,
+            "controller_ref": controller_ref,
+            "reason": reason,
+        }
+        old = self._conn.execute(
+            "SELECT record_json FROM cl_revocations WHERE owner=? AND kind=? AND record_id=?",
+            (self.owner, kind, record_id),
+        ).fetchone()
+        if old is not None:
+            if json.loads(old[0]) != record:
+                raise IdReuseError(f"this {kind} was already revoked differently")
+            return False
+        encoded = dumps(record, limit=self._limit)
+        self._conn.execute(
+            "INSERT INTO cl_revocations VALUES (?, ?, ?, ?, ?)",
+            (self.owner, kind, record_id, expectation_id, encoded),
+        )
+        self._append(f"{kind.upper()}_REVOKED", {"revocation": record}, expectation_id)
+        return True
+
+    def _is_revoked(self, expectation_id: str) -> bool:
+        return (
+            self._conn.execute(
+                "SELECT 1 FROM cl_revocations WHERE owner=? AND kind='expectation' AND record_id=?",
+                (self.owner, expectation_id),
+            ).fetchone()
+            is not None
+        )
+
+    def _refuse_revoked(self, expectation_id: str) -> None:
+        if self._is_revoked(expectation_id):
+            raise Revoked(f"{expectation_id} was revoked by the owner")
 
     # --- history -------------------------------------------------------------
 

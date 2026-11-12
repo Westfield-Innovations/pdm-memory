@@ -50,6 +50,7 @@ __all__ = [
     "ReconcileFirst",
     "Response",
     "ReviewLimits",
+    "Revoked",
     "Route",
     "Significance",
     "SourceDecl",
@@ -156,6 +157,7 @@ class UpdateState(str, Enum):
     UNCERTAIN = "UNCERTAIN"
     APPLIED = "APPLIED"
     NOT_APPLIED = "NOT_APPLIED"
+    REVOKED = "REVOKED"
 
 
 class UnauthorizedChange(PermissionError):
@@ -168,6 +170,10 @@ class NotSupported(ValueError):
 
 class ReconcileFirst(ValueError):
     """An earlier update's application is uncertain; reconcile it first."""
+
+
+class Revoked(ValueError):
+    """The owner revoked this expectation; it takes no further evaluation or proposal."""
 
 
 def _plain(value: Any) -> Any:
@@ -782,6 +788,7 @@ class Significance:
     persistence: int
     reach: tuple[str, ...]
     interruption: bool
+    revoked: bool = False
 
 
 @dataclass(frozen=True)
