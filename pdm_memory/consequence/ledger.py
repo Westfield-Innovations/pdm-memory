@@ -20,7 +20,10 @@ from typing import Any
 
 from pdm_memory.consequence.compare import COMPARATORS, NOT_OBSERVED
 from pdm_memory.consequence.records import (
+    PROTECTED_TARGETS,
+    Admission,
     Applicability,
+    Application,
     CauseHypothesis,
     Comparison,
     Criterion,
@@ -29,11 +32,17 @@ from pdm_memory.consequence.records import (
     Expectation,
     Finding,
     ForecastRow,
+    LearningProposal,
+    NotSupported,
     Observation,
     Ordering,
     OwnerPolicy,
+    ReconcileFirst,
     Response,
+    Route,
     TaskRef,
+    UnauthorizedChange,
+    UpdateState,
 )
 from pdm_memory.goal_loop._json import dumps, parse_datetime, require_aware, utc_now
 from pdm_memory.guarded_effects import (
@@ -57,6 +66,17 @@ _COUNT = {
     Comparison.CONFLICT: "conflict",
 }
 _GRADED = (Comparison.CONFIRMED_MATCH, Comparison.CONFIRMED_MISS)
+_OPEN_OR_APPLIED = {UpdateState.PROPOSED.value, UpdateState.DEFERRED.value, UpdateState.APPLIED.value}
+_NEXT = {
+    UpdateState.PROPOSED: {UpdateState.DEFERRED, UpdateState.REJECTED, UpdateState.UNCERTAIN,
+                           UpdateState.APPLIED, UpdateState.NOT_APPLIED},
+    UpdateState.DEFERRED: {UpdateState.REJECTED, UpdateState.UNCERTAIN, UpdateState.APPLIED,
+                           UpdateState.NOT_APPLIED},
+    UpdateState.UNCERTAIN: {UpdateState.APPLIED, UpdateState.NOT_APPLIED},
+    UpdateState.REJECTED: set(),
+    UpdateState.APPLIED: set(),
+    UpdateState.NOT_APPLIED: set(),
+}
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cl_expectations (
@@ -77,6 +97,11 @@ CREATE TABLE IF NOT EXISTS cl_evaluations (
   owner TEXT NOT NULL, evaluation_id TEXT NOT NULL, expectation_id TEXT NOT NULL,
   revision INTEGER NOT NULL, record_json TEXT NOT NULL, superseded_by TEXT,
   PRIMARY KEY(owner, evaluation_id), UNIQUE(owner, expectation_id, revision));
+CREATE TABLE IF NOT EXISTS cl_updates (
+  owner TEXT NOT NULL, update_id TEXT NOT NULL, expectation_id TEXT NOT NULL,
+  criterion TEXT NOT NULL, target_kind TEXT NOT NULL, target_id TEXT NOT NULL,
+  record_json TEXT NOT NULL, state TEXT NOT NULL,
+  PRIMARY KEY(owner, update_id));
 CREATE TABLE IF NOT EXISTS cl_events (
   sequence INTEGER PRIMARY KEY, owner TEXT NOT NULL, expectation_id TEXT,
   kind TEXT NOT NULL, payload_json TEXT NOT NULL, previous_hash TEXT NOT NULL,
@@ -541,6 +566,169 @@ class ConsequenceLedger:
     @staticmethod
     def _evaluation_from(row: sqlite3.Row) -> Evaluation:
         return Evaluation.from_dict(json.loads(row["record_json"]), row["superseded_by"])
+
+    # --- learning ------------------------------------------------------------
+
+    def propose_learning(
+        self,
+        evaluation_id: str,
+        *,
+        criterion: str,
+        target_kind: str,
+        target_id: str,
+        target_version: str,
+        change: dict[str, Any],
+        scope: str,
+        confidence: float,
+        route: Route,
+        evidence_kind: EvidenceKind,
+        interface_id: str | None = None,
+    ) -> LearningProposal:
+        """Name one target and a bounded change the evaluation supports.
+
+        Nothing is applied here: the owner's update path admits or rejects the
+        proposal and its receipts come back through ``record_update_receipt``.
+        """
+        _name(target_kind, "target_kind")
+        if target_kind in PROTECTED_TARGETS or target_kind not in self.policy.learning_targets:
+            raise UnauthorizedChange(f"{target_kind} is not an owner-admitted learning target")
+        _name(target_id, "target_id")
+        _name(target_version, "target_version")
+        _name(scope, "scope")
+        route, evidence_kind = Route(route), EvidenceKind(evidence_kind)
+        if type(confidence) not in (int, float) or not 0 <= confidence <= 1:
+            raise ValueError("confidence must be between 0 and 1")
+        if not isinstance(change, dict) or not change:
+            raise ValueError("a proposal names its change")
+        dumps(change, limit=self._limit)
+        evaluation = self.evaluation(evaluation_id)
+        expectation, _ = self.expectation(evaluation.expectation_id)
+        if evaluation.superseded_by is not None:
+            raise NotSupported("this evaluation was superseded; propose from the current one")
+        finding = evaluation.finding(criterion)
+        if finding.applicability is not Applicability.APPLICABLE:
+            raise NotSupported(f"the finding is {finding.applicability.value}, not applicable")
+        if finding.comparison not in _GRADED:
+            raise NotSupported(f"the finding is {finding.comparison.value}")
+        if finding.comparison is Comparison.CONFIRMED_MISS and not evaluation.attribution_supported:
+            raise NotSupported("attribution unresolved; the miss is retained")
+        if target_kind == "interface_calibration" and (
+            route is not Route.OWN_ACTION
+            or interface_id is None
+            or interface_id != expectation.interface_id
+        ):
+            raise NotSupported("only this interface's own action can calibrate this interface")
+        update_id = _hash(
+            dumps(
+                [expectation.expectation_id, criterion, target_kind, target_id, target_version, change]
+            )
+        )
+        with self._transaction():
+            old = self._conn.execute(
+                "SELECT record_json FROM cl_updates WHERE owner=? AND update_id=?",
+                (self.owner, update_id),
+            ).fetchone()
+            if old is not None:
+                return LearningProposal.from_dict(json.loads(old[0]))
+            prior = self._conn.execute(
+                "SELECT update_id, state FROM cl_updates WHERE owner=? AND expectation_id=?"
+                " AND criterion=? AND target_kind=? AND target_id=? ORDER BY rowid DESC LIMIT 1",
+                (self.owner, expectation.expectation_id, criterion, target_kind, target_id),
+            ).fetchone()
+            if prior is not None and prior["state"] == UpdateState.UNCERTAIN.value:
+                raise ReconcileFirst(f"update {prior['update_id']} has no application receipt")
+            reconciles = (
+                prior["update_id"]
+                if prior is not None and prior["state"] in _OPEN_OR_APPLIED
+                else None
+            )
+            proposal = LearningProposal(
+                update_id=update_id,
+                expectation_id=expectation.expectation_id,
+                evaluation_id=evaluation_id,
+                criterion=criterion,
+                target_kind=target_kind,
+                target_id=target_id,
+                target_version=target_version,
+                change=change,
+                scope=scope,
+                confidence=float(confidence),
+                route=route,
+                evidence_kind=evidence_kind,
+                interface_id=interface_id,
+                reconciles=reconciles,
+            )
+            record = proposal.to_dict()
+            self._conn.execute(
+                "INSERT INTO cl_updates VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    self.owner,
+                    update_id,
+                    expectation.expectation_id,
+                    criterion,
+                    target_kind,
+                    target_id,
+                    dumps(record),
+                    UpdateState.PROPOSED.value,
+                ),
+            )
+            self._append("LEARNING_PROPOSED", {"proposal": record}, expectation.expectation_id)
+        return proposal
+
+    def update_state(self, update_id: str) -> UpdateState:
+        with self._lock:
+            return UpdateState(self._update_row(update_id)["state"])
+
+    def _update_row(self, update_id: str) -> sqlite3.Row:
+        row = self._conn.execute(
+            "SELECT * FROM cl_updates WHERE owner=? AND update_id=?",
+            (self.owner, _name(update_id, "update_id")),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"no proposal {update_id}")
+        return row
+
+    def record_update_receipt(
+        self,
+        update_id: str,
+        *,
+        admission: Admission,
+        application: Application | None = None,
+        controller_ref: str,
+    ) -> UpdateState:
+        """Append the owner's controller decision. Acceptance alone is UNCERTAIN, not applied."""
+        admission = Admission(admission)
+        application = None if application is None else Application(application)
+        _name(controller_ref, "controller_ref")
+        if admission is not Admission.ACCEPTED and application is not None:
+            raise ValueError("only an accepted proposal can carry an application receipt")
+        if admission is Admission.ACCEPTED:
+            new = UpdateState(application.value) if application else UpdateState.UNCERTAIN
+        else:
+            new = UpdateState(admission.value)
+        with self._transaction():
+            row = self._update_row(update_id)
+            current = UpdateState(row["state"])
+            if new is current:
+                return current
+            if new not in _NEXT[current]:
+                raise ValueError(f"a {new.value} receipt cannot follow {current.value}")
+            self._conn.execute(
+                "UPDATE cl_updates SET state=? WHERE owner=? AND update_id=?",
+                (new.value, self.owner, update_id),
+            )
+            self._append(
+                "UPDATE_RECEIPT",
+                {
+                    "update_id": update_id,
+                    "admission": admission.value,
+                    "application": None if application is None else application.value,
+                    "controller_ref": controller_ref,
+                    "state": new.value,
+                },
+                row["expectation_id"],
+            )
+        return new
 
     # --- history -------------------------------------------------------------
 

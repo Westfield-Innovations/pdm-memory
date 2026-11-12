@@ -34,6 +34,7 @@ __all__ = [
     "Finding",
     "ForecastRow",
     "Horizon",
+    "LearningProposal",
     "NotSupported",
     "Observation",
     "Ordering",
@@ -569,3 +570,36 @@ class ForecastRow:
     conflict: int
     retrospective: int
     mean_probability: float | None
+
+
+@dataclass(frozen=True)
+class LearningProposal:
+    """A bounded change for the owner's update path. It grants nothing by itself."""
+
+    update_id: str
+    expectation_id: str
+    evaluation_id: str
+    criterion: str
+    target_kind: str
+    target_id: str
+    target_version: str
+    change: dict[str, Any]
+    scope: str
+    confidence: float
+    route: Route
+    evidence_kind: EvidenceKind
+    interface_id: str | None = None
+    reconciles: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return _plain(self)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> LearningProposal:
+        return cls(
+            **{
+                **data,
+                "route": Route(data["route"]),
+                "evidence_kind": EvidenceKind(data["evidence_kind"]),
+            }
+        )
