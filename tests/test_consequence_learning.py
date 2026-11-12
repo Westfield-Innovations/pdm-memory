@@ -30,7 +30,8 @@ from tests.consequence_fixtures import (
     VALVE,
 )
 
-SUPPLY = replace(TEMP, observation_id="obs-supply", observable="supply_bar", value=0.4)
+SUPPLY = replace(TEMP, observation_id="obs-supply", source="supply-gauge", observable="supply_bar",
+                 unit="bar", value=0.4)
 SUPPORTED = (CauseHypothesis(Cause.EXECUTION, ("obs-supply",)),)
 
 
@@ -55,6 +56,7 @@ def _correct(ledger, value, revision=2, causes=SUPPORTED):
 
 def _propose(ledger, ev, **changes):
     args = {
+        "task": TASK,
         "criterion": "room_temp",
         "target_kind": "predictor",
         "target_id": "valve-model",

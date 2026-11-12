@@ -27,7 +27,8 @@ from tests.consequence_fixtures import (
     _request,
 )
 
-SUPPLY = replace(TEMP, observation_id="obs-supply", observable="supply_bar", value=0.4)
+SUPPLY = replace(TEMP, observation_id="obs-supply", source="supply-gauge", observable="supply_bar",
+                 unit="bar", value=0.4)
 
 
 def _open(path):
@@ -77,6 +78,7 @@ def test_the_valve_episode_learns_from_a_supported_miss_once(tmp_path):
         assert (ev.response, ev.attribution_supported) == (Response.OPEN_REVIEW, True)
         proposal = ledger.propose_learning(
             ev.evaluation_id,
+            task=TASK,
             criterion="room_temp",
             target_kind="belief",
             target_id="supply-pressure-ok",
@@ -104,6 +106,7 @@ def test_the_valve_episode_learns_from_a_supported_miss_once(tmp_path):
         assert again == ev
         assert ledger.propose_learning(
             again.evaluation_id,
+            task=TASK,
             criterion="room_temp",
             target_kind="belief",
             target_id="supply-pressure-ok",

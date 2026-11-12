@@ -70,6 +70,7 @@ POLICY = OwnerPolicy(
         _source("position-feed", "valve_position"),
         _source("room-sensor", "room_temp_c"),
         _source("wall-probe", "room_temp_c", cost="3"),
+        _source("supply-gauge", "supply_bar"),
     ),
     comparators=frozenset(
         {("exact", "1"), ("range", "1"), ("categorical", "1"), ("probabilistic", "1")}

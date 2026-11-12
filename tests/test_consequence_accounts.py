@@ -153,7 +153,8 @@ def test_an_unresolved_effect_gets_a_bounded_proposal(ledger):
     _resolve_movement(ledger)
     (p,) = ledger.suggest_observation("exp-valve-1", now=COMMIT + MINUTE)
     assert (p.criterion, p.status, p.deadline) == ("room_temp", "OPEN", HORIZON.latest_decision_point)
-    assert p.sources == ("room-sensor", "wall-probe")  # cheapest first, one basis
+    assert [s.name for s in p.sources] == ["room-sensor", "wall-probe"]  # cheapest first
+    assert (p.sources[0].cost, p.sources[0].burden, p.sources[0].latency_s) == (1, 0, 30.0)
     assert p.ordered
     assert set(p.distinguishes) == {Comparison.CONFIRMED_MATCH, Comparison.CONFIRMED_MISS}
     assert p.decision_ref == "decision-open-valve-3"
@@ -164,7 +165,7 @@ def test_sources_are_ranked_only_on_a_shared_basis(make):
     ledger = make(sources=(*POLICY.sources[:2], replace(mixed, cost_unit="usd")))
     _resolve_movement(ledger)
     (p,) = ledger.suggest_observation("exp-valve-1")
-    assert (p.ordered, p.sources) == (False, ("room-sensor", "wall-probe"))
+    assert (p.ordered, [s.name for s in p.sources]) == (False, ["room-sensor", "wall-probe"])
 
 
 def test_past_the_decision_point_it_is_too_late(ledger):
@@ -177,7 +178,7 @@ def test_past_the_decision_point_it_is_too_late(ledger):
 def test_repeated_requests_coalesce(ledger):
     _resolve_movement(ledger)
     first = ledger.suggest_observation("exp-valve-1")
-    assert ledger.suggest_observation("exp-valve-1") == first
+    assert ledger.suggest_observation("exp-valve-1") == first  # read back from the ledger
     assert ledger.suggest_observation("exp-valve-1") == first
     kinds = [e["kind"] for e in ledger.history("exp-valve-1")]
     assert kinds.count("OBSERVATION_PROPOSED") == 1
