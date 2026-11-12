@@ -14,11 +14,27 @@ import sqlite3
 import threading
 from collections.abc import Callable
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from pdm_memory.consequence.records import Expectation, Observation, OwnerPolicy
+from pdm_memory.consequence.compare import COMPARATORS, NOT_OBSERVED
+from pdm_memory.consequence.records import (
+    Applicability,
+    CauseHypothesis,
+    Comparison,
+    Criterion,
+    Evaluation,
+    EvidenceKind,
+    Expectation,
+    Finding,
+    ForecastRow,
+    Observation,
+    Ordering,
+    OwnerPolicy,
+    Response,
+    TaskRef,
+)
 from pdm_memory.goal_loop._json import dumps, parse_datetime, require_aware, utc_now
 from pdm_memory.guarded_effects import (
     ActionReceipt,
@@ -27,11 +43,20 @@ from pdm_memory.guarded_effects import (
     EffectRequest,
     IdReuseError,
     LedgerIntegrityError,
+    ResourceLimitError,
     _hash,
     _name,
 )
 
 __all__ = ["ConsequenceLedger"]
+
+_COUNT = {
+    Comparison.CONFIRMED_MATCH: "match",
+    Comparison.CONFIRMED_MISS: "miss",
+    Comparison.UNRESOLVED: "unresolved",
+    Comparison.CONFLICT: "conflict",
+}
+_GRADED = (Comparison.CONFIRMED_MATCH, Comparison.CONFIRMED_MISS)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cl_expectations (
@@ -48,6 +73,10 @@ CREATE TABLE IF NOT EXISTS cl_observations (
   owner TEXT NOT NULL, observation_id TEXT NOT NULL, revision INTEGER NOT NULL,
   record_json TEXT NOT NULL, recorded_seq INTEGER NOT NULL,
   PRIMARY KEY(owner, observation_id, revision));
+CREATE TABLE IF NOT EXISTS cl_evaluations (
+  owner TEXT NOT NULL, evaluation_id TEXT NOT NULL, expectation_id TEXT NOT NULL,
+  revision INTEGER NOT NULL, record_json TEXT NOT NULL, superseded_by TEXT,
+  PRIMARY KEY(owner, evaluation_id), UNIQUE(owner, expectation_id, revision));
 CREATE TABLE IF NOT EXISTS cl_events (
   sequence INTEGER PRIMARY KEY, owner TEXT NOT NULL, expectation_id TEXT,
   kind TEXT NOT NULL, payload_json TEXT NOT NULL, previous_hash TEXT NOT NULL,
@@ -149,6 +178,7 @@ class ConsequenceLedger:
         for c in expectation.criteria:
             if c.comparator not in self.policy.comparators:
                 raise ValueError(f"comparator {c.comparator} is not registered by the owner")
+            COMPARATORS[c.comparator].check_expected(c.expected)
         record = expectation.to_dict()
         encoded = dumps(record, limit=self._limit)
         with self._transaction():
@@ -313,6 +343,205 @@ class ConsequenceLedger:
         out = [Observation.from_dict(json.loads(r[0])) for r in rows]
         return [o for o in out if observable is None or o.observable == observable]
 
+    # --- evaluation ----------------------------------------------------------
+
+    def evaluate(
+        self,
+        expectation_id: str,
+        *,
+        task: TaskRef,
+        causes: tuple[CauseHypothesis, ...] = (),
+    ) -> Evaluation:
+        """Grade each criterion against admissible evidence, for these exact revisions.
+
+        The same evidence, comparators and policy return the same evaluation;
+        restating a cause without new evidence is not new evidence.
+        """
+        expectation, committed_at = self.expectation(expectation_id)
+        if task != expectation.task:
+            raise ValueError("an evaluation is bound to the expectation's own task")
+        causes = tuple(causes)
+        if not all(isinstance(h, CauseHypothesis) for h in causes):
+            raise TypeError("causes must be CauseHypothesis records")
+        observables = {c.observable for c in expectation.criteria}
+        latest = self.observations()
+        by_id = {o.observation_id: o for o in latest}
+        relevant = [
+            o for o in latest if o.observable in observables and _in_window(o, expectation)
+        ]
+        cited = {ref for h in causes for ref in h.support if ref in by_id}
+        inputs = sorted(
+            {(o.observation_id, o.revision) for o in relevant}
+            | {(ref, by_id[ref].revision) for ref in cited}
+        )
+        evaluation_id = _hash(
+            dumps(
+                [
+                    expectation_id,
+                    [list(i) for i in inputs],
+                    sorted(list(c.comparator) for c in expectation.criteria),
+                    self.policy.policy_version,
+                ]
+            )
+        )
+        with self._transaction():
+            old = self._evaluation_row(evaluation_id)
+            if old is not None:
+                return self._evaluation_from(old)
+            revision = (
+                self._conn.execute(
+                    "SELECT COALESCE(MAX(revision), 0) FROM cl_evaluations"
+                    " WHERE owner=? AND expectation_id=?",
+                    (self.owner, expectation_id),
+                ).fetchone()[0]
+                + 1
+            )
+            if revision > self.policy.limits.max_revisions:
+                raise ResourceLimitError(
+                    f"{expectation_id} reached {self.policy.limits.max_revisions} evaluation"
+                    f" revisions; escalate: {self.policy.escalation}"
+                )
+            findings = tuple(
+                _finding(expectation, committed_at, c, relevant, self.policy)
+                for c in expectation.criteria
+            )
+            evaluation = Evaluation(
+                evaluation_id=evaluation_id,
+                expectation_id=expectation_id,
+                revision=revision,
+                findings=findings,
+                policy_version=self.policy.policy_version,
+                causes=causes,
+                attribution_supported=any(
+                    h.support and all(r in by_id and r not in expectation.inputs for r in h.support)
+                    for h in causes
+                ),
+                response=_response(findings),
+            )
+            record = evaluation.to_dict()
+            previous = self._conn.execute(
+                "SELECT evaluation_id FROM cl_evaluations"
+                " WHERE owner=? AND expectation_id=? AND superseded_by IS NULL",
+                (self.owner, expectation_id),
+            ).fetchone()
+            self._conn.execute(
+                "INSERT INTO cl_evaluations VALUES (?, ?, ?, ?, ?, NULL)",
+                (self.owner, evaluation_id, expectation_id, revision, dumps(record)),
+            )
+            self._append("EVALUATED", {"evaluation": record}, expectation_id)
+            if previous is not None:
+                # Marked, never deleted: the earlier finding stays readable.
+                self._conn.execute(
+                    "UPDATE cl_evaluations SET superseded_by=? WHERE owner=? AND evaluation_id=?",
+                    (evaluation_id, self.owner, previous[0]),
+                )
+                self._append(
+                    "EVALUATION_SUPERSEDED",
+                    {"superseded": previous[0], "by": evaluation_id},
+                    expectation_id,
+                )
+        return evaluation
+
+    def current_evaluation(self, expectation_id: str) -> Evaluation | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM cl_evaluations"
+                " WHERE owner=? AND expectation_id=? AND superseded_by IS NULL",
+                (self.owner, expectation_id),
+            ).fetchone()
+        return None if row is None else self._evaluation_from(row)
+
+    def forecast_record(self, predictor: str, *, version: str | None = None) -> list[ForecastRow]:
+        """Confirmation and error counts of current evaluations, per comparable case.
+
+        Retrospective findings are counted apart: they grade, but they were not forecasts.
+        """
+        rows: dict[tuple[Any, ...], dict[str, Any]] = {}
+        with self._lock:
+            current = self._conn.execute(
+                "SELECT e.record_json, v.record_json AS evaluation_json FROM cl_expectations e"
+                " JOIN cl_evaluations v ON v.owner=e.owner AND v.expectation_id=e.expectation_id"
+                " WHERE e.owner=? AND v.superseded_by IS NULL ORDER BY v.rowid",
+                (self.owner,),
+            ).fetchall()
+            kinds = {
+                (r["observation_id"], r["revision"]): json.loads(r["record_json"])["kind"]
+                for r in self._conn.execute(
+                    "SELECT observation_id, revision, record_json FROM cl_observations WHERE owner=?",
+                    (self.owner,),
+                )
+            }
+        for row in current:
+            expectation = Expectation.from_dict(json.loads(row["record_json"]))
+            if expectation.predictor != predictor or version not in (
+                None,
+                expectation.predictor_version,
+            ):
+                continue
+            evaluation = Evaluation.from_dict(json.loads(row["evaluation_json"]))
+            h = expectation.horizon
+            for f in evaluation.findings:
+                c = expectation.criterion(f.criterion)
+                used_kinds = sorted({kinds[u] for u in f.used})
+                key = (
+                    expectation.predictor_version,
+                    c.observable,
+                    _hash(dumps(expectation.to_dict()["conditions"])),
+                    EvidenceKind(used_kinds[0]) if len(used_kinds) == 1 else None,
+                    (h.window_end - h.window_start).total_seconds(),
+                    dumps(c.expected),
+                )
+                counts = rows.setdefault(
+                    key,
+                    {"n": 0, "match": 0, "miss": 0, "unresolved": 0, "conflict": 0,
+                     "retrospective": 0, "probabilities": []},
+                )
+                if f.ordering is Ordering.RETROSPECTIVE:
+                    counts["retrospective"] += 1
+                    continue
+                counts["n"] += 1
+                counts[_COUNT[f.comparison]] += 1
+                if c.comparator[0] == "probabilistic" and f.comparison in _GRADED:
+                    counts["probabilities"].append(float(c.expected["probability"]))
+        return [
+            ForecastRow(
+                predictor=predictor,
+                predictor_version=k[0],
+                observable=k[1],
+                conditions_key=k[2],
+                evidence_kind=k[3],
+                horizon_s=k[4],
+                tolerance=k[5],
+                n=v["n"],
+                match=v["match"],
+                miss=v["miss"],
+                unresolved=v["unresolved"],
+                conflict=v["conflict"],
+                retrospective=v["retrospective"],
+                mean_probability=(
+                    sum(v["probabilities"]) / len(v["probabilities"]) if v["probabilities"] else None
+                ),
+            )
+            for k, v in rows.items()
+        ]
+
+    def evaluation(self, evaluation_id: str) -> Evaluation:
+        with self._lock:
+            row = self._evaluation_row(_name(evaluation_id, "evaluation_id"))
+        if row is None:
+            raise KeyError(f"no evaluation {evaluation_id}")
+        return self._evaluation_from(row)
+
+    def _evaluation_row(self, evaluation_id: str) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT * FROM cl_evaluations WHERE owner=? AND evaluation_id=?",
+            (self.owner, evaluation_id),
+        ).fetchone()
+
+    @staticmethod
+    def _evaluation_from(row: sqlite3.Row) -> Evaluation:
+        return Evaluation.from_dict(json.loads(row["record_json"]), row["superseded_by"])
+
     # --- history -------------------------------------------------------------
 
     def history(
@@ -366,3 +595,136 @@ class ConsequenceLedger:
                     raise LedgerIntegrityError("retained consequence history chain is inconsistent")
                 previous = row["event_hash"]
         return True
+
+
+# --- grading ---------------------------------------------------------------
+
+
+def _inadmissible(o: Observation, c: Criterion, e: Expectation, policy: OwnerPolicy) -> str:
+    """Why *o* cannot grade *c*, or "" when it can."""
+    source = policy.source(o.source)
+    if source is None or o.observable not in source.observables:
+        return "source"
+    if o.unit != c.unit:
+        return "unit"
+    if not o.valid:
+        return "invalid"
+    if o.kind is EvidenceKind.SIMULATED:
+        return "simulated"
+    if o.evidence_ref in e.inputs:
+        return "own witness"
+    h = e.horizon
+    if o.value is None:
+        covered = o.coverage is not None and o.coverage[0] <= h.window_start
+        return "" if covered and o.coverage[1] >= h.window_end else "coverage"
+    return ""
+
+
+def _in_window(o: Observation, e: Expectation) -> bool:
+    """Readings outside the window are not this expectation's evidence at all."""
+    h = e.horizon
+    if o.value is None:
+        return o.coverage is not None and o.coverage[0] < h.window_end and o.coverage[1] > h.window_start
+    return h.window_start <= o.event_time <= h.window_end
+
+
+def _ordering(o: Observation, e: Expectation, committed_at: datetime) -> Ordering:
+    recorded = e.source_sequences.get(o.source)
+    if recorded is not None and o.source_sequence is not None:
+        return Ordering.PROSPECTIVE if o.source_sequence > recorded else Ordering.RETROSPECTIVE
+    # A silence is timed by when its coverage began, not when it was reported.
+    t = o.coverage[0] if o.value is None else o.event_time
+    u = timedelta(seconds=o.clock_uncertainty_s)
+    if t - u > committed_at:
+        return Ordering.PROSPECTIVE
+    if t + u <= committed_at:
+        return Ordering.RETROSPECTIVE
+    return Ordering.UNCERTAIN
+
+
+def _applicability(found: list[Observation], e: Expectation) -> Applicability:
+    if not found:
+        return Applicability.UNRESOLVED
+    keys = e.horizon.invalidated_by
+    seen = {tuple(o.conditions[k] for k in keys) for o in found if all(k in o.conditions for k in keys)}
+    if len(seen) > 1:
+        return Applicability.CONFLICTING
+    results = set()
+    for o in found:
+        result = Applicability.APPLICABLE
+        for k, v in e.horizon.environment_versions.items():
+            if k in o.configuration and o.configuration[k] != v:
+                result = Applicability.OUT_OF_SCOPE
+        for k in keys:
+            if k not in o.conditions:
+                result = result if result is Applicability.OUT_OF_SCOPE else Applicability.UNRESOLVED
+            elif o.conditions[k] != e.conditions.get(k):
+                result = Applicability.OUT_OF_SCOPE
+        results.add(result)
+    for kind in (Applicability.OUT_OF_SCOPE, Applicability.UNRESOLVED):
+        if kind in results:
+            return kind
+    return Applicability.APPLICABLE
+
+
+def _finding(
+    e: Expectation,
+    committed_at: datetime,
+    c: Criterion,
+    observations: list[Observation],
+    policy: OwnerPolicy,
+) -> Finding:
+    compare = COMPARATORS[c.comparator].compare
+    excluded: list[tuple[str, str]] = []
+    graded: list[tuple[Observation, Ordering, bool, bool]] = []
+    for o in observations:
+        if o.observable != c.observable:
+            continue
+        reason = _inadmissible(o, c, e, policy)
+        if reason:
+            excluded.append((o.observation_id, reason))
+            continue
+        ordering = _ordering(o, e, committed_at)
+        if ordering is Ordering.UNCERTAIN:
+            excluded.append((o.observation_id, "ordering"))
+            continue
+        try:
+            met, allowed = compare(c.expected, NOT_OBSERVED if o.value is None else o.value)
+        except (TypeError, ValueError):
+            excluded.append((o.observation_id, "value"))
+            continue
+        graded.append((o, ordering, met, allowed))
+    if not graded:
+        reasons = sorted({r for _, r in excluded})
+        missing = "no admissible observation" + (f" ({', '.join(reasons)})" if reasons else "")
+        return Finding(c.name, None, Applicability.UNRESOLVED, Comparison.UNRESOLVED, (),
+                       tuple(excluded), False, missing)
+    mets = {met for _, _, met, _ in graded}
+    if mets == {True}:
+        comparison = Comparison.CONFIRMED_MATCH
+    elif mets == {False}:
+        comparison = Comparison.CONFIRMED_MISS
+    else:
+        comparison = Comparison.CONFLICT
+    orderings = {ordering for _, ordering, _, _ in graded}
+    return Finding(
+        criterion=c.name,
+        ordering=Ordering.RETROSPECTIVE if Ordering.RETROSPECTIVE in orderings else Ordering.PROSPECTIVE,
+        applicability=_applicability([o for o, *_ in graded], e),
+        comparison=comparison,
+        used=tuple((o.observation_id, o.revision) for o, *_ in graded),
+        excluded=tuple(excluded),
+        allowed_by_model=comparison is Comparison.CONFIRMED_MISS and all(a for *_, a in graded),
+        missing="",
+    )
+
+
+def _response(findings: tuple[Finding, ...]) -> Response:
+    seen = {f.comparison for f in findings}
+    if Comparison.CONFLICT in seen:
+        return Response.RESOLVE_CONFLICT
+    if Comparison.CONFIRMED_MISS in seen:
+        return Response.OPEN_REVIEW
+    if Comparison.UNRESOLVED in seen:
+        return Response.OBSERVE
+    return Response.CONTINUE

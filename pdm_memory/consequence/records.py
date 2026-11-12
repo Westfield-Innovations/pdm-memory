@@ -14,6 +14,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any
 
+from pdm_memory.consequence.compare import COMPARATORS
 from pdm_memory.goal_loop._json import parse_datetime, require_aware, to_decimal
 from pdm_memory.guarded_effects import ConfigurationError, _name
 
@@ -24,10 +25,14 @@ __all__ = [
     "Applicability",
     "Application",
     "Cause",
+    "CauseHypothesis",
     "Comparison",
     "Criterion",
+    "Evaluation",
     "EvidenceKind",
     "Expectation",
+    "Finding",
+    "ForecastRow",
     "Horizon",
     "NotSupported",
     "Observation",
@@ -448,7 +453,11 @@ class OwnerPolicy:
         if len({s.name for s in sources}) != len(sources):
             raise ConfigurationError("source names must be unique")
         object.__setattr__(self, "sources", sources)
-        object.__setattr__(self, "comparators", frozenset(tuple(c) for c in self.comparators))
+        comparators = frozenset(tuple(c) for c in self.comparators)
+        unknown = comparators - COMPARATORS.keys()
+        if unknown:
+            raise ConfigurationError(f"no implementation for comparators {sorted(unknown)}")
+        object.__setattr__(self, "comparators", comparators)
         targets = frozenset(_texts(self.learning_targets, "learning target"))
         if targets & PROTECTED_TARGETS:
             raise ConfigurationError(
@@ -464,3 +473,99 @@ class OwnerPolicy:
 
     def source(self, name: str) -> SourceDecl | None:
         return next((s for s in self.sources if s.name == name), None)
+
+
+@dataclass(frozen=True)
+class CauseHypothesis:
+    """A proposed cause. It is supported only by recorded observations it cites."""
+
+    cause: Cause
+    support: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "cause", Cause(self.cause))
+        object.__setattr__(self, "support", _texts(self.support, "support"))
+
+
+@dataclass(frozen=True)
+class Finding:
+    """One criterion's result. Applicability and ordering are kept beside it."""
+
+    criterion: str
+    ordering: Ordering | None
+    applicability: Applicability
+    comparison: Comparison
+    used: tuple[tuple[str, int], ...]
+    excluded: tuple[tuple[str, str], ...]
+    allowed_by_model: bool
+    missing: str
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> Finding:
+        return cls(
+            criterion=data["criterion"],
+            ordering=None if data["ordering"] is None else Ordering(data["ordering"]),
+            applicability=Applicability(data["applicability"]),
+            comparison=Comparison(data["comparison"]),
+            used=tuple((i, r) for i, r in data["used"]),
+            excluded=tuple((i, r) for i, r in data["excluded"]),
+            allowed_by_model=data["allowed_by_model"],
+            missing=data["missing"],
+        )
+
+
+@dataclass(frozen=True)
+class Evaluation:
+    """Comparison for exact input revisions. It never says the decision was wrong."""
+
+    evaluation_id: str
+    expectation_id: str
+    revision: int
+    findings: tuple[Finding, ...]
+    policy_version: str
+    causes: tuple[CauseHypothesis, ...]
+    attribution_supported: bool
+    response: Response
+    superseded_by: str | None = None
+
+    def finding(self, criterion: str) -> Finding:
+        return next(f for f in self.findings if f.criterion == criterion)
+
+    def to_dict(self) -> dict[str, Any]:
+        record = _plain(self)
+        del record["superseded_by"]
+        return record
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any], superseded_by: str | None = None) -> Evaluation:
+        return cls(
+            evaluation_id=data["evaluation_id"],
+            expectation_id=data["expectation_id"],
+            revision=data["revision"],
+            findings=tuple(Finding.from_dict(f) for f in data["findings"]),
+            policy_version=data["policy_version"],
+            causes=tuple(CauseHypothesis(c["cause"], tuple(c["support"])) for c in data["causes"]),
+            attribution_supported=data["attribution_supported"],
+            response=Response(data["response"]),
+            superseded_by=superseded_by,
+        )
+
+
+@dataclass(frozen=True)
+class ForecastRow:
+    """How one predictor held for one comparable case, with its sample counts."""
+
+    predictor: str
+    predictor_version: str
+    observable: str
+    conditions_key: str
+    evidence_kind: EvidenceKind | None
+    horizon_s: float
+    tolerance: str
+    n: int
+    match: int
+    miss: int
+    unresolved: int
+    conflict: int
+    retrospective: int
+    mean_probability: float | None
