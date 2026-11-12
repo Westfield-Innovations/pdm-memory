@@ -12,7 +12,7 @@ from dataclasses import dataclass, field, fields
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pdm_memory.consequence.compare import COMPARATORS
 from pdm_memory.goal_loop._json import parse_datetime, require_aware, to_decimal
@@ -21,12 +21,15 @@ from pdm_memory.guarded_effects import ConfigurationError, _name
 __all__ = [
     "PROTECTED_TARGETS",
     "Account",
+    "AccountSummary",
     "Admission",
     "Applicability",
     "Application",
+    "CapacityFinding",
     "Cause",
     "CauseHypothesis",
     "Comparison",
+    "ConsequenceEntry",
     "Criterion",
     "Evaluation",
     "EvidenceKind",
@@ -34,9 +37,11 @@ __all__ = [
     "Finding",
     "ForecastRow",
     "Horizon",
+    "InfluencePath",
     "LearningProposal",
     "NotSupported",
     "Observation",
+    "ObservationProposal",
     "Ordering",
     "OwnerPolicy",
     "QuantityStatus",
@@ -49,6 +54,7 @@ __all__ = [
     "TaskRef",
     "UnauthorizedChange",
     "UpdateState",
+    "compare_to_capacity",
 ]
 
 # Outside any learning proposal's editable scope (spec: "Learning under
@@ -601,5 +607,119 @@ class LearningProposal:
                 **data,
                 "route": Route(data["route"]),
                 "evidence_kind": EvidenceKind(data["evidence_kind"]),
+            }
+        )
+
+
+@dataclass(frozen=True)
+class InfluencePath:
+    """A recorded path by which a consequence reaches another task or resource."""
+
+    kind: Literal["declared", "observed", "hypothesized"]
+    scope: str
+    evidence: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.kind not in ("declared", "observed", "hypothesized"):
+            raise ValueError("a path is declared, observed or hypothesized")
+        _name(self.scope, "scope")
+        object.__setattr__(self, "evidence", _texts(self.evidence, "evidence"))
+
+
+@dataclass(frozen=True)
+class ConsequenceEntry:
+    """One quantity in one account. An unknown quantity is not zero."""
+
+    entry_id: str
+    expectation_id: str
+    account: Account
+    subject: str
+    quantity: Decimal | None
+    unit: str
+    horizon_end: datetime
+    source: str
+    status: QuantityStatus
+    path: InfluencePath | None = None
+    boundary_violation: bool = False
+
+    def __post_init__(self) -> None:
+        for label in ("entry_id", "expectation_id", "subject", "unit", "source"):
+            _name(getattr(self, label), label)
+        object.__setattr__(self, "account", Account(self.account))
+        object.__setattr__(self, "status", QuantityStatus(self.status))
+        require_aware(self.horizon_end, "horizon_end")
+        if (self.quantity is None) != (self.status is QuantityStatus.UNKNOWN):
+            raise ValueError("an UNKNOWN quantity has no value, and only an UNKNOWN one")
+        if self.quantity is not None:
+            object.__setattr__(self, "quantity", to_decimal(self.quantity, "quantity"))
+        if type(self.boundary_violation) is not bool:
+            raise TypeError("boundary_violation must be bool")
+        if self.account is Account.COUPLED_EFFECT:
+            if self.path is None:
+                raise ValueError("a coupled effect needs its influence path")
+            if not self.path.evidence:
+                raise ValueError("an influence path needs evidence of the path")
+
+    def to_dict(self) -> dict[str, Any]:
+        return _plain(self)
+
+
+@dataclass(frozen=True)
+class AccountSummary:
+    totals: dict[tuple[Account, str, QuantityStatus], Decimal]
+    unknown: dict[Account, int]
+    combined: Decimal | None
+    combined_reason: str
+
+
+@dataclass(frozen=True)
+class CapacityFinding:
+    status: Literal["WITHIN", "EXCEEDS", "UNKNOWN_CAPACITY", "ZERO_CAPACITY", "INCOMPATIBLE_UNITS"]
+    ratio: Decimal | None = None
+
+
+def compare_to_capacity(
+    forecast: Decimal, forecast_unit: str, remaining: Decimal | None, remaining_unit: str
+) -> CapacityFinding:
+    """Expected burden against a declared remaining budget, in one unit or not at all."""
+    forecast = to_decimal(forecast, "forecast")
+    if remaining is None:
+        return CapacityFinding("UNKNOWN_CAPACITY")
+    if forecast_unit != remaining_unit:
+        return CapacityFinding("INCOMPATIBLE_UNITS")
+    remaining = to_decimal(remaining, "remaining")
+    if remaining == 0:
+        return CapacityFinding("ZERO_CAPACITY")
+    ratio = forecast / remaining
+    return CapacityFinding("WITHIN" if forecast <= remaining else "EXCEEDS", ratio)
+
+
+@dataclass(frozen=True)
+class ObservationProposal:
+    """The next reading that could settle a criterion, and when it stops helping."""
+
+    proposal_id: str
+    expectation_id: str
+    criterion: str
+    distinguishes: tuple[Comparison, ...]
+    decision_ref: str
+    sources: tuple[str, ...]
+    ordered: bool
+    deadline: datetime
+    status: Literal["OPEN", "EXHAUSTED", "TOO_LATE", "CLOSED"]
+    escalation: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return _plain(self)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any], status: str) -> ObservationProposal:
+        return cls(
+            **{
+                **data,
+                "distinguishes": tuple(Comparison(c) for c in data["distinguishes"]),
+                "sources": tuple(data["sources"]),
+                "deadline": parse_datetime(data["deadline"], "deadline"),
+                "status": status,
             }
         )

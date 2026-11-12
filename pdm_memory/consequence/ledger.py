@@ -15,17 +15,21 @@ import threading
 from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 from pdm_memory.consequence.compare import COMPARATORS, NOT_OBSERVED
 from pdm_memory.consequence.records import (
     PROTECTED_TARGETS,
+    Account,
+    AccountSummary,
     Admission,
     Applicability,
     Application,
     CauseHypothesis,
     Comparison,
+    ConsequenceEntry,
     Criterion,
     Evaluation,
     EvidenceKind,
@@ -35,8 +39,10 @@ from pdm_memory.consequence.records import (
     LearningProposal,
     NotSupported,
     Observation,
+    ObservationProposal,
     Ordering,
     OwnerPolicy,
+    QuantityStatus,
     ReconcileFirst,
     Response,
     Route,
@@ -102,6 +108,13 @@ CREATE TABLE IF NOT EXISTS cl_updates (
   criterion TEXT NOT NULL, target_kind TEXT NOT NULL, target_id TEXT NOT NULL,
   record_json TEXT NOT NULL, state TEXT NOT NULL,
   PRIMARY KEY(owner, update_id));
+CREATE TABLE IF NOT EXISTS cl_consequences (
+  owner TEXT NOT NULL, entry_id TEXT NOT NULL, expectation_id TEXT NOT NULL,
+  record_json TEXT NOT NULL, PRIMARY KEY(owner, entry_id));
+CREATE TABLE IF NOT EXISTS cl_proposals (
+  owner TEXT NOT NULL, proposal_id TEXT NOT NULL, expectation_id TEXT NOT NULL,
+  criterion TEXT NOT NULL, status TEXT NOT NULL, record_json TEXT NOT NULL,
+  PRIMARY KEY(owner, proposal_id));
 CREATE TABLE IF NOT EXISTS cl_events (
   sequence INTEGER PRIMARY KEY, owner TEXT NOT NULL, expectation_id TEXT,
   kind TEXT NOT NULL, payload_json TEXT NOT NULL, previous_hash TEXT NOT NULL,
@@ -454,6 +467,9 @@ class ConsequenceLedger:
                 (self.owner, evaluation_id, expectation_id, revision, dumps(record)),
             )
             self._append("EVALUATED", {"evaluation": record}, expectation_id)
+            for f in findings:
+                if f.comparison is not Comparison.UNRESOLVED:
+                    self._close_proposals(expectation_id, f.criterion, evaluation_id)
             if previous is not None:
                 # Marked, never deleted: the earlier finding stays readable.
                 self._conn.execute(
@@ -729,6 +745,167 @@ class ConsequenceLedger:
                 row["expectation_id"],
             )
         return new
+
+    # --- consequence accounts ------------------------------------------------
+
+    def record_consequence(self, entry: ConsequenceEntry) -> str:
+        """Append one account entry for a retained expectation."""
+        if not isinstance(entry, ConsequenceEntry):
+            raise TypeError("record_consequence takes a ConsequenceEntry")
+        self.expectation(entry.expectation_id)
+        record = entry.to_dict()
+        encoded = dumps(record, limit=self._limit)
+        with self._transaction():
+            old = self._conn.execute(
+                "SELECT record_json FROM cl_consequences WHERE owner=? AND entry_id=?",
+                (self.owner, entry.entry_id),
+            ).fetchone()
+            if old:
+                if old[0] != encoded:
+                    raise IdReuseError("entry_id already binds a different consequence")
+                return entry.entry_id
+            self._conn.execute(
+                "INSERT INTO cl_consequences VALUES (?, ?, ?, ?)",
+                (self.owner, entry.entry_id, entry.expectation_id, encoded),
+            )
+            self._append("CONSEQUENCE_RECORDED", {"entry": record}, entry.expectation_id)
+        return entry.entry_id
+
+    def accounts(self, expectation_id: str) -> AccountSummary:
+        """Totals per account, unit and status. Combined only under the owner's rules."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT record_json FROM cl_consequences WHERE owner=? AND expectation_id=?"
+                " ORDER BY rowid",
+                (self.owner, expectation_id),
+            ).fetchall()
+        totals: dict[tuple[Account, str, QuantityStatus], Decimal] = {}
+        unknown: dict[Account, int] = {}
+        violated = False
+        units: set[str] = set()
+        for row in rows:
+            data = json.loads(row[0])
+            account, status = Account(data["account"]), QuantityStatus(data["status"])
+            violated = violated or data["boundary_violation"]
+            if data["quantity"] is None:
+                unknown[account] = unknown.get(account, 0) + 1
+                continue
+            key = (account, data["unit"], status)
+            totals[key] = totals.get(key, Decimal(0)) + Decimal(data["quantity"])
+            units.add(data["unit"])
+        rules = self.policy.exchange_rules
+        if violated:
+            return AccountSummary(totals, unknown, None, "a hard boundary was violated")
+        if unknown:
+            return AccountSummary(totals, unknown, None, "some quantities are unknown")
+        missing = sorted(units - set(rules or {}))
+        if rules is None or missing:
+            return AccountSummary(totals, unknown, None, f"no owner exchange rule for {missing}")
+        combined = sum((q * rules[unit] for (_, unit, _), q in totals.items()), Decimal(0))
+        return AccountSummary(totals, unknown, combined, "")
+
+    # --- observation proposals -----------------------------------------------
+
+    def suggest_observation(
+        self, expectation_id: str, *, now: datetime | None = None
+    ) -> tuple[ObservationProposal, ...]:
+        """One proposal per unresolved criterion, coalesced and within owner limits.
+
+        It names sources and a deadline; it never requests an action.
+        """
+        expectation, _ = self.expectation(expectation_id)
+        now = self._now() if now is None else require_aware(now, "now")
+        evaluation = self.current_evaluation(expectation_id)
+        names = (
+            [f.criterion for f in evaluation.findings if f.comparison is Comparison.UNRESOLVED]
+            if evaluation is not None
+            else [c.name for c in expectation.criteria]
+        )
+        limits = self.policy.limits
+        deadline = expectation.horizon.latest_decision_point
+        out = []
+        with self._transaction():
+            for name in names:
+                c = expectation.criterion(name)
+                proposal_id = _hash(
+                    dumps([expectation_id, name, evaluation.evaluation_id if evaluation else ""])
+                )
+                old = self._conn.execute(
+                    "SELECT record_json, status FROM cl_proposals WHERE owner=? AND proposal_id=?",
+                    (self.owner, proposal_id),
+                ).fetchone()
+                if old is not None:
+                    out.append(ObservationProposal.from_dict(json.loads(old[0]), old[1]))
+                    continue
+                sources = [s for s in self.policy.sources if c.observable in s.observables]
+                ordered = len({(s.cost_unit, s.burden_unit) for s in sources}) == 1
+                if ordered:
+                    sources.sort(key=lambda s: (s.cost, s.burden, s.latency_s))
+                if now > deadline:
+                    status = "TOO_LATE"
+                elif self._count_proposals(expectation_id, name) >= limits.max_repeats or (
+                    self._count_proposals() >= limits.max_outstanding
+                ):
+                    status = "EXHAUSTED"
+                else:
+                    status = "OPEN"
+                proposal = ObservationProposal(
+                    proposal_id=proposal_id,
+                    expectation_id=expectation_id,
+                    criterion=name,
+                    distinguishes=(Comparison.CONFIRMED_MATCH, Comparison.CONFIRMED_MISS),
+                    decision_ref=expectation.decision_ref,
+                    sources=tuple(s.name for s in sources),
+                    ordered=ordered,
+                    deadline=deadline,
+                    status=status,
+                    escalation=self.policy.escalation if status == "EXHAUSTED" else "",
+                )
+                if status == "TOO_LATE":
+                    out.append(proposal)
+                    continue
+                # A newer evaluation replaces the request made from an older one.
+                self._close_proposals(expectation_id, name, "replaced")
+                record = proposal.to_dict()
+                del record["status"]
+                self._conn.execute(
+                    "INSERT INTO cl_proposals VALUES (?, ?, ?, ?, ?, ?)",
+                    (self.owner, proposal_id, expectation_id, name, status, dumps(record)),
+                )
+                self._append(
+                    "OBSERVATION_PROPOSED", {"proposal": proposal.to_dict()}, expectation_id
+                )
+                out.append(proposal)
+        return tuple(out)
+
+    def _count_proposals(self, expectation_id: str | None = None, criterion: str = "") -> int:
+        if expectation_id is None:
+            sql, args = "status='OPEN'", ()
+        else:
+            sql, args = "expectation_id=? AND criterion=?", (expectation_id, criterion)
+        return self._conn.execute(
+            f"SELECT COUNT(*) FROM cl_proposals WHERE owner=? AND {sql}", (self.owner, *args)
+        ).fetchone()[0]
+
+    def _close_proposals(self, expectation_id: str, criterion: str, reason: str) -> None:
+        open_ids = [
+            r[0]
+            for r in self._conn.execute(
+                "SELECT proposal_id FROM cl_proposals"
+                " WHERE owner=? AND expectation_id=? AND criterion=? AND status='OPEN'",
+                (self.owner, expectation_id, criterion),
+            )
+        ]
+        for proposal_id in open_ids:
+            self._conn.execute(
+                "UPDATE cl_proposals SET status='CLOSED' WHERE owner=? AND proposal_id=?",
+                (self.owner, proposal_id),
+            )
+            self._append(
+                "OBSERVATION_PROPOSAL_CLOSED",
+                {"proposal_id": proposal_id, "by": reason},
+                expectation_id,
+            )
 
     # --- history -------------------------------------------------------------
 
