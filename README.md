@@ -593,6 +593,65 @@ for the theme, lifecycle and integration responsibilities. The OpenClaw plugin
 also now defaults to blocking when its checker cannot complete; see its
 [configuration and migration notes](plugins/openclaw/README.md).
 
+### Consequence ledger preview
+
+`pdm_memory.consequence.ConsequenceLedger` keeps what AZUS expected before it
+acted, what was later observed, and what the evidence supports learning. A bad
+result opens a review; it does not by itself say the decision was wrong.
+
+- `prepare` retains an expectation before its action. `prepared_check` plugs into
+  a `GuardedEffects` opening and holds release until one is retained.
+- `observe` appends readings; a correction is a new revision naming the one it
+  supersedes. `evaluate` grades each criterion as `CONFIRMED_MATCH`,
+  `CONFIRMED_MISS`, `UNRESOLVED` or `CONFLICT`, with ordering and applicability
+  beside it. A handler return is not an effect, a missing reading is
+  `UNRESOLVED`, and an expectation's own inputs never witness for it.
+- `propose_learning` names one owner-admitted target and a bounded change. It
+  applies nothing: the owner's controller admits it, and `record_update_receipt`
+  keeps the result. Accepted without an application receipt is `UNCERTAIN`.
+- `record_consequence` / `accounts` keep task result, agent operation, principal
+  burden and coupled effects apart unless the owner's exchange rules cover them.
+  `suggest_observation` names the next useful reading and its deadline.
+
+```python
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from pdm_memory.consequence import (
+    ConsequenceLedger, Criterion, EvidenceKind, Expectation, Horizon, Observation,
+    OwnerPolicy, ReviewLimits, SourceDecl, Stage, TaskRef,
+)
+
+now = datetime.now(timezone.utc)
+policy = OwnerPolicy(
+    policy_version="1",
+    sources=(SourceDecl("room-sensor", frozenset({"room_temp_c"}), 30.0,
+                        Decimal("1"), "call", Decimal("0"), "min"),),
+    comparators=frozenset({("range", "1")}),
+    learning_targets=frozenset({"predictor"}),
+    limits=ReviewLimits(max_outstanding=8, max_repeats=3,
+                        max_payload_bytes=65_536, max_revisions=8),
+    escalation="notify the owner",
+)
+task = TaskRef("heat-room-4", "owner-1")
+with ConsequenceLedger("./consequences.db", owner="owner-1", policy=policy) as ledger:
+    ledger.prepare(Expectation(
+        expectation_id="exp-1", task=task, predictor="valve-model", predictor_version="1",
+        criteria=(Criterion("room_temp", "room_temp_c", Stage.TASK_EFFECT, ("range", "1"),
+                            "degC", {"low": 20.0, "high": 22.0}),),
+        horizon=Horizon(now + timedelta(minutes=1), now + timedelta(hours=1),
+                        now + timedelta(hours=2)),
+    ))
+    ledger.observe(Observation(
+        "obs-1", 1, "room-sensor", "room_temp_c", now + timedelta(minutes=30),
+        now + timedelta(minutes=31), 21.0, "degC", "sensor:room-4:1", EvidenceKind.MEASURED,
+    ))
+    print(ledger.evaluate("exp-1", task=task).response)  # Response.CONTINUE
+```
+
+The ledger is its own SQLite file, kept outside the worker's authority like the
+guard's, and never writes to a PDM store. It follows the AZUS Consequence and
+Learning Specification V1.
+
 ### Goal Loop preview: the Goal Contract
 
 A Goal Loop job is written down once, as one `GoalContract` record that every

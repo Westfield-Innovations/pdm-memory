@@ -330,3 +330,14 @@ def test_the_forecast_record_counts_current_prospective_findings_only(ledger):
     assert graded.horizon_s == 3600.0 and graded.observable == "room_temp_c"
     assert ledger.forecast_record("valve-model", version="2") == []
     assert ledger.forecast_record("other-model") == []
+
+
+def test_standing_causes_carry_forward_until_dropped(ledger):
+    pressure = replace(TEMP, observation_id="obs-supply", observable="supply_bar", value=0.4)
+    _with(ledger, POSITION_MOVED, replace(TEMP, value=25.0), pressure)
+    cited = (CauseHypothesis(Cause.EXECUTION, ("obs-supply",)),)
+    supported = ledger.evaluate("exp-valve-1", task=TASK, causes=cited)
+    assert ledger.evaluate("exp-valve-1", task=TASK) == supported
+    assert ledger.current_evaluation("exp-valve-1") == supported
+    dropped = ledger.evaluate("exp-valve-1", task=TASK, causes=())
+    assert (dropped.revision, dropped.attribution_supported) == (2, False)
