@@ -6,6 +6,7 @@ rules; learning leaves only as a proposal for the owner's update path.
 Nothing here writes to a PDM store.
 """
 
+from pdm_memory.consequence.ledger import ConsequenceLedger
 from pdm_memory.consequence.records import (
     PROTECTED_TARGETS,
     Account,
@@ -42,6 +43,7 @@ __all__ = [
     "Application",
     "Cause",
     "Comparison",
+    "ConsequenceLedger",
     "Criterion",
     "EvidenceKind",
     "Expectation",

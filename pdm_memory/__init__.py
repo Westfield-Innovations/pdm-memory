@@ -33,6 +33,7 @@ from pdm_memory.core.signature import (
 )
 from pdm_memory.filters import FilterRefused, FilterVerdict, NounProbeFilter, SaveFilter
 from pdm_memory.memory import Memory
+from pdm_memory.consequence import ConsequenceLedger
 from pdm_memory.guarded_effects import (
     ActionReceipt,
     BranchError,
@@ -69,6 +70,7 @@ __all__ = [
     "CheckResult",
     "ConditionVerdict",
     "ConfigurationError",
+    "ConsequenceLedger",
     "ContraryEvidenceResult",
     "ContractHistory",
     "DecaySnapshot",
