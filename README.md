@@ -611,7 +611,16 @@ result opens a review; it does not by itself say the decision was wrong.
   keeps the result. Accepted without an application receipt is `UNCERTAIN`.
 - `record_consequence` / `accounts` keep task result, agent operation, principal
   burden and coupled effects apart unless the owner's exchange rules cover them.
-  `suggest_observation` names the next useful reading and its deadline.
+  `suggest_observation` names the next useful reading and its deadline, and,
+  when a criterion declares what it could avoid, each source's net value on the
+  owner's basis.
+- A `Horizon` can wait for an `EventCondition` instead of a fixed window:
+  readings count from the first admissible reading that meets it.
+- `significance` reports the owner's review priority, how many revisions in a
+  row stayed open, the recorded reach and whether an interruption is permitted.
+  Priority never changes a response or a review limit.
+- `revoke_expectation` stops further evaluation and proposals (the guard holds
+  its action); `revoke_update` records the controller withdrawing an applied update.
 
 ```python
 from datetime import datetime, timedelta, timezone
