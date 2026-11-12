@@ -36,6 +36,7 @@ from pdm_memory.consequence.records import (
     Expectation,
     Finding,
     ForecastRow,
+    Horizon,
     LearningProposal,
     NotSupported,
     Observation,
@@ -213,7 +214,10 @@ class ConsequenceLedger:
         """Retain *expectation* and return its id, before the action is released."""
         if not isinstance(expectation, Expectation):
             raise TypeError("prepare takes an Expectation")
-        for c in expectation.criteria:
+        rules = list(expectation.criteria)
+        if expectation.horizon.event is not None:
+            rules.append(expectation.horizon.event)
+        for c in rules:
             if c.comparator not in self.policy.comparators:
                 raise ValueError(f"comparator {c.comparator} is not registered by the owner")
             COMPARATORS[c.comparator].check_expected(c.expected)
@@ -421,12 +425,16 @@ class ConsequenceLedger:
         observables = {c.observable for c in expectation.criteria}
         latest = self.observations()
         by_id = {o.observation_id: o for o in latest}
+        window = _window(expectation, latest, self.policy)
         relevant = [
-            o for o in latest if o.observable in observables and _in_window(o, expectation)
+            o
+            for o in latest
+            if o.observable in observables and window is not None and _in_window(o, window)
         ]
         cited = {ref for h in causes for ref in h.support if ref in by_id}
         inputs = sorted(
             {(o.observation_id, o.revision) for o in relevant}
+            | {(o.observation_id, o.revision) for o in _event_readings(expectation, latest)}
             | {(ref, by_id[ref].revision) for ref in cited}
         )
         evaluation_id = _hash(
@@ -456,7 +464,7 @@ class ConsequenceLedger:
                 f" revisions; escalate: {self.policy.escalation}"
             )
         findings = tuple(
-            _finding(expectation, committed_at, c, relevant, self.policy)
+            _finding(expectation, committed_at, c, relevant, self.policy, window)
             for c in expectation.criteria
         )
         evaluation = Evaluation(
@@ -549,7 +557,7 @@ class ConsequenceLedger:
                     c.observable,
                     _hash(dumps(expectation.to_dict()["conditions"])),
                     EvidenceKind(used_kinds[0]) if len(used_kinds) == 1 else None,
-                    (h.window_end - h.window_start).total_seconds(),
+                    _horizon_s(h),
                     dumps(c.expected),
                 )
                 counts = rows.setdefault(
@@ -1006,12 +1014,23 @@ class ConsequenceLedger:
 # --- grading ---------------------------------------------------------------
 
 
-def _inadmissible(o: Observation, c: Criterion, e: Expectation, policy: OwnerPolicy) -> str:
-    """Why *o* cannot grade *c*, or "" when it can."""
+_Window = tuple[datetime, datetime]
+
+
+def _horizon_s(h: Horizon) -> float:
+    if h.event is not None and h.event.grade_for_s is not None:
+        return float(h.event.grade_for_s)
+    return (h.window_end - h.window_start).total_seconds()
+
+
+def _inadmissible(
+    o: Observation, unit: str, e: Expectation, policy: OwnerPolicy, window: _Window
+) -> str:
+    """Why *o* cannot grade a rule in *unit*, or "" when it can."""
     source = policy.source(o.source)
     if source is None or o.observable not in source.observables:
         return "source"
-    if o.unit != c.unit:
+    if o.unit != unit:
         return "unit"
     if not o.valid:
         return "invalid"
@@ -1019,10 +1038,9 @@ def _inadmissible(o: Observation, c: Criterion, e: Expectation, policy: OwnerPol
         return "simulated"
     if o.evidence_ref in e.inputs:
         return "own witness"
-    h = e.horizon
     if o.value is None:
-        covered = o.coverage is not None and o.coverage[0] <= h.window_start
-        return "" if covered and o.coverage[1] >= h.window_end else "coverage"
+        covered = o.coverage is not None and o.coverage[0] <= window[0]
+        return "" if covered and o.coverage[1] >= window[1] else "coverage"
     return ""
 
 
@@ -1038,20 +1056,57 @@ def _admissible_support(o: Observation, e: Expectation, policy: OwnerPolicy) -> 
     )
 
 
-def _in_window(o: Observation, e: Expectation) -> bool:
+def _in_window(o: Observation, window: _Window) -> bool:
     """Readings outside the window are not this expectation's evidence at all."""
-    h = e.horizon
+    start, end = window
     if o.value is None:
-        return o.coverage is not None and o.coverage[0] < h.window_end and o.coverage[1] > h.window_start
-    return h.window_start <= o.event_time <= h.window_end
+        return o.coverage is not None and o.coverage[0] < end and o.coverage[1] > start
+    return start <= o.event_time <= end
 
 
-def _ordering(o: Observation, e: Expectation, committed_at: datetime) -> Ordering:
+def _event_readings(e: Expectation, observations: list[Observation]) -> list[Observation]:
+    """Every reading that could open an event horizon; a correction to one is new evidence."""
+    h, event = e.horizon, e.horizon.event
+    if event is None:
+        return []
+    return [
+        o
+        for o in observations
+        if o.observable == event.observable and h.window_start <= o.event_time <= h.window_end
+    ]
+
+
+def _window(e: Expectation, observations: list[Observation], policy: OwnerPolicy) -> _Window | None:
+    """The span readings are graded over; None while the awaited event is unseen."""
+    h, event = e.horizon, e.horizon.event
+    if event is None:
+        return h.window_start, h.window_end
+    compare = COMPARATORS[event.comparator].compare
+    times = []
+    for o in _event_readings(e, observations):
+        # A silence cannot be the event, and the event needs admissible evidence.
+        if o.value is None or _inadmissible(o, event.unit, e, policy, (h.window_start, h.window_end)):
+            continue
+        try:
+            met, _ = compare(event.expected, o.value)
+        except (TypeError, ValueError):
+            continue
+        if met:
+            times.append(o.event_time)
+    if not times:
+        return None
+    start = min(times)
+    if event.grade_for_s is None:
+        return start, h.window_end
+    return start, min(h.window_end, start + timedelta(seconds=event.grade_for_s))
+
+
+def _ordering(o: Observation, e: Expectation, committed_at: datetime, window: _Window) -> Ordering:
     recorded = e.source_sequences.get(o.source)
     if recorded is not None and o.source_sequence is not None:
         return Ordering.PROSPECTIVE if o.source_sequence > recorded else Ordering.RETROSPECTIVE
     # A silence is graded over the window it covers, so the window's opening times it.
-    t = e.horizon.window_start if o.value is None else o.event_time
+    t = window[0] if o.value is None else o.event_time
     u = timedelta(seconds=o.clock_uncertainty_s)
     if t - u > committed_at:
         return Ordering.PROSPECTIVE
@@ -1091,18 +1146,22 @@ def _finding(
     c: Criterion,
     observations: list[Observation],
     policy: OwnerPolicy,
+    window: _Window | None,
 ) -> Finding:
+    if window is None:
+        return Finding(c.name, None, Applicability.UNRESOLVED, Comparison.UNRESOLVED, (), (),
+                       False, "event not observed")
     compare = COMPARATORS[c.comparator].compare
     excluded: list[tuple[str, str]] = []
     graded: list[tuple[Observation, Ordering, bool, bool]] = []
     for o in observations:
         if o.observable != c.observable:
             continue
-        reason = _inadmissible(o, c, e, policy)
+        reason = _inadmissible(o, c.unit, e, policy, window)
         if reason:
             excluded.append((o.observation_id, reason))
             continue
-        ordering = _ordering(o, e, committed_at)
+        ordering = _ordering(o, e, committed_at, window)
         if ordering is Ordering.UNCERTAIN:
             excluded.append((o.observation_id, "ordering"))
             continue

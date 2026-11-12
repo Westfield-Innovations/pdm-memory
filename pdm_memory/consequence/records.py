@@ -33,6 +33,7 @@ __all__ = [
     "ConsequenceEntry",
     "Criterion",
     "Evaluation",
+    "EventCondition",
     "EvidenceKind",
     "Expectation",
     "Finding",
@@ -175,7 +176,12 @@ def _plain(value: Any) -> Any:
     if isinstance(value, Decimal):
         return str(value)
     if hasattr(value, "__dataclass_fields__"):
-        return {f.name: _plain(getattr(value, f.name)) for f in fields(value)}
+        # Optional fields at their default stay out, so older records keep their bytes and ids.
+        return {
+            f.name: _plain(getattr(value, f.name))
+            for f in fields(value)
+            if not (f.metadata.get("optional") and getattr(value, f.name) == f.default)
+        }
     if isinstance(value, Mapping):
         return {k: _plain(v) for k, v in value.items()}
     if isinstance(value, (tuple, list)):
@@ -238,13 +244,49 @@ class Criterion:
         return cls(**{**data, "comparator": tuple(data["comparator"])})
 
 
+_OPTIONAL = {"optional": True}
+
+
+@dataclass(frozen=True)
+class EventCondition:
+    """The event that opens grading: the first admissible reading that meets it.
+
+    Readings count from that event to ``grade_for_s`` later, or to the window's
+    end when it is None.
+    """
+
+    observable: str
+    unit: str
+    comparator: tuple[str, str]
+    expected: Any
+    grade_for_s: float | None = None
+
+    def __post_init__(self) -> None:
+        _name(self.observable, "observable")
+        _name(self.unit, "unit")
+        comparator = tuple(self.comparator)
+        if len(comparator) != 2:
+            raise ValueError("comparator must be a (name, version) pair")
+        object.__setattr__(self, "comparator", _texts(comparator, "comparator"))
+        g = self.grade_for_s
+        if g is not None and (type(g) not in (int, float) or not math.isfinite(g) or g <= 0):
+            raise ValueError("grade_for_s must be a finite positive number")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> EventCondition:
+        return cls(**{**data, "comparator": tuple(data["comparator"])})
+
+
 @dataclass(frozen=True)
 class Horizon:
+    """The window readings may fall in, or, with ``event``, the wait for that event."""
+
     window_start: datetime
     window_end: datetime
     latest_decision_point: datetime
     environment_versions: dict[str, str] = field(default_factory=dict)
     invalidated_by: tuple[str, ...] = ()
+    event: EventCondition | None = field(default=None, metadata=_OPTIONAL)
 
     def __post_init__(self) -> None:
         for label in ("window_start", "window_end", "latest_decision_point"):
@@ -253,6 +295,8 @@ class Horizon:
             raise ValueError("the observation window must close after it opens")
         object.__setattr__(self, "environment_versions", dict(self.environment_versions))
         object.__setattr__(self, "invalidated_by", _texts(self.invalidated_by, "condition"))
+        if self.event is not None and not isinstance(self.event, EventCondition):
+            raise TypeError("event must be an EventCondition")
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Horizon:
@@ -264,6 +308,7 @@ class Horizon:
             ),
             environment_versions=data["environment_versions"],
             invalidated_by=tuple(data["invalidated_by"]),
+            event=EventCondition.from_dict(data["event"]) if data.get("event") else None,
         )
 
 
