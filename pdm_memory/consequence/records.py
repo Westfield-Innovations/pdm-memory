@@ -12,6 +12,7 @@ from dataclasses import dataclass, field, fields
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
+from types import MappingProxyType
 from typing import Any, Literal
 
 from pdm_memory.consequence.compare import COMPARATORS
@@ -475,7 +476,9 @@ class OwnerPolicy:
             object.__setattr__(
                 self,
                 "exchange_rules",
-                {_name(k, "unit"): to_decimal(v, "exchange rate") for k, v in self.exchange_rules.items()},
+                MappingProxyType(
+                    {_name(k, "unit"): to_decimal(v, "exchange rate") for k, v in self.exchange_rules.items()}
+                ),
             )
 
     def source(self, name: str) -> SourceDecl | None:
@@ -536,7 +539,10 @@ class Evaluation:
     superseded_by: str | None = None
 
     def finding(self, criterion: str) -> Finding:
-        return next(f for f in self.findings if f.criterion == criterion)
+        for f in self.findings:
+            if f.criterion == criterion:
+                return f
+        raise KeyError(criterion)
 
     def to_dict(self) -> dict[str, Any]:
         record = _plain(self)
@@ -703,7 +709,7 @@ class ObservationProposal:
     criterion: str
     distinguishes: tuple[Comparison, ...]
     decision_ref: str
-    sources: tuple[str, ...]
+    sources: tuple[SourceDecl, ...]
     ordered: bool
     deadline: datetime
     status: Literal["OPEN", "EXHAUSTED", "TOO_LATE", "CLOSED"]
@@ -718,7 +724,10 @@ class ObservationProposal:
             **{
                 **data,
                 "distinguishes": tuple(Comparison(c) for c in data["distinguishes"]),
-                "sources": tuple(data["sources"]),
+                "sources": tuple(
+                    SourceDecl(**{**s, "observables": frozenset(s["observables"])})
+                    for s in data["sources"]
+                ),
                 "deadline": parse_datetime(data["deadline"], "deadline"),
                 "status": status,
             }

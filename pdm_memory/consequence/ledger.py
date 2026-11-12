@@ -399,12 +399,25 @@ class ConsequenceLedger:
         expectation, committed_at = self.expectation(expectation_id)
         if task != expectation.task:
             raise ValueError("an evaluation is bound to the expectation's own task")
+        if causes is not None:
+            causes = tuple(causes)
+            if not all(isinstance(h, CauseHypothesis) for h in causes):
+                raise TypeError("causes must be CauseHypothesis records")
+        # Evidence is read under the write lock, so a slower caller can never
+        # supersede a revision built from newer readings.
+        with self._transaction():
+            return self._evaluate(expectation, committed_at, causes)
+
+    def _evaluate(
+        self,
+        expectation: Expectation,
+        committed_at: datetime,
+        causes: tuple[CauseHypothesis, ...] | None,
+    ) -> Evaluation:
+        expectation_id = expectation.expectation_id
         if causes is None:
             current = self.current_evaluation(expectation_id)
             causes = current.causes if current is not None else ()
-        causes = tuple(causes)
-        if not all(isinstance(h, CauseHypothesis) for h in causes):
-            raise TypeError("causes must be CauseHypothesis records")
         observables = {c.observable for c in expectation.criteria}
         latest = self.observations()
         by_id = {o.observation_id: o for o in latest}
@@ -426,65 +439,68 @@ class ConsequenceLedger:
                 ]
             )
         )
-        with self._transaction():
-            old = self._evaluation_row(evaluation_id)
-            if old is not None:
-                return self._evaluation_from(old)
-            revision = (
-                self._conn.execute(
-                    "SELECT COALESCE(MAX(revision), 0) FROM cl_evaluations"
-                    " WHERE owner=? AND expectation_id=?",
-                    (self.owner, expectation_id),
-                ).fetchone()[0]
-                + 1
-            )
-            if revision > self.policy.limits.max_revisions:
-                raise ResourceLimitError(
-                    f"{expectation_id} reached {self.policy.limits.max_revisions} evaluation"
-                    f" revisions; escalate: {self.policy.escalation}"
-                )
-            findings = tuple(
-                _finding(expectation, committed_at, c, relevant, self.policy)
-                for c in expectation.criteria
-            )
-            evaluation = Evaluation(
-                evaluation_id=evaluation_id,
-                expectation_id=expectation_id,
-                revision=revision,
-                findings=findings,
-                policy_version=self.policy.policy_version,
-                causes=causes,
-                attribution_supported=any(
-                    h.support and all(r in by_id and r not in expectation.inputs for r in h.support)
-                    for h in causes
-                ),
-                response=_response(findings),
-            )
-            record = evaluation.to_dict()
-            previous = self._conn.execute(
-                "SELECT evaluation_id FROM cl_evaluations"
-                " WHERE owner=? AND expectation_id=? AND superseded_by IS NULL",
-                (self.owner, expectation_id),
-            ).fetchone()
+        old = self._evaluation_row(evaluation_id)
+        if old is not None:
+            return self._evaluation_from(old)
+        revision = (
             self._conn.execute(
-                "INSERT INTO cl_evaluations VALUES (?, ?, ?, ?, ?, NULL)",
-                (self.owner, evaluation_id, expectation_id, revision, dumps(record)),
+                "SELECT COALESCE(MAX(revision), 0) FROM cl_evaluations"
+                " WHERE owner=? AND expectation_id=?",
+                (self.owner, expectation_id),
+            ).fetchone()[0]
+            + 1
+        )
+        if revision > self.policy.limits.max_revisions:
+            raise ResourceLimitError(
+                f"{expectation_id} reached {self.policy.limits.max_revisions} evaluation"
+                f" revisions; escalate: {self.policy.escalation}"
             )
-            self._append("EVALUATED", {"evaluation": record}, expectation_id)
-            for f in findings:
-                if f.comparison is not Comparison.UNRESOLVED:
-                    self._close_proposals(expectation_id, f.criterion, evaluation_id)
-            if previous is not None:
-                # Marked, never deleted: the earlier finding stays readable.
-                self._conn.execute(
-                    "UPDATE cl_evaluations SET superseded_by=? WHERE owner=? AND evaluation_id=?",
-                    (evaluation_id, self.owner, previous[0]),
+        findings = tuple(
+            _finding(expectation, committed_at, c, relevant, self.policy)
+            for c in expectation.criteria
+        )
+        evaluation = Evaluation(
+            evaluation_id=evaluation_id,
+            expectation_id=expectation_id,
+            revision=revision,
+            findings=findings,
+            policy_version=self.policy.policy_version,
+            causes=causes,
+            attribution_supported=any(
+                h.support
+                and all(
+                    r in by_id and _admissible_support(by_id[r], expectation, self.policy)
+                    for r in h.support
                 )
-                self._append(
-                    "EVALUATION_SUPERSEDED",
-                    {"superseded": previous[0], "by": evaluation_id},
-                    expectation_id,
-                )
+                for h in causes
+            ),
+            response=_response(findings),
+        )
+        record = evaluation.to_dict()
+        previous = self._conn.execute(
+            "SELECT evaluation_id FROM cl_evaluations"
+            " WHERE owner=? AND expectation_id=? AND superseded_by IS NULL",
+            (self.owner, expectation_id),
+        ).fetchone()
+        self._conn.execute(
+            "INSERT INTO cl_evaluations VALUES (?, ?, ?, ?, ?, NULL)",
+            (self.owner, evaluation_id, expectation_id, revision, dumps(record)),
+        )
+        self._append("EVALUATED", {"evaluation": record}, expectation_id)
+        for f in findings:
+            if f.comparison is not Comparison.UNRESOLVED:
+                self._close_proposals(expectation_id, f.criterion, evaluation_id)
+        if previous is not None:
+            # Marked, never deleted: the earlier finding stays readable.
+            self._conn.execute(
+                "UPDATE cl_evaluations SET superseded_by=? WHERE owner=? AND evaluation_id=?",
+                (evaluation_id, self.owner, previous[0]),
+            )
+            self._append(
+                "EVALUATION_SUPERSEDED",
+                {"superseded": previous[0], "by": evaluation_id},
+                expectation_id,
+            )
         return evaluation
 
     def current_evaluation(self, expectation_id: str) -> Evaluation | None:
@@ -593,6 +609,7 @@ class ConsequenceLedger:
         self,
         evaluation_id: str,
         *,
+        task: TaskRef,
         criterion: str,
         target_kind: str,
         target_id: str,
@@ -623,6 +640,8 @@ class ConsequenceLedger:
         dumps(change, limit=self._limit)
         evaluation = self.evaluation(evaluation_id)
         expectation, _ = self.expectation(evaluation.expectation_id)
+        if task != expectation.task:
+            raise ValueError("a proposal is bound to the expectation's own task")
         if evaluation.superseded_by is not None:
             raise NotSupported("this evaluation was superseded; propose from the current one")
         finding = evaluation.finding(criterion)
@@ -650,13 +669,19 @@ class ConsequenceLedger:
             ).fetchone()
             if old is not None:
                 return LearningProposal.from_dict(json.loads(old[0]))
+            same_target = (self.owner, expectation.expectation_id, criterion, target_kind, target_id)
+            uncertain = self._conn.execute(
+                "SELECT update_id FROM cl_updates WHERE owner=? AND expectation_id=?"
+                " AND criterion=? AND target_kind=? AND target_id=? AND state=? LIMIT 1",
+                (*same_target, UpdateState.UNCERTAIN.value),
+            ).fetchone()
+            if uncertain is not None:
+                raise ReconcileFirst(f"update {uncertain[0]} has no application receipt")
             prior = self._conn.execute(
                 "SELECT update_id, state FROM cl_updates WHERE owner=? AND expectation_id=?"
                 " AND criterion=? AND target_kind=? AND target_id=? ORDER BY rowid DESC LIMIT 1",
-                (self.owner, expectation.expectation_id, criterion, target_kind, target_id),
+                same_target,
             ).fetchone()
-            if prior is not None and prior["state"] == UpdateState.UNCERTAIN.value:
-                raise ReconcileFirst(f"update {prior['update_id']} has no application receipt")
             reconciles = (
                 prior["update_id"]
                 if prior is not None and prior["state"] in _OPEN_OR_APPLIED
@@ -798,6 +823,8 @@ class ConsequenceLedger:
             totals[key] = totals.get(key, Decimal(0)) + Decimal(data["quantity"])
             units.add(data["unit"])
         rules = self.policy.exchange_rules
+        if not rows:
+            return AccountSummary(totals, unknown, None, "no consequences recorded")
         if violated:
             return AccountSummary(totals, unknown, None, "a hard boundary was violated")
         if unknown:
@@ -838,6 +865,10 @@ class ConsequenceLedger:
                     "SELECT record_json, status FROM cl_proposals WHERE owner=? AND proposal_id=?",
                     (self.owner, proposal_id),
                 ).fetchone()
+                if old is not None and now > deadline:
+                    self._close_proposals(expectation_id, name, "too late")
+                    out.append(ObservationProposal.from_dict(json.loads(old[0]), "TOO_LATE"))
+                    continue
                 if old is not None:
                     out.append(ObservationProposal.from_dict(json.loads(old[0]), old[1]))
                     continue
@@ -848,7 +879,7 @@ class ConsequenceLedger:
                 if now > deadline:
                     status = "TOO_LATE"
                 elif self._count_proposals(expectation_id, name) >= limits.max_repeats or (
-                    self._count_proposals() >= limits.max_outstanding
+                    self._count_outstanding(now) >= limits.max_outstanding
                 ):
                     status = "EXHAUSTED"
                 else:
@@ -859,7 +890,7 @@ class ConsequenceLedger:
                     criterion=name,
                     distinguishes=(Comparison.CONFIRMED_MATCH, Comparison.CONFIRMED_MISS),
                     decision_ref=expectation.decision_ref,
-                    sources=tuple(s.name for s in sources),
+                    sources=tuple(sources),
                     ordered=ordered,
                     deadline=deadline,
                     status=status,
@@ -882,14 +913,20 @@ class ConsequenceLedger:
                 out.append(proposal)
         return tuple(out)
 
-    def _count_proposals(self, expectation_id: str | None = None, criterion: str = "") -> int:
-        if expectation_id is None:
-            sql, args = "status='OPEN'", ()
-        else:
-            sql, args = "expectation_id=? AND criterion=?", (expectation_id, criterion)
+    def _count_proposals(self, expectation_id: str, criterion: str) -> int:
         return self._conn.execute(
-            f"SELECT COUNT(*) FROM cl_proposals WHERE owner=? AND {sql}", (self.owner, *args)
+            "SELECT COUNT(*) FROM cl_proposals WHERE owner=? AND expectation_id=? AND criterion=?",
+            (self.owner, expectation_id, criterion),
         ).fetchone()[0]
+
+    def _count_outstanding(self, now: datetime) -> int:
+        """Open requests that can still help; one past its deadline holds no budget."""
+        rows = self._conn.execute(
+            "SELECT record_json FROM cl_proposals WHERE owner=? AND status='OPEN'", (self.owner,)
+        ).fetchall()
+        return sum(
+            parse_datetime(json.loads(r[0])["deadline"], "deadline") >= now for r in rows
+        )
 
     def _close_proposals(self, expectation_id: str, criterion: str, reason: str) -> None:
         open_ids = [
@@ -989,6 +1026,18 @@ def _inadmissible(o: Observation, c: Criterion, e: Expectation, policy: OwnerPol
     return ""
 
 
+def _admissible_support(o: Observation, e: Expectation, policy: OwnerPolicy) -> bool:
+    """A cause's support: an admitted source, valid, measured or reported, not its own input."""
+    source = policy.source(o.source)
+    return (
+        source is not None
+        and o.observable in source.observables
+        and o.valid
+        and o.kind is not EvidenceKind.SIMULATED
+        and o.evidence_ref not in e.inputs
+    )
+
+
 def _in_window(o: Observation, e: Expectation) -> bool:
     """Readings outside the window are not this expectation's evidence at all."""
     h = e.horizon
@@ -1001,8 +1050,8 @@ def _ordering(o: Observation, e: Expectation, committed_at: datetime) -> Orderin
     recorded = e.source_sequences.get(o.source)
     if recorded is not None and o.source_sequence is not None:
         return Ordering.PROSPECTIVE if o.source_sequence > recorded else Ordering.RETROSPECTIVE
-    # A silence is timed by when its coverage began, not when it was reported.
-    t = o.coverage[0] if o.value is None else o.event_time
+    # A silence is graded over the window it covers, so the window's opening times it.
+    t = e.horizon.window_start if o.value is None else o.event_time
     u = timedelta(seconds=o.clock_uncertainty_s)
     if t - u > committed_at:
         return Ordering.PROSPECTIVE

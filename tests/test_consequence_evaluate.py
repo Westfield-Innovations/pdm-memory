@@ -221,7 +221,8 @@ def test_an_unsupported_cause_leaves_attribution_unresolved(ledger):
 
 
 def test_a_cause_is_supported_only_by_recorded_independent_evidence(ledger):
-    pressure = replace(TEMP, observation_id="obs-supply", observable="supply_bar", value=0.4)
+    pressure = replace(TEMP, observation_id="obs-supply", source="supply-gauge", observable="supply_bar",
+                       unit="bar", value=0.4)
     _with(ledger, POSITION_MOVED, replace(TEMP, value=25.0), pressure)
     unknown = (CauseHypothesis(Cause.EXECUTION, ("obs-nowhere",)),)
     assert not ledger.evaluate("exp-valve-1", task=TASK, causes=unknown).attribution_supported
@@ -333,7 +334,8 @@ def test_the_forecast_record_counts_current_prospective_findings_only(ledger):
 
 
 def test_standing_causes_carry_forward_until_dropped(ledger):
-    pressure = replace(TEMP, observation_id="obs-supply", observable="supply_bar", value=0.4)
+    pressure = replace(TEMP, observation_id="obs-supply", source="supply-gauge", observable="supply_bar",
+                       unit="bar", value=0.4)
     _with(ledger, POSITION_MOVED, replace(TEMP, value=25.0), pressure)
     cited = (CauseHypothesis(Cause.EXECUTION, ("obs-supply",)),)
     supported = ledger.evaluate("exp-valve-1", task=TASK, causes=cited)
