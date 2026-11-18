@@ -163,10 +163,10 @@ $\text{intent\_weight}$, $\text{quality}$ і $\text{comparator}$ не входя
 
 **Три числа — три писарі.**
 *   P пише лише `save`.
-*   Лічильники V пише лише validate: `reinforce` (правильно) і `penalize` (хибно).
+*   Лічильники V пише лише validate: `reinforce` (правильно), `penalize` і contrary evidence (хибно), `validate_claim` і `settle_due_claims` (вердикт claim).
 *   Годинник (`last_retrieved`, `retrieval_count`) пише лише `touch`.
 
-`recall`, `retrieve` і `search` не пишуть нічого.
+`recall`, `retrieve`, `search` і `detect_torsion` не пишуть нічого: конфлікт — не вердикт. `update`, `update_batch` і `update_many` відмовляють (`ValueError`), якщо їм передати P, `effective_spike`, лічильники V або годинник. Нова оцінка тиску — це новий `save`.
 
 **Carried number** = $P \times V$, індекс на виразі. Він ніколи не менший за вагу, тож поріг по індексу не відкидає жодного рядка, який пройшов би точний поріг.
 
