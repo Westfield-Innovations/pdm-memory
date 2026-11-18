@@ -32,6 +32,7 @@ from pdm_memory.core.signature import (
     DrawerInfo,
     MemoryHit,
 )
+from pdm_memory.filters import FilterRefused, FilterVerdict, NounProbeFilter, SaveFilter
 from pdm_memory.memory import Memory
 from pdm_memory.guarded_effects import (
     ActionReceipt,
@@ -46,6 +47,12 @@ from pdm_memory.guarded_effects import (
     Opening,
     RecoveryContext,
     ResourceLimitError,
+)
+from pdm_memory.goal_loop import (
+    ContractHistory,
+    GoalContract,
+    GoalLoopController,
+    OwnerApproval,
 )
 from pdm_memory.models import (
     AlignmentReport,
@@ -67,20 +74,28 @@ __all__ = [
     "ConditionVerdict",
     "ConfigurationError",
     "ContraryEvidenceResult",
+    "ContractHistory",
     "DecaySnapshot",
     "DrawerInfo",
     "EffectRequest",
+    "FilterRefused",
+    "FilterVerdict",
+    "GoalContract",
+    "GoalLoopController",
     "GuardedEffects",
     "IdReuseError",
     "LedgerIntegrityError",
     "MEMORY_SHAPE_KEY",
     "Memory",
     "MemoryHit",
+    "NounProbeFilter",
     "Opening",
+    "OwnerApproval",
     "RecoveryContext",
     "RelationshipChannelResolution",
     "ResourceLimitError",
     "SHAPE_HALF_LIVES",
+    "SaveFilter",
     "SurfaceReport",
     "TorsionReport",
     "__version__",
