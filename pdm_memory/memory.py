@@ -40,7 +40,7 @@ import os
 import warnings
 from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -1221,7 +1221,11 @@ class Memory:
             raise ValueError("now must be timezone-aware.")
         report = SettlementReport()
         gaps: dict[str, builtins.list[tuple[datetime, datetime]]] = {}
-        due = [r for r in self._storage.claims(self._user, verdict="") if r.due and r.due <= now]
+        # A due is stored as ISO text in its own offset (at most 14 h from UTC), so
+        # the index bound reaches 14 h past now and the exact test runs here.
+        bound = (now + timedelta(hours=14)).astimezone(timezone.utc)
+        open_claims = self._storage.claims(self._user, verdict="", due_by=bound)
+        due = [r for r in open_claims if r.due and r.due <= now]
         for rec in sorted(due, key=lambda r: (r.due, r.id)):
             source = rec.outcome_source
             if source and source not in gaps:

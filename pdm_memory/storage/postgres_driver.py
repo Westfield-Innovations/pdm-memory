@@ -567,7 +567,12 @@ class PostgresDriver(BaseStorage):
         return 0  # no settlement here yet, so no verdict to amend
 
     def claims(
-        self, user: str, *, verdict: str, source: str | None = None
+        self,
+        user: str,
+        *,
+        verdict: str,
+        source: str | None = None,
+        due_by: datetime | None = None,
     ) -> builtins.list[SignatureRecord]:
         sql = (
             'SELECT * FROM pdm_signatures WHERE "user" = %s AND is_deleted = 0 '
@@ -577,6 +582,9 @@ class PostgresDriver(BaseStorage):
         if source is not None:
             sql += " AND outcome_source = %s"
             params.append(source)
+        if due_by is not None:
+            sql += " AND due <= %s"
+            params.append(due_by.isoformat())
         return [mapping_to_record(r) for r in self._conn().execute(sql, params)]
 
     def coverage_gaps(self, user: str, source: str) -> builtins.list[tuple[datetime, datetime]]:

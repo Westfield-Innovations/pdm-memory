@@ -241,3 +241,15 @@ def test_a_verdict_computed_from_a_stale_read_writes_nothing(mem):
     assert mem._write_verdict(stale, "not_by_due", "", None, NOW) is None
     assert _rec(mem, mid).verdict == "on_time"
     assert _counts(mem, mid) == (1, 1)
+
+
+def test_the_pass_reads_due_claims_in_any_offset_and_skips_later_ones(mem):
+    east = timezone(timedelta(hours=14))
+    west = timezone(timedelta(hours=-12))
+    due_east = _claim(mem, "occurs", PAST_DUE.astimezone(east), source="feed")
+    due_west = _claim(mem, "occurs", PAST_DUE.astimezone(west), source="feed")
+    later = _claim(mem, "occurs", NOW + timedelta(days=30), source="feed")
+    assert mem.settle_due_claims(NOW).settled == {"not_by_due": 2}
+    assert _rec(mem, due_east).verdict == _rec(mem, due_west).verdict == "not_by_due"
+    bound = NOW + timedelta(hours=14)
+    assert later not in {r.id for r in mem._storage.claims(USER, verdict="", due_by=bound)}

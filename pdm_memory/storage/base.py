@@ -174,9 +174,18 @@ class BaseStorage(ABC):
         raise NotImplementedError(f"{type(self).__name__} keeps no coverage gaps")
 
     def claims(
-        self, user: str, *, verdict: str, source: str | None = None
+        self,
+        user: str,
+        *,
+        verdict: str,
+        source: str | None = None,
+        due_by: datetime | None = None,
     ) -> builtins.list[SignatureRecord]:
-        """Live claims of *user* holding *verdict* ("" while open), on *source* when given."""
+        """Live claims of *user* holding *verdict* ("" while open), on *source* when given.
+
+        With *due_by*, only claims whose stored due text sorts at or before
+        ``due_by.isoformat()``: a text bound, so the caller widens it for offsets.
+        """
         raise NotImplementedError(f"{type(self).__name__} keeps no claims")
 
     def coverage_gaps(self, user: str, source: str) -> builtins.list[tuple[datetime, datetime]]:
