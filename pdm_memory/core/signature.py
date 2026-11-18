@@ -77,6 +77,19 @@ class SignatureRecord:
     is_deleted: bool = False
     idempotency_key: str | None = None
 
+    # UNVALIDATED, VALIDATED or REOPENED (PDM v1.9 change 8); written by validate.
+    validation_status: str = "UNVALIDATED"
+
+    # The claim (PDM v1.9 change 4): "" / None when the signature predicts nothing.
+    direction: str = ""                # "occurs", or "absent" (a safety claim)
+    outcome_source: str = ""           # the bound source; "" = settled only by observation
+    due: datetime | None = None        # when the prediction is read
+    watch_window: float | None = None  # days after due a late report may still amend
+    outcome: str = ""                  # occurred / observed_absent / unknown, as supplied
+    verdict: str = ""                  # the memory's one verdict; "" while open
+    event_time: datetime | None = None
+    report_time: datetime | None = None
+
     def __post_init__(self) -> None:
         if self.created_at is None:
             self.created_at = datetime.now(tz=timezone.utc)
@@ -85,6 +98,29 @@ class SignatureRecord:
             self.effective_spike = calculate_effective_spike(
                 self.p_magnitude, self.t_persistence, self.phase_privilege
             )
+
+
+UNVALIDATED = "UNVALIDATED"
+VALIDATED = "VALIDATED"
+REOPENED = "REOPENED"
+
+
+@dataclass(frozen=True)
+class LinkRow:
+    """
+    One link (PDM v1.9 change 7): ``pressure_id`` rests on, or was used beside, ``neighbor_id``.
+
+    ``kind`` is ``support`` (what a signature rested on when it was made) or
+    ``coaccess`` (what it was used beside). The neighbour's status and V are
+    kept as of the write.
+    """
+
+    pressure_id: str
+    neighbor_id: str
+    kind: str
+    status_at_write: str
+    v_at_write: float
+    written_at: datetime
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +173,25 @@ class MemoryHit:
     t_event_at: datetime | None = None
     t_deadline: datetime | None = None
 
+    # PDM v1.9 change 14: the record's status and claim, and flags computed at
+    # retrieve (never stored). context and support_in_doubt are None when the
+    # store keeps no links: not computed, so not a clearance.
+    validation_status: str = UNVALIDATED
+    context: str | None = None  # STANDALONE or RECOVERY
+    support_in_doubt: bool | None = None
+    owl: bool = False
+    duck: bool = False
+    direction: str = ""
+    due: datetime | None = None
+    verdict: str = ""
+
+    @property
+    def action_status(self) -> str:
+        """What the hit may be acted on as: UNVALIDATED whenever a flag says so."""
+        if self.context != "RECOVERY" or self.support_in_doubt is not False or self.duck:
+            return UNVALIDATED
+        return self.validation_status
+
     @classmethod
     def from_record(
         cls,
@@ -178,6 +233,10 @@ class MemoryHit:
             is_urgent=is_urgent,
             t_event_at=record.t_event_at,
             t_deadline=record.t_deadline,
+            validation_status=record.validation_status,
+            direction=record.direction,
+            due=record.due,
+            verdict=record.verdict,
         )
 
 
@@ -308,11 +367,12 @@ class ExplainReport:
             f"║    p_magnitude:    {self.p_magnitude:.2f}",
             f"║    V coefficient:  {self.v_coefficient:.4f}  ({self.retrieval_count} retrievals)",
             f"║    Decay factor:   {self.decay_factor:.4f}  ({self.days_since_retrieved:.1f}d since retrieved, T½={half_life_label})",
+            "║    ─────────────────────────────",
+            f"║    P_effective:    {self.p_effective:.2f}  (P × V × fade: the weight)",
+            f"║    Eff. spike:     {self.effective_spike:.2f}",
+            "║  Match score only (after the weight gate):",
             f"║    Intent weight:  {self.intent_weight if self.intent_weight is not None else 'n/a (no query)'}",
             f"║    Quality:        {self.quality:.2f}",
-            "║    ─────────────────────────────",
-            f"║    P_effective:    {self.p_effective:.2f}",
-            f"║    Eff. spike:     {self.effective_spike:.2f}",
         ]
         if self.coupling_score is not None:
             lines += [

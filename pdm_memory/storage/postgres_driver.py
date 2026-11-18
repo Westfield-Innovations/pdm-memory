@@ -17,20 +17,26 @@ from __future__ import annotations
 import builtins
 import logging
 import threading
-from collections.abc import Callable, Generator
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
 
-from pdm_memory.core.math import P_MAX, calculate_effective_spike
-from pdm_memory.core.signature import DrawerInfo, SignatureRecord
+from pdm_memory.core.signature import DrawerInfo, LinkRow, SignatureRecord
 from pdm_memory.storage.base import BaseStorage, SaveBatchResult, UpdateBatchResult
 from pdm_memory.storage.schema import (
+    CARRIED_SQL,
     SCHEMA_POSTGRES,
     apply_postgres_migrations,
+    increment_set_clause,
+    link_insert_row,
+    mapping_to_link,
     mapping_to_record,
+    parse_dt,
     prepare_update_fields,
     signature_insert_row,
+    tag_words,
+    write_tags,
 )
 
 logger = logging.getLogger(__name__)
@@ -43,7 +49,8 @@ INSERT INTO pdm_signatures (
     retrieval_count, last_retrieved, created_at,
     validation_prediction_total, validation_prediction_correct,
     decay_rate, t_deadline, t_event_at, urgency_rate, metadata,
-    is_deleted, idempotency_key
+    is_deleted, idempotency_key, validation_status,
+    direction, outcome_source, due, watch_window, outcome, verdict, event_time, report_time
 ) VALUES (
     %s, %s, %s, %s, %s,
     %s, %s, %s, %s,
@@ -51,7 +58,8 @@ INSERT INTO pdm_signatures (
     %s, %s, %s,
     %s, %s,
     %s, %s, %s, %s, %s,
-    %s, %s
+    %s, %s, %s,
+    %s, %s, %s, %s, %s, %s, %s, %s
 )
 ON CONFLICT (id) DO NOTHING
 RETURNING id
@@ -140,6 +148,7 @@ class PostgresDriver(BaseStorage):
         row = cur.fetchone() if hasattr(cur, "fetchone") else None
         if not row and hasattr(cur, "rowcount") and cur.rowcount == 0:
             raise ValueError(f"Signature record with id '{sig.id}' already exists")
+        write_tags(conn, [(sig.user, sig.id, sig.intent_tags)], dialect="postgres")
         conn.execute(_INSERT_DRAWER_SQL, (sig.drawer_domain, sig.user, ""))
         self._commit_if_idle(conn)
         logger.debug("[PDM-Postgres] Saved signature %s (P=%.1f)", sig.id, sig.p_magnitude)
@@ -185,6 +194,15 @@ class PostgresDriver(BaseStorage):
                     if not cur.nextset():
                         break
 
+                write_tags(
+                    conn,
+                    [
+                        (sig.user, sig.id, sig.intent_tags)
+                        for (_, sig), row in zip(chunk, rows)
+                        if row is not None
+                    ],
+                    dialect="postgres",
+                )
                 drawer_rows: list[tuple[str, str, str]] = []
                 for (index, sig), row in zip(chunk, rows):
                     if row is not None:
@@ -327,6 +345,8 @@ class PostgresDriver(BaseStorage):
             f'UPDATE pdm_signatures SET {set_clause} WHERE id = %s AND "user" = %s',
             values,
         )
+        if cur.rowcount and "intent_tags" in fields:
+            write_tags(self._conn(), [(user, memory_id, fields["intent_tags"])], dialect="postgres")
         self._commit_if_idle(self._conn())
         if cur.rowcount == 0:
             logger.warning(
@@ -335,55 +355,30 @@ class PostgresDriver(BaseStorage):
                 user,
             )
 
-    def atomic_reinforce(
+    def increment(
         self,
         memory_id: str,
-        user: str,
+        user: str = "default",
+        deltas: dict[str, int] | None = None,
         *,
-        compute_delta: Callable[[float, int], float],
-        last_retrieved: datetime,
-    ) -> None:
-        """
-        Row-locked reinforce: SELECT … FOR UPDATE then atomic counter increment.
+        expect_verdict: str | None = None,
+        **fields,
+    ) -> bool:
+        """Add *deltas* to counters and set *fields* in one UPDATE."""
+        set_clause, values = increment_set_clause(deltas or {}, fields, "%s")
+        if not set_clause:
+            return self.get(memory_id, user=user) is not None
+        where = 'id = %s AND "user" = %s'
+        params = [memory_id, user]
+        if expect_verdict is not None:
+            where += " AND verdict = %s"
+            params.append(expect_verdict)
+        cur = self._conn().execute(
+            f"UPDATE pdm_signatures SET {set_clause} WHERE {where}", values + params
+        )
+        self._commit_if_idle(self._conn())
+        return cur.rowcount > 0
 
-        Prevents lost updates when multiple threads reinforce the same signature.
-        """
-        with self.transaction():
-            conn = self._conn()
-            row = conn.execute(
-                """
-                SELECT p_magnitude, retrieval_count, t_persistence, phase_privilege
-                FROM pdm_signatures
-                WHERE id = %s AND "user" = %s AND is_deleted = 0
-                FOR UPDATE
-                """,
-                (memory_id, user),
-            ).fetchone()
-            if row is None:
-                raise ValueError(
-                    f"Memory '{memory_id}' not found for user '{user}'"
-                )
-
-            p_magnitude = float(row["p_magnitude"])
-            retrieval_count = int(row["retrieval_count"] or 0)
-            delta = compute_delta(p_magnitude, retrieval_count)
-            new_p = min(P_MAX, p_magnitude + delta)
-            new_spike = calculate_effective_spike(
-                new_p,
-                float(row["t_persistence"]),
-                float(row["phase_privilege"]),
-            )
-            conn.execute(
-                """
-                UPDATE pdm_signatures
-                SET p_magnitude = %s,
-                    effective_spike = %s,
-                    retrieval_count = retrieval_count + 1,
-                    last_retrieved = %s
-                WHERE id = %s AND "user" = %s AND is_deleted = 0
-                """,
-                (new_p, new_spike, last_retrieved, memory_id, user),
-            )
     def update_batch(
         self,
         updates: builtins.list[tuple[str, dict]],
@@ -446,6 +441,16 @@ class PostgresDriver(BaseStorage):
                             len(touched), len(chunk), user, list(columns), missing[:20],
                         )
 
+            write_tags(
+                conn,
+                [
+                    (user, mid, fields["intent_tags"])
+                    for i, (mid, fields) in enumerate(updates)
+                    if "intent_tags" in fields and not results[i].error
+                ],
+                dialect="postgres",
+            )
+
         return results
 
     def delete(self, memory_id: str, user: str = "default") -> None:
@@ -463,6 +468,13 @@ class PostgresDriver(BaseStorage):
             'DELETE FROM pdm_signatures WHERE id = %s AND "user" = %s',
             (memory_id, user),
         )
+        conn.execute(
+            'DELETE FROM pdm_links WHERE "user" = %s AND (pressure_id = %s OR neighbor_id = %s)',
+            (user, memory_id, memory_id),
+        )
+        conn.execute(
+            'DELETE FROM pdm_tags WHERE pressure_id = %s AND "user" = %s', (memory_id, user)
+        )
         self._commit_if_idle(conn)
 
     def list(
@@ -474,21 +486,25 @@ class PostgresDriver(BaseStorage):
         cursor_id: str | None = None,
         include_deleted: bool = False,
         tag_any: builtins.list[str] | tuple[str, ...] | None = None,
+        min_carried: float = 0.0,
     ) -> builtins.list[SignatureRecord]:
         where = ['"user" = %s', "p_magnitude >= %s"]
         params: list[Any] = [user, min_pressure]
         if not include_deleted:
             where.append("is_deleted = 0")
+        if min_carried > 0:
+            where.append(f"{CARRIED_SQL} >= %s")
+            params.append(min_carried)
         if drawer:
             where.append("drawer_domain = %s")
             params.append(drawer)
-        tags = [t.strip().lower() for t in (tag_any or ()) if t and str(t).strip()]
+        tags = tag_words(tag_any)[:32]
         if tags:
-            tag_clauses: list[str] = []
-            for tag in tags[:32]:
-                tag_clauses.append("LOWER(intent_tags) LIKE %s")
-                params.append(f'%"{tag}"%')
-            where.append("(" + " OR ".join(tag_clauses) + ")")
+            where.append(
+                'id IN (SELECT pressure_id FROM pdm_tags WHERE "user" = %s '
+                "AND word = ANY(%s))"
+            )
+            params.extend([user, tags])
         if cursor_id:
             cursor = self._conn().execute(
                 'SELECT p_magnitude FROM pdm_signatures WHERE id = %s AND "user" = %s',
@@ -506,6 +522,88 @@ class PostgresDriver(BaseStorage):
         params.append(limit)
         rows = self._conn().execute(query, params).fetchall()
         return [mapping_to_record(r) for r in rows]
+
+    def write_links(self, user: str, rows: builtins.list[LinkRow]) -> int:
+        if not rows:
+            return 0
+        cur = self._conn().cursor()
+        cur.executemany(
+            'INSERT INTO pdm_links ("user", pressure_id, neighbor_id, kind, status_at_write, '
+            "v_at_write, written_at) VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+            [link_insert_row(user, link) for link in rows],
+        )
+        self._commit_if_idle(self._conn())
+        return max(0, cur.rowcount)
+
+    def links(
+        self,
+        user: str,
+        ids: Sequence[str],
+        *,
+        side: str,
+        kind: str | None = None,
+    ) -> builtins.list[LinkRow]:
+        column = "pressure_id" if side == "out" else "neighbor_id"
+        ids = list(dict.fromkeys(ids))
+        found: builtins.list[LinkRow] = []
+        for i in range(0, len(ids), 500):
+            chunk = ids[i : i + 500]
+            sql = f'SELECT * FROM pdm_links WHERE "user" = %s AND {column} = ANY(%s)'
+            params: list[Any] = [user, chunk]
+            if kind:
+                sql += " AND kind = %s"
+                params.append(kind)
+            found += [mapping_to_link(r) for r in self._conn().execute(sql, params)]
+        return found
+
+    def save_coverage_gap(
+        self, user: str, source: str, gap_from: datetime, gap_to: datetime
+    ) -> int:
+        self._conn().execute(
+            'INSERT INTO pdm_coverage_gaps ("user", source, gap_from, gap_to) VALUES (%s, %s, %s, %s)',
+            (user, source, gap_from.isoformat(), gap_to.isoformat()),
+        )
+        self._commit_if_idle(self._conn())
+        return 0  # Memory.report_coverage_gap amends local verdicts itself
+
+    def claims(
+        self,
+        user: str,
+        *,
+        verdict: str,
+        source: str | None = None,
+        due_by: datetime | None = None,
+    ) -> builtins.list[SignatureRecord]:
+        sql = 'SELECT * FROM pdm_signatures WHERE "user" = %s AND is_deleted = 0 AND direction != \'\''
+        params: list[Any] = [user]
+        if verdict == "":
+            # A literal, so a prepared (generic) plan still matches the open-claims partial index.
+            sql += " AND verdict = ''"
+        else:
+            sql += " AND verdict = %s"
+            params.append(verdict)
+        if source is not None:
+            sql += " AND outcome_source = %s"
+            params.append(source)
+        if due_by is not None:
+            sql += " AND due <= %s"
+            params.append(due_by.isoformat())
+        return [mapping_to_record(r) for r in self._conn().execute(sql, params)]
+
+    def coverage_gaps(self, user: str, source: str) -> builtins.list[tuple[datetime, datetime]]:
+        rows = self._conn().execute(
+            'SELECT gap_from, gap_to FROM pdm_coverage_gaps WHERE "user" = %s AND source = %s',
+            (user, source),
+        )
+        return [(parse_dt(r["gap_from"]), parse_dt(r["gap_to"])) for r in rows]
+
+    def count_below_carried(self, user: str, theta: float) -> int:
+        row = self._conn().execute(
+            'SELECT COUNT(*) AS n FROM pdm_signatures WHERE "user" = %s AND is_deleted = 0 '
+            f"AND {CARRIED_SQL} < %s",
+            (user, theta),
+        ).fetchone()
+        return int(row["n"]) if row else 0
 
     def list_drawers(self, user: str = "default") -> builtins.list[DrawerInfo]:
         rows = self._conn().execute(

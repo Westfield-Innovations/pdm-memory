@@ -188,13 +188,12 @@ def _run_scenario(
 
 
 def _get_pressure(backend: Any, memory_id: str) -> float:
-    """Read p_magnitude from the backend.  Falls back to 0 if not found."""
+    """Read the pressure retrieval ranks by (PDM: the weight).  0 if not found."""
     try:
         if hasattr(backend, "get_pressure"):
             return backend.get_pressure(memory_id) or 0.0
-        # PDM Memory — access storage directly (read-only)
-        rec = backend._storage.get(memory_id, user=backend._user)
-        return rec.p_magnitude if rec else 0.0
+        # PDM Memory: P is fixed at ingest, so the verdicts move the weight.
+        return backend.decay_at(memory_id).p_effective
     except Exception as e:
         logger.warning("[Harness] get_pressure failed for %s: %s", memory_id, e)
         return 0.0

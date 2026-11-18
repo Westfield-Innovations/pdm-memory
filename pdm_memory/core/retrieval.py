@@ -37,14 +37,12 @@ from pdm_memory.core.constraints import (
 )
 from pdm_memory.core.math import (
     P_MAX,
-    calculate_decay_factor,
+    SEARCH_FLOOR,
     calculate_intent_weight,
-    calculate_p_effective,
     calculate_temporal_geometry,
-    calculate_v,
-    half_life_for_signature,
     infer_domain,
     infer_regime,
+    weight_of,
 )
 from pdm_memory.core.signature import MemoryHit, SignatureRecord
 from pdm_memory.models import AlignmentReport, TorsionReport
@@ -52,6 +50,8 @@ from pdm_memory.models import AlignmentReport, TorsionReport
 logger = logging.getLogger(__name__)
 
 WORD_PATTERN = re.compile(r"\b[a-zA-Z]{3,}\b")
+# Recall cues in any script; torsion and alignment keep WORD_PATTERN.
+CUE_WORD_PATTERN = re.compile(r"\b[^\W\d_]{3,}\b")
 # Standalone numerics only — reject Q3 / v2 / H1 bleed into factual torsion
 NUMBER_PATTERN = re.compile(r"(?<![A-Za-z])-?\d+(?:\.\d+)?(?![A-Za-z])")
 
@@ -128,9 +128,8 @@ _INTEGRITY_TAGS: frozenset[str] = frozenset(
 )
 # Cap pairs per shared tag — hot tags otherwise go O(n²).
 _TAG_FANOUT_CAP: int = 64
-# PDM-T: how hard urgency energy lifts ranking / Phase-1 gate
+# PDM-T: how hard urgency energy lifts ranking (never the weight gate)
 _TEMPORAL_RANK_BOOST: float = 0.35
-_TEMPORAL_GATE_BOOST: float = 0.25
 # Recommended / API-default drawer share cap for parliamentary breadth
 DEFAULT_DIVERSITY_BIAS: float = 0.40
 # Extra rank weight when t_event_at falls inside a query-relative window
@@ -222,7 +221,7 @@ _STOPWORDS: frozenset[str] = frozenset(
 # ---------------------------------------------------------------------------
 
 ALPHA_DEFAULT: float = 0.7  # Threshold-lowering aggressiveness
-THETA_FLOOR: float = 5.0  # Absolute minimum effective threshold
+THETA_FLOOR: float = SEARCH_FLOOR  # 10 = 0.1 of full; lowest search_cost reaches
 THETA_BASE_DEFAULT: float = 30.0  # Default base threshold
 
 COUPLING_MIN_DEFAULT: float = 0.3  # Minimum coupling score to count as "coupled"
@@ -321,6 +320,8 @@ class RetrievalEngine:
         domain: str | None = None,
         regime: str | None = None,
         diversity_bias: float | None = DEFAULT_DIVERSITY_BIAS,
+        theta: float | None = None,
+        as_of: datetime | None = None,
     ) -> list[MemoryHit]:
         """
         Retrieve top-k memories from a list of SignatureRecords.
@@ -337,6 +338,8 @@ class RetrievalEngine:
             diversity_bias:  Max fraction of top-k from one drawer
                              (default ``0.4``). Pass ``None`` for pure
                              score order; ``1.0`` disables the cap.
+            theta:           Weight gate (0–100); replaces the one search_cost derives.
+            as_of:           The one time every weight is read at (default: now).
 
         Returns:
             List[MemoryHit] ranked by relevance, length ≤ k.
@@ -344,46 +347,29 @@ class RetrievalEngine:
         if not records:
             return []
 
-        now = datetime.now(tz=timezone.utc)
+        now = as_of or datetime.now(tz=timezone.utc)
         event_window = self._parse_relative_event_window(query, now)
 
         # Phase 1: threshold lowering
-        theta_eff = self._compute_threshold(base_threshold, search_cost)
+        theta_eff = (
+            theta if theta is not None else self._compute_threshold(base_threshold, search_cost)
+        )
 
         coupled: list[tuple[NodeCoupling, MemoryHit]] = []
 
         # Infer domain/regime from query if not specified
-        query_tags = self._tokenize_query(query) if query else []
+        query_tags = self._cue_words(query) if query else []
         effective_domain = domain or (infer_domain(query_tags) if query_tags else None)
         effective_regime = regime or (infer_regime(query_tags) if query_tags else None)
 
         for rec in records:
-            # Live pressure: ONE law — shape/domain half-life × (1 - decay_factor).
-            # Do NOT mutate p_magnitude here (legacy incremental power-law removed).
-            half_life = half_life_for_signature(
-                rec.domain,
-                intent_tags=rec.intent_tags,
-                metadata=rec.metadata,
-                text=rec.compressed_fact,
-            )
-            days_since_touch = self._days_since(rec.last_retrieved or rec.created_at, now)
-            days_since_created = self._days_since(rec.created_at, now)
-            decay = calculate_decay_factor(
-                days_since_touch,
-                half_life,
-                days_since_created=days_since_created,
-                t_persistence=rec.t_persistence,
-            )
-            v = calculate_v(rec.validation_prediction_correct, rec.validation_prediction_total)
-            i_weight = calculate_intent_weight(rec.intent_tags, query)
-            p_eff = calculate_p_effective(rec.p_magnitude, v, decay, i_weight, quality=0.80)
-            e_temporal, is_urgent = self._temporal_energy(rec, now)
-            # Urgent deadlines get a soft lift through the Phase-1 pressure gate
-            p_gate = p_eff * (1.0 + _TEMPORAL_GATE_BOOST * e_temporal)
-
-            # Phase 1 gate — skip coupling for below-threshold records (not returned).
-            if p_gate < theta_eff:
+            # Phase 1: the weight gate. Modifiers (intent weight, urgency) rank
+            # only what clears it (PDM v1.9 change 2).
+            p_eff, v, decay = weight_of(rec, now)
+            if p_eff < theta_eff:
                 continue
+            i_weight = calculate_intent_weight(rec.intent_tags, query)
+            e_temporal, is_urgent = self._temporal_energy(rec, now)
 
             # Phase 2: impedance matching
             coupling = self._compute_coupling(
@@ -425,6 +411,7 @@ class RetrievalEngine:
             score = (
                 coupling.coupling_score
                 * hit.p_effective
+                * hit.intent_weight
                 * (1.0 + _TEMPORAL_RANK_BOOST * (hit.e_temporal or 0.0) + window_boost)
             )
             return (in_window, score)
@@ -660,7 +647,7 @@ class RetrievalEngine:
         sig_tags = {t.lower() for t in (rec.intent_tags or []) if t}
         if RetrievalEngine._tags_overlap(cue, sig_tags):
             return 1.0
-        fact_tokens = set(RetrievalEngine._tokenize_query(rec.compressed_fact or ""))
+        fact_tokens = set(RetrievalEngine._cue_words(rec.compressed_fact or ""))
         if not fact_tokens:
             return 0.0
         if RetrievalEngine._tags_overlap(cue, fact_tokens):
@@ -771,6 +758,11 @@ class RetrievalEngine:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return max(0.0, (now - dt).total_seconds() / 86400.0)
+
+    @staticmethod
+    def _cue_words(text: str) -> list[str]:
+        """The words of a recall cue in any script, lower-cased, stopwords dropped."""
+        return [w for w in CUE_WORD_PATTERN.findall(text.lower()) if w not in _STOPWORDS]
 
     @staticmethod
     def _tokenize_query(query: str) -> list[str]:

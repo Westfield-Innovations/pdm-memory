@@ -39,9 +39,8 @@ class AblationMemory:
     All other mechanisms (pressure, decay, tag matching, reinforcement delta)
     behave exactly as in the normal Memory class.  Only V is neutralised.
 
-    The penalize() call still decrements p_magnitude so pressure changes are
-    real — but V no longer compounds those changes, isolating V's specific
-    contribution to correctability.
+    P is fixed at ingest (PDM v1.9), so with V frozen the weight cannot move:
+    whatever ranks first stays first, isolating V's contribution to correctability.
     """
 
     def __init__(self, store: str = "./pdm_ablation.db", user: str = "bench") -> None:
@@ -70,9 +69,11 @@ class AblationMemory:
         return self._mem.penalize(*args, **kwargs)
 
     def get_pressure(self, memory_id: str) -> float | None:
-        """Read the raw p_magnitude for a given memory ID."""
-        rec = self._mem._storage.get(memory_id, user=self._mem._user)
-        return rec.p_magnitude if rec else None
+        """The weight of a memory, with V frozen."""
+        try:
+            return self._mem.decay_at(memory_id).p_effective
+        except KeyError:
+            return None
 
     def close(self) -> None:
         self._patcher.stop()

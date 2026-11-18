@@ -218,3 +218,13 @@ class TestIntegrityOnPostgres:
         for n in range(12):
             driver.save_source_event(make_event(user), payload=f"m{n}")
         assert len(list(driver.iter_source_events(user=user, batch=5))) == 12
+
+
+class TestCarriedOnPostgres:
+    def test_count_below_carried_counts_the_quiet_rows(self, driver, user):
+        # No verdicts: V = 0.5, so P 20 carries 10 and P 80 carries 40.
+        for p in (20.0, 80.0):
+            driver.save(SignatureRecord(
+                user=user, compressed_fact=f"p{p}", intent_tags=["a", "b", "c"], p_magnitude=p,
+            ))
+        assert driver.count_below_carried(user, 30.0) == 1

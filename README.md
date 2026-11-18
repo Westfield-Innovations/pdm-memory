@@ -65,21 +65,26 @@ mem.save("User prefers metric units and short answers", source="manual",
          shape="behavioral")
 
 # Read: resonance retrieval — surfaces what's relevant, not just what matches.
+# Reading writes nothing.
 hits = mem.recall("how should I format the answer?", k=5)
 
 for h in hits:
-    print(h.text, h.pressure, h.last_reinforced)
+    print(h.text, h.pressure, h.action_status)
 
-# Reinforce a memory manually (recall() does this automatically).
+# Use: tell the memory what you acted on. This resets its fade, nothing more.
+mem.touch([hits[0].id])
+
+# Grade: when the world answers. reinforce() counts a correct prediction,
+# penalize() a wrong one. Only V moves; P is fixed when a memory is saved.
 mem.reinforce(hits[0].id)
 
-# Contrary evidence: lower active pressure/V without rewriting the stored fact.
+# Contrary evidence: lower V without rewriting the stored fact.
 result = mem.apply_contrary_evidence(
     hits[0].id,
     "User prefers imperial units",
     evidence_tags=["units", "formatting", "preferences"],
 )
-print(result.p_before, "→", result.p_after)
+print(result.v_before, "→", result.v_after)  # P stays; V falls
 
 # Inspect why a memory surfaced.
 report = mem.explain(hits[0].id, query="how should I format the answer?")
@@ -89,10 +94,84 @@ print(report.render())
 snap = mem.decay_at(hits[0].id)
 print(snap.shape, snap.half_life_days, snap.p_effective)
 
-# Store-wide soft-delete of memories below the live P_effective threshold:
-counts = mem.decay()
-print(f"Decayed: {counts['decayed']}, Deleted: {counts['deleted']}")
+# Nothing is deleted for fading: count the silent memories instead.
+print(mem.count_silent())  # weight under 30 (0.3 of full)
 ```
+
+### Retrieve, use, grade (PDM v1.9)
+
+`retrieve()` is `recall()` with everything the call covered. It walks the tag
+index, gates on the carried number (P × V), weighs each candidate at one fixed
+time while its budget lasts, and flags what it returns:
+
+```python
+from datetime import datetime, timedelta, timezone
+from pdm_memory import Claim
+
+# Weight = P × V × fade; with no verdicts V = 0.5, so P 80 weighs 40 (gate: 30).
+sensor = mem.save("North flare sensor read 9 bar", tags=["north", "flare", "sensor"],
+                  p_magnitude=80)
+claim = mem.save(
+    "North flare igniter fails by Friday",
+    tags=["north", "flare", "igniter"],
+    p_magnitude=80,
+    rests_on=[sensor],  # support: a correction to the sensor re-opens this
+    claim=Claim("occurs", datetime.now(timezone.utc) + timedelta(days=4),
+                outcome_source="failure-feed"),
+)
+
+result = mem.retrieve("north flare", k=5)          # min_p=30 by default
+for h in result.hits:
+    print(h.text, h.p_effective, h.validation_status, h.context,
+          h.support_in_doubt, h.owl, h.duck, h.action_status)
+print(result.routes, result.theta, result.as_of, result.completed)
+
+# Ran out of budget? Resume under the same as-of time and order.
+if not result.completed:
+    more = mem.retrieve("north flare", continuation=result.continuation)
+
+# A search lowers only the weight gate (never under 10 without a named area).
+quiet = mem.search("north flare", min_p_lowered=12)
+
+mem.touch([h.id for h in result.hits])  # what you used
+mem.reinforce(sensor)  # the sensor was checked: VALIDATED
+mem.penalize(sensor)   # later found stuck: a correction, returns the ids it re-opened
+now = datetime.now(timezone.utc)
+mem.report_coverage_gap("failure-feed", now - timedelta(hours=6), now)  # a feed that was down
+```
+
+`action_status` is `UNVALIDATED` when the hit stands alone (`STANDALONE`), when
+something it rests on is in doubt, or when it is a safety claim nobody has
+checked (a duck). The memory returns qualified hits; the caller decides.
+
+### Settle claims (PDM v1.9)
+
+A claim holds one verdict: `on_time`, `late`, `observed_absent`, `not_by_due`
+or `expired_unobserved`. Amending it moves its one count in V; it never adds a
+second. Run the settlement pass once per cycle; nothing runs it for you.
+
+```python
+# Each cycle: every open claim whose due has come gets its verdict.
+# Bound to a source with nothing reported: not_by_due (graded).
+# Unbound, or a reported gap touches its interval: expired_unobserved (V unchanged).
+report = mem.settle_due_claims()
+print(report.settled, report.reopened, report.failed)
+
+# An observation arrives: settle the claim, or amend its verdict while the
+# watch window is open. "occurred", "observed_absent" or "unknown".
+result = mem.validate_claim(claim, "occurred", event_time=now)
+if result:  # None when the observation changes nothing
+    print(result.verdict, result.reopened)  # on_time 0
+```
+
+A wrong verdict on a `VALIDATED` claim is a correction: it re-opens what rests
+on it. A gap reported after the due turns `not_by_due` into
+`expired_unobserved` and restores the count while the watch window is open.
+On a cloud store the server runs the pass, so `settle_due_claims()` raises;
+`validate_claim()` and `report_coverage_gap()` go to the server.
+
+`recall(reinforce=True)` and `decay()` still work but are deprecated: the first
+only touches the hits, the second only counts the silent set.
 
 ### Privacy-First Mode
 
@@ -1013,12 +1092,12 @@ Store-free record of one Goal Loop job. See [Goal Loop preview](#goal-loop-previ
 | `recall(query, k, min_pressure, search_cost, drawer, reinforce)` → `List[MemoryHit]` | Retrieve top-k relevant memories |
 | `verify_alignment(intent_text, min_pressure, k_goals, torsion_threshold)` → `AlignmentReport` | Same GAA gate against goals already stored in Memory |
 | `detect_torsion(drawer, threshold)` → `List[TorsionReport]` | Find contradicting facts (Reverse Resonance) |
-| `reinforce(memory_id, coupling_score)` | Manually raise a memory's pressure (and V-counters where supported) |
-| `penalize(memory_id, coupling_score)` | Record a wrong prediction: lower P and V |
+| `reinforce(memory_id, coupling_score)` | Record a correct prediction: V rises, the memory becomes `VALIDATED`; P does not move |
+| `penalize(memory_id, coupling_score)` → `set[str]` | Record a wrong prediction: V falls; P does not move. On a `VALIDATED` memory it is a correction and returns the ids it re-opened |
 | `apply_contrary_evidence(target, evidence, …)` → `ContraryEvidenceResult` | Immediate V-miss + Δp on conflicting evidence; does not rewrite historical fact fields |
 | `delete(memory_id)` → `bool` | Soft-delete when storage supports it |
 | `decay_at(signature, now=None)` → `DecaySnapshot` | Live shape-aware decay metrics for one memory (read-only) |
-| `decay(dry_run=False)` → `dict` | Soft-delete signatures whose live `P_effective` is below threshold |
+| `decay(dry_run=False)` → `dict` | Deprecated: deletes nothing, only counts the silent set; call `count_silent()` |
 | `explain(memory_id, query)` → `ExplainReport` | Show why a memory has its current pressure |
 | `list(limit, min_pressure, drawer, cursor_id)` → `MemoryListPage` | Keyset page of memories (storage list API on cloud) |
 | `sync(direction, token, cloud_url)` → `SyncReport` | Sync local ↔ cloud |

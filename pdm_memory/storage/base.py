@@ -20,8 +20,10 @@ from abc import ABC, abstractmethod
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 
-from pdm_memory.core.signature import DrawerInfo, SignatureRecord
+from pdm_memory.core.signature import DrawerInfo, LinkRow, SignatureRecord
+from pdm_memory.storage.schema import carried_of
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +88,29 @@ class BaseStorage(ABC):
         """Update whitelisted columns for ``memory_id`` owned by ``user``."""
         ...
 
+    def increment(
+        self,
+        memory_id: str,
+        user: str = "default",
+        deltas: dict[str, int] | None = None,
+        *,
+        expect_verdict: str | None = None,
+        **fields,
+    ) -> bool:
+        """Add *deltas* to counters and set *fields*. False when the row is not there.
+
+        With *expect_verdict*, only while the row still holds that verdict, so a
+        write computed from a stale read changes nothing and returns False.
+        SQL drivers do it in one UPDATE; this fallback reads, then writes.
+        """
+        rec = self.get(memory_id, user=user)
+        if rec is None or (expect_verdict is not None and rec.verdict != expect_verdict):
+            return False
+        for col, delta in (deltas or {}).items():
+            fields[col] = int(getattr(rec, col) or 0) + int(delta)
+        self.update(memory_id, user=user, **fields)
+        return True
+
     @abstractmethod
     def update_batch(
         self,
@@ -115,6 +140,7 @@ class BaseStorage(ABC):
         cursor_id: str | None = None,
         include_deleted: bool = False,
         tag_any: Sequence[str] | None = None,
+        min_carried: float = 0.0,
     ) -> builtins.list[SignatureRecord]:
         """
         List signatures ordered by ``p_magnitude DESC, id DESC``.
@@ -122,8 +148,67 @@ class BaseStorage(ABC):
         Keyset pagination: pass ``cursor_id`` from the last item of the previous page.
         Optional ``tag_any``: prefer records whose ``intent_tags`` contain any token
         (drivers without native support may ignore or filter client-side).
+        ``min_carried``: only rows whose carried number (P × V, 0–100) is at least this.
         """
         ...
+
+    def write_links(self, user: str, rows: builtins.list[LinkRow]) -> int:
+        """Store *rows*; the first write of a (pressure, neighbour, kind) stands. Returns how many are new."""
+        raise NotImplementedError(f"{type(self).__name__} keeps no links")
+
+    def links(
+        self,
+        user: str,
+        ids: Sequence[str],
+        *,
+        side: str,
+        kind: str | None = None,
+    ) -> builtins.list[LinkRow]:
+        """Links of *ids*: ``side="out"`` what they rest on or were used beside, ``"in"`` the reverse."""
+        raise NotImplementedError(f"{type(self).__name__} keeps no links")
+
+    def save_coverage_gap(
+        self, user: str, source: str, gap_from: datetime, gap_to: datetime
+    ) -> int:
+        """Record that *source* did not report from *gap_from* to *gap_to*.
+
+        Returns the verdicts the store amended itself: a server that settles its
+        own claims counts them; a local store returns 0 and leaves the amending
+        to :meth:`Memory.report_coverage_gap`.
+        """
+        raise NotImplementedError(f"{type(self).__name__} keeps no coverage gaps")
+
+    def claims(
+        self,
+        user: str,
+        *,
+        verdict: str,
+        source: str | None = None,
+        due_by: datetime | None = None,
+    ) -> builtins.list[SignatureRecord]:
+        """Live claims of *user* holding *verdict* ("" while open), on *source* when given.
+
+        With *due_by*, only claims whose stored due text sorts at or before
+        ``due_by.isoformat()``: a text bound, so the caller widens it for offsets.
+        """
+        raise NotImplementedError(f"{type(self).__name__} keeps no claims")
+
+    def coverage_gaps(self, user: str, source: str) -> builtins.list[tuple[datetime, datetime]]:
+        """The gaps reported for *source*, as (from, to)."""
+        raise NotImplementedError(f"{type(self).__name__} keeps no coverage gaps")
+
+    def count_below_carried(self, user: str, theta: float) -> int:
+        """Live rows whose carried number is under *theta*: silent without weighing.
+
+        SQL drivers answer from the index; this fallback pages through :meth:`list`.
+        """
+        count, cursor = 0, None
+        while True:
+            page = self.list(user=user, limit=500, cursor_id=cursor)
+            count += sum(1 for rec in page if carried_of(rec) < theta)
+            if len(page) < 500:
+                return count
+            cursor = page[-1].id
 
     @abstractmethod
     def list_drawers(self, user: str = "default") -> builtins.list[DrawerInfo]:

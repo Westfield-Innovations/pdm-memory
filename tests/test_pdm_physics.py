@@ -14,12 +14,8 @@ import pytest
 from pdm_memory import Memory
 from pdm_memory.core.math import (
     P_MAX,
-    calculate_decay_factor,
     calculate_effective_spike,
-    calculate_intent_weight,
-    calculate_p_effective,
-    calculate_v,
-    half_life_for_signature,
+    weight_of,
 )
 from pdm_memory.core.retrieval import RetrievalEngine
 
@@ -39,33 +35,9 @@ def mem(tmp_path):
     m.close()
 
 
-def _live_p_effective(rec, *, now: datetime | None = None, query: str | None = None) -> float:
-    """Mirror Memory.explain() pressure math without building a full report."""
-    now = now or datetime.now(tz=timezone.utc)
-    anchor = rec.last_retrieved or rec.created_at or now
-    if anchor.tzinfo is None:
-        anchor = anchor.replace(tzinfo=timezone.utc)
-    created = rec.created_at or now
-    if created.tzinfo is None:
-        created = created.replace(tzinfo=timezone.utc)
-
-    days_since = max(0.0, (now - anchor).total_seconds() / 86400.0)
-    days_since_created = max(0.0, (now - created).total_seconds() / 86400.0)
-    half_life = half_life_for_signature(
-        rec.domain,
-        intent_tags=rec.intent_tags,
-        metadata=rec.metadata,
-        text=rec.compressed_fact,
-    )
-    decay = calculate_decay_factor(
-        days_since,
-        half_life,
-        days_since_created=days_since_created,
-        t_persistence=rec.t_persistence,
-    )
-    v = calculate_v(rec.validation_prediction_correct, rec.validation_prediction_total)
-    intent_weight = calculate_intent_weight(rec.intent_tags, query) if query else 1.0
-    return calculate_p_effective(rec.p_magnitude, v, decay, intent_weight, quality=0.80)
+def _live_p_effective(rec, *, now: datetime | None = None) -> float:
+    """The weight Memory.explain() reports."""
+    return weight_of(rec, now or datetime.now(tz=timezone.utc))[0]
 
 
 def _random_fact(rng: random.Random) -> str:

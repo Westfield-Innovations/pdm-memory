@@ -11,6 +11,7 @@ Keep these stable: they are part of the public API surface for tooling/CLI.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 
@@ -716,4 +717,62 @@ class SurfaceReport:
             "torsion_count": self.torsion_count,
             "alignment": self.alignment,
             "alignment_score": round(float(self.alignment_score), 4),
+        }
+
+
+@dataclass
+class RetrieveResult:
+    """
+    A retrieve or search (PDM v1.9 change 14): qualified hits and what the call covered.
+
+    ``routes`` and ``area`` are the scope, ``theta`` the one weight gate (0–100),
+    ``as_of`` the fixed time every weight was read at. ``completed`` is False
+    when the budget stopped the call; ``continuation`` then resumes it under
+    the same as-of time and order. Finishing claims nothing beyond the routes.
+    """
+
+    hits: list[Any]
+    routes: list[str]
+    area: str | None
+    theta: float
+    as_of: datetime
+    completed: bool
+    continuation: str | None = None
+    evaluated: int = 0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "hits": [
+                {
+                    "id": h.id,
+                    "text": h.text,
+                    "p_effective": round(float(h.p_effective), 4),
+                    "v": round(float(h.v_coefficient), 4),
+                    "validation_status": h.validation_status,
+                    "action_status": h.action_status,
+                    "context": h.context,
+                    "support_in_doubt": h.support_in_doubt,
+                    "owl": h.owl,
+                    "duck": h.duck,
+                    **(
+                        {
+                            "direction": h.direction,
+                            "due": h.due.isoformat() if h.due else None,
+                            "verdict": h.verdict,
+                        }
+                        if h.direction
+                        else {}
+                    ),
+                }
+                for h in self.hits
+            ],
+            "scope": {
+                "routes": list(self.routes),
+                "area": self.area,
+                "theta": self.theta,
+                "as_of": self.as_of.isoformat(),
+            },
+            "completed": self.completed,
+            "continuation": self.continuation,
+            "evaluated": self.evaluated,
         }

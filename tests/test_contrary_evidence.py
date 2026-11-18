@@ -16,7 +16,7 @@ def mem(tmp_path):
 
 
 class TestApplyContraryEvidence:
-    def test_lowers_p_and_v_immediately(self, mem):
+    def test_lowers_v_and_leaves_p(self, mem):
         mid = mem.save(
             "User lives in Lviv",
             tags=["identity", "city", "bio"],
@@ -38,12 +38,12 @@ class TestApplyContraryEvidence:
 
         assert isinstance(result, ContraryEvidenceResult)
         assert result.target_id == mid
-        assert result.p_after < result.p_before
+        assert result.p_after == result.p_before
         assert result.v_after < v_before
         assert result.p_effective_after > 0
 
         after = mem._storage.get(mid, user="test_user")
-        assert after.p_magnitude == pytest.approx(result.p_after)
+        assert after.p_magnitude == before.p_magnitude
         assert after.validation_prediction_total == (
             before.validation_prediction_total or 0
         ) + 1
@@ -111,12 +111,12 @@ class TestApplyContraryEvidence:
             mem.apply_contrary_evidence(mid, "   ")
 
     def test_penalize_shares_prediction_miss_path(self, mem):
-        """penalize() must still lower P via the shared miss helper."""
+        """penalize() records the same miss: V falls, P stays."""
         mid = mem.save("Wrong claim", tags=["a", "b", "c"], p_magnitude=70)
         before = mem._storage.get(mid, user="test_user").p_magnitude
         mem.penalize(mid, coupling_score=0.8)
         after = mem._storage.get(mid, user="test_user")
-        assert after.p_magnitude < before
+        assert after.p_magnitude == before
         assert after.validation_prediction_total == 1
         assert after.validation_prediction_correct == 0
 

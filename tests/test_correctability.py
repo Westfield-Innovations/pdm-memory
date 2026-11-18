@@ -2,9 +2,9 @@
 Tests for the Correctability Benchmark.
 
 Covers:
- - penalize() decreases V-coefficient and p_magnitude
- - reinforce() increases V-coefficient and p_magnitude
- - _apply_reinforcement updates V counters via recall()
+ - penalize() lowers V and leaves p_magnitude
+ - reinforce() raises V and leaves p_magnitude
+ - recall(reinforce=True) grades nothing
  - crossover occurs within a small harness run
  - ablation shows higher gravity than pdm_enabled
  - VectorRAGBaseline is gravity-dominant
@@ -76,8 +76,8 @@ def scenario_with_mem(tmp_mem):
 # ---------------------------------------------------------------------------
 
 
-def test_penalize_decreases_p_magnitude_and_raises_total(tmp_mem):
-    """penalize() must lower p_magnitude and increment validation_prediction_total."""
+def test_penalize_leaves_p_magnitude_and_raises_total(tmp_mem):
+    """penalize() counts a miss; P is written once, at ingest."""
     mem_id = tmp_mem.save(
         text="Wrong answer about boiling point",
         p_magnitude=85.0,
@@ -96,10 +96,7 @@ def test_penalize_decreases_p_magnitude_and_raises_total(tmp_mem):
     rec_after = tmp_mem._storage.get(mem_id, user="test")
     assert rec_after is not None
 
-    # p_magnitude must fall
-    assert rec_after.p_magnitude < p_before, (
-        f"Expected p_magnitude to fall after penalize, got {rec_after.p_magnitude} >= {p_before}"
-    )
+    assert rec_after.p_magnitude == p_before
     # total must increment
     assert rec_after.validation_prediction_total == total_before + 1
     # correct must NOT change
@@ -111,8 +108,8 @@ def test_penalize_decreases_p_magnitude_and_raises_total(tmp_mem):
 # ---------------------------------------------------------------------------
 
 
-def test_reinforce_increases_p_magnitude_and_both_v_counters(tmp_mem):
-    """reinforce() must raise p_magnitude and increment both V counters."""
+def test_reinforce_leaves_p_magnitude_and_raises_both_v_counters(tmp_mem):
+    """reinforce() counts a correct prediction; P is written once, at ingest."""
     mem_id = tmp_mem.save(
         text="Correct answer: water boils at 100°C",
         p_magnitude=40.0,
@@ -129,7 +126,7 @@ def test_reinforce_increases_p_magnitude_and_both_v_counters(tmp_mem):
 
     rec_after = tmp_mem._storage.get(mem_id, user="test")
 
-    assert rec_after.p_magnitude > p_before, "p_magnitude must rise after reinforce()"
+    assert rec_after.p_magnitude == p_before
     assert rec_after.validation_prediction_total == total_before + 1
     assert rec_after.validation_prediction_correct == correct_before + 1
 
@@ -139,8 +136,8 @@ def test_reinforce_increases_p_magnitude_and_both_v_counters(tmp_mem):
 # ---------------------------------------------------------------------------
 
 
-def test_recall_auto_reinforce_updates_v_counters(tmp_mem):
-    """recall(reinforce=True) should update both V counters for returned hits."""
+def test_recall_reinforce_true_counts_no_prediction(tmp_mem):
+    """recall(reinforce=True) is deprecated: it touches, never grades."""
     mem_id = tmp_mem.save(
         text="Correct answer auto-reinforce test",
         p_magnitude=60.0,
@@ -151,11 +148,11 @@ def test_recall_auto_reinforce_updates_v_counters(tmp_mem):
     rec_before = tmp_mem._storage.get(mem_id, user="test")
     total_before = rec_before.validation_prediction_total
 
-    tmp_mem.recall("correct answer test", k=1, reinforce=True)
+    with pytest.warns(DeprecationWarning):
+        tmp_mem.recall("correct answer test", k=1, reinforce=True)
 
     rec_after = tmp_mem._storage.get(mem_id, user="test")
-    # At least total should have increased (hit was returned)
-    assert rec_after.validation_prediction_total >= total_before
+    assert rec_after.validation_prediction_total == total_before
 
 
 # ---------------------------------------------------------------------------

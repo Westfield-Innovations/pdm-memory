@@ -32,6 +32,7 @@ from pdm_memory.storage.errors import (
     CloudNotFoundError,
     CloudStorageError,
 )
+from pdm_memory.storage.schema import carried_of
 
 logger = logging.getLogger(__name__)
 
@@ -160,9 +161,14 @@ class CloudDriver(BaseStorage):
     # BaseStorage
     # ------------------------------------------------------------------
 
-    def save(self, sig: SignatureRecord) -> str:
+    #: The server writes support links at ingest (``rests_on``); Memory passes them here.
+    support_at_ingest = True
+
+    def save(self, sig: SignatureRecord, *, rests_on: builtins.list[str] | None = None) -> str:
         """POST /api/v1/pdm/ingest — create a new signature in the cloud."""
         payload = self._record_to_payload(sig)
+        if rests_on:
+            payload["rests_on"] = list(rests_on)
         resp = self._post("/api/v1/pdm/ingest", payload)
         data = resp.json()
         cloud_id = data.get("id") or data.get("signature_id") or sig.id
@@ -495,20 +501,22 @@ class CloudDriver(BaseStorage):
         cursor_id: str | None = None,
         include_deleted: bool = False,
         tag_any: builtins.list[str] | tuple[str, ...] | None = None,
+        min_carried: float = 0.0,
     ) -> builtins.list[SignatureRecord]:
         """
         GET /api/v1/pdm/signatures — keyset list, mirrors Postgres/SQLite.
 
         Storage scan endpoint (no retrieve side effects). Pages transparently
         when ``limit`` exceeds ``_API_PAGE_MAX`` (server max page size).
-        Optional ``tag_any`` is filtered client-side (API has no tag param yet).
+        Optional ``tag_any`` and ``min_carried`` are filtered client-side.
         """
         if limit <= 0:
             return []
 
         tags = {t.strip().lower() for t in (tag_any or ()) if t and str(t).strip()}
         # Over-fetch when tag-filtering so callers can still fill ``limit`` matches.
-        need = limit if not tags else min(max(limit * 5, limit), 2_000)
+        filtered = bool(tags) or min_carried > 0
+        need = limit if not filtered else min(max(limit * 5, limit), 2_000)
 
         records: builtins.list[SignatureRecord] = []
         next_cursor = cursor_id
@@ -554,6 +562,8 @@ class CloudDriver(BaseStorage):
                     for rec in page_records
                     if {tag.lower() for tag in (rec.intent_tags or []) if tag} & tags
                 ]
+            if min_carried > 0:
+                page_records = [rec for rec in page_records if carried_of(rec) >= min_carried]
 
             if raw_count == 0:
                 break
@@ -599,6 +609,37 @@ class CloudDriver(BaseStorage):
                 "List response missing valid pagination.total_count",
                 path=path,
             ) from exc
+
+    def touch(self, user: str, ids: builtins.list[str]) -> int:
+        """POST /api/v1/pdm/touch: the server stamps the rows and links them as coaccess."""
+        resp = self._post("/api/v1/pdm/touch", {"ids": list(ids)})
+        return int(resp.json().get("touched", 0) or 0)
+
+    def save_coverage_gap(
+        self, user: str, source: str, gap_from: datetime, gap_to: datetime
+    ) -> int:
+        """POST /api/v1/pdm/coverage-gaps; returns how many verdicts the server amended."""
+        resp = self._post(
+            "/api/v1/pdm/coverage-gaps",
+            {"source": source, "from": gap_from.isoformat(), "to": gap_to.isoformat()},
+        )
+        return int(resp.json().get("amended", 0) or 0)
+
+    def observe_claim(
+        self, memory_id: str, outcome: str, event_time: datetime | None
+    ) -> dict:
+        """POST /api/v1/pdm/claims/<id>/observe: the server grades it; the report time is its own."""
+        payload: dict[str, Any] = {"outcome": outcome}
+        if event_time is not None:
+            payload["event_time"] = event_time.isoformat()
+        return self._post(f"/api/v1/pdm/claims/{memory_id}/observe", payload).json()
+
+    def count_silent(self, user: str, theta: float, as_of: datetime) -> int:
+        """GET /api/v1/pdm/count-silent: counted by the server, from its own index."""
+        resp = self._get(
+            "/api/v1/pdm/count-silent", params={"theta": theta, "as_of": as_of.isoformat()}
+        )
+        return int(resp.json().get("silent", 0) or 0)
 
     def list_drawers(self, user: str = "default") -> builtins.list[DrawerInfo]:
         """GET /api/v1/pdm/drawers — raises on failure."""
@@ -1576,6 +1617,14 @@ class CloudDriver(BaseStorage):
             "t_event_at": cls._iso(sig.t_event_at),
             "source_sdk": sig.source,
         }
+        if sig.direction:
+            # The response serializer omits the claim; keep it for the round trip.
+            sdk_bag["claim"] = {
+                "direction": sig.direction,
+                "due": cls._iso(sig.due),
+                "outcome_source": sig.outcome_source,
+                "watch_window": sig.watch_window,
+            }
         shape = meta.get(MEMORY_SHAPE_KEY)
         if isinstance(shape, str) and shape:
             sdk_bag[MEMORY_SHAPE_KEY] = shape
@@ -1609,6 +1658,13 @@ class CloudDriver(BaseStorage):
         }
         if sig.idempotency_key:
             payload["idempotency_key"] = sig.idempotency_key
+        if sig.direction:
+            payload["direction"] = sig.direction
+            payload["due"] = cls._iso(sig.due)
+            if sig.outcome_source:
+                payload["outcome_source"] = sig.outcome_source
+            if sig.watch_window is not None:
+                payload["watch_window_days"] = sig.watch_window
         return payload
 
     @staticmethod
@@ -1712,7 +1768,22 @@ class CloudDriver(BaseStorage):
             or bool(isinstance(meta, dict) and meta.get("_pdm_is_deleted")),
             "idempotency_key": data.get("idempotency_key")
             or (meta.get("_idempotency_key") if isinstance(meta, dict) else None),
+            "validation_status": str(data.get("validation_status") or "UNVALIDATED"),
         }
+        claim = sdk_bag.get("claim") if isinstance(sdk_bag.get("claim"), dict) else {}
+        direction = data.get("direction") or claim.get("direction") or ""
+        if direction:
+            watch = data.get("watch_window_days", claim.get("watch_window"))
+            kwargs.update(
+                direction=str(direction),
+                due=_dt(data.get("due") or claim.get("due")),
+                outcome_source=str(data.get("outcome_source") or claim.get("outcome_source") or ""),
+                watch_window=float(watch) if watch is not None else None,
+                outcome=str(data.get("outcome") or ""),
+                verdict=str(data.get("verdict") or ""),
+                event_time=_dt(data.get("event_time")),
+                report_time=_dt(data.get("report_time")),
+            )
         if record_id:
             kwargs["id"] = record_id
         # Restore shape from SDK bag when top-level metadata was stripped.

@@ -33,38 +33,63 @@ Wrapper (zero-config LLM integration):
 from __future__ import annotations
 
 import builtins
+import itertools
 import logging
 import math
 import os
+import warnings
 from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
 from typing_extensions import Self
 
+from pdm_memory.claims import (
+    EXPIRED_UNOBSERVED,
+    NOT_BY_DUE,
+    Claim,
+    ClaimResult,
+    SettlementReport,
+    counts_for,
+    gap_touches,
+    graded,
+    is_duck,
+    is_owl,
+    observed_verdict,
+    watch_window_end,
+)
 from pdm_memory.core.alignment import verify_records
 from pdm_memory.core.math import (
-    DECAY_DELETE_THRESHOLD,
+    DEFAULT_MIN_P,
     MEMORY_SHAPE_KEY,
+    SEARCH_FLOOR,
     SHAPE_HALF_LIVES,
-    calculate_decay_factor,
     calculate_effective_spike,
     calculate_intent_weight,
-    calculate_p_effective,
     calculate_v,
+    disuse_clock,
     half_life_for_signature,
     infer_domain,
     infer_shape,
     resolve_memory_shape,
+    weight_of,
 )
-from pdm_memory.core.retrieval import DEFAULT_DIVERSITY_BIAS, RetrievalEngine
+from pdm_memory.core.retrieval import (
+    DEFAULT_DIVERSITY_BIAS,
+    THETA_BASE_DEFAULT,
+    RetrievalEngine,
+)
 from pdm_memory.core.signature import (
+    REOPENED,
+    UNVALIDATED,
+    VALIDATED,
     ContraryEvidenceResult,
     DecaySnapshot,
     DrawerInfo,
     ExplainReport,
+    LinkRow,
     MemoryHit,
     SignatureRecord,
 )
@@ -77,6 +102,7 @@ from pdm_memory.models import (
     RecordedProjection,
     RelationshipChannelResolution,
     RelationshipState,
+    RetrieveResult,
     SurfaceReport,
     TorsionReport,
     Trajectory,
@@ -92,6 +118,26 @@ from pdm_memory.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+# How many of the rows one touch used get coaccess links: the best-matching.
+COACCESS_PER_TOUCH = 5
+# Candidates a retrieve weighs exactly, unless the caller sets its budget.
+DEFAULT_BUDGET = 200
+# Under this many tagged candidates over the gate, the listing route joins.
+LISTING_MIN = 50
+# Columns only their own writer sets (PDM v1.9 change 3): P (and the spike derived
+# from it) at ingest, the verdict counts at validate, the use clock at touch.
+_WRITER_OWNED_FIELDS = frozenset({
+    "p_magnitude",
+    "effective_spike",
+    "validation_prediction_correct",
+    "validation_prediction_total",
+    "last_retrieved",
+    "retrieval_count",
+})
+ROUTE_TAGS = "tags"
+ROUTE_AREA = "area"
+ROUTE_LISTING = "listing"
 
 
 class Memory:
@@ -276,6 +322,8 @@ class Memory:
         dedupe: bool = True,
         dedupe_reinforce: bool = False,
         idempotency_key: str | None = None,
+        rests_on: Sequence[str] | None = None,
+        claim: Claim | None = None,
     ) -> str:
         """
         Store a new memory.
@@ -303,8 +351,14 @@ class Memory:
                             ``structural``. Stored in ``metadata[memory_shape]``. When
                             omitted, inferred from tags/text when possible.
             dedupe:         If True, return existing ID when fact hash already stored.
-            dedupe_reinforce: When dedupe hits, call reinforce() on the existing memory.
+            dedupe_reinforce: When dedupe hits, touch() the existing memory (a use, not a grade).
             idempotency_key:  If set, repeated saves with the same key return the existing ID.
+            rests_on:       Ids this memory rests on: support links (PDM v1.9 change 7).
+                            A correction to one re-opens this memory. Unknown ids and
+                            the memory itself are skipped; ignored on a dedupe hit.
+            claim:          A prediction on this memory: direction, due, bound source
+                            (PDM v1.9 change 4). A claim is never deduped: each is its
+                            own prediction.
 
         Returns:
             The new memory ID (UUID string), or existing ID if dedupe matched.
@@ -313,6 +367,8 @@ class Memory:
             raise ValueError("Memory text cannot be empty.")
 
         text = text.strip()[:500]
+        if claim is not None:
+            dedupe = False
 
         if idempotency_key:
             key = idempotency_key.strip()
@@ -328,7 +384,7 @@ class Memory:
             existing = self._storage.find_by_hash(hash_fact_text(text), user=self._user)
             if existing is not None:
                 if dedupe_reinforce:
-                    self.reinforce(existing.id)
+                    self.touch([existing.id])
                 logger.debug("[PDM] save() dedupe → %s", existing.id[:8])
                 return existing.id
 
@@ -351,8 +407,22 @@ class Memory:
             shape=shape,
             idempotency_key=idempotency_key,
         )
+        if claim is not None:
+            sig.direction = claim.direction
+            sig.due = claim.due
+            sig.outcome_source = (claim.outcome_source or "").strip()
+            sig.watch_window = claim.watch_window_days
         sig = self._run_pre_save_hooks(sig)
-        memory_id = self._storage.save(sig)
+        if rests_on and getattr(self._storage, "support_at_ingest", False):
+            known = self._storage.get_many(
+                [i for i in dict.fromkeys(str(x) for x in rests_on if x) if i != sig.id],
+                user=self._user,
+            )
+            memory_id = self._storage.save(sig, rests_on=sorted(known))
+        else:
+            memory_id = self._storage.save(sig)
+            if rests_on:
+                self._write_support(memory_id, rests_on)
         self._run_post_save_hooks(sig, memory_id)
         logger.debug("[PDM] save() → %s (P=%.1f)", memory_id, p_magnitude)
         return memory_id
@@ -501,11 +571,11 @@ class Memory:
                     if len(save_results) < len(sigs_to_save):
                         errors += len(sigs_to_save) - len(save_results)
 
-        for memory_id in reinforce_ids:
+        if reinforce_ids:
             try:
-                self.reinforce(memory_id)
+                self.touch(reinforce_ids)
             except Exception as exc:
-                logger.warning("[PDM] save_many dedupe reinforce failed for %s: %s", memory_id, exc)
+                logger.warning("[PDM] save_many dedupe touch failed: %s", exc)
 
         logger.info(
             "[PDM] save_many saved=%d skipped=%d errors=%d blocked=%d",
@@ -608,7 +678,8 @@ class Memory:
             memory_id:   Target signature UUID.
             text:        New fact text (max 500 chars).
             tags:        Replacement intent tags (recomputes domain).
-            p_magnitude: New stored pressure (0–100).
+            p_magnitude: Refused: P is written only at ingest (PDM v1.9 change 3).
+                         Kept so an old call fails with that reason.
             t_persistence: New persistence half-life in days.
             drawer:      New drawer / category name.
             regime:      New question regime.
@@ -622,7 +693,7 @@ class Memory:
             Updated MemoryHit with live P_effective.
 
         Raises:
-            ValueError: Memory not found or no fields to update.
+            ValueError: Memory not found, no fields to update, or *p_magnitude* given.
         """
         rec = self._storage.get(memory_id, user=self._user)
         if rec is None:
@@ -736,7 +807,7 @@ class Memory:
         min_pressure: float = 0.0,
         search_cost: float = 0.5,
         drawer: str | None = None,
-        reinforce: bool = True,
+        reinforce: bool = False,
         *,
         candidate_limit: int = 2_000,
         page_size: int = 500,
@@ -746,13 +817,9 @@ class Memory:
         """
         Retrieve the top-k most relevant memories for a query.
 
-        Retrieval works via Threshold-Adjustment Search (TAS):
-        pressure thresholds are lowered based on search_cost, then
-        coupling scores rank memories by tag/domain/regime resonance.
-
-        Decay is applied at recall time via the canonical domain half-life
-        law (P_effective = P × … × (1 - decay_factor)). Stored p_magnitude
-        is not rewritten on read — no second power-law decay.
+        :meth:`retrieve` in the PDM v1.9 order, returning only the hits:
+        ``search_cost`` lowers the one weight gate θ (0.0 strict, 1.0 loose,
+        never under 10 = 0.1 of full) and ``drawer`` is the area. Writes nothing.
 
         Args:
             query:       The recall query / current context.
@@ -760,52 +827,37 @@ class Memory:
             min_pressure: Only consider memories with p_magnitude >= this.
             search_cost: 0.0 = strict (high threshold), 1.0 = loose (low threshold).
             drawer:      Optional: filter by drawer name.
-            reinforce:   If True, increment retrieval_count and update last_retrieved.
-            candidate_limit: Max signatures loaded from storage for ranking (default 2_000).
+            reinforce:   Deprecated. Recall writes nothing (PDM v1.9 change 3); True
+                         only touches the hits. Call :meth:`touch` with what you used.
+            candidate_limit: Budget: max candidates weighed exactly (default 2_000).
             page_size:       Keyset page size when loading candidates (default 500).
             diversity_bias:  Max fraction of top-k from one drawer (default ``0.4``).
                              Pass ``None`` for pure score order.
-            on_recall:       Optional callback invoked for each returned hit before reinforce.
+            on_recall:       Optional callback invoked for each returned hit.
 
         Returns:
             List[MemoryHit] ranked by relevance, length ≤ k.
         """
-        records = self._load_recall_candidates(
-            query=query,
-            min_pressure=min_pressure,
-            drawer=drawer,
-            candidate_limit=candidate_limit,
-            page_size=page_size,
-        )
-        if not records:
-            ctx: dict[str, Any] = {
-                "query": query,
-                "k": k,
-                "hits": [],
-                "reinforced": False,
-                "min_pressure": min_pressure,
-                "search_cost": search_cost,
-                "drawer": drawer,
-                "diversity_bias": diversity_bias,
-            }
-            self._run_post_recall_hooks(ctx)
-            return []
-
-        hits = self._engine.recall(
-            records=records,
-            query=query,
+        hits = self._retrieve(
+            query,
+            area=drawer,
+            theta=self._engine._compute_threshold(THETA_BASE_DEFAULT, search_cost),
             k=k,
-            search_cost=search_cost,
+            budget=candidate_limit,
+            min_pressure=min_pressure,
+            page_size=page_size,
             diversity_bias=diversity_bias,
-        )
+        ).hits
 
         if on_recall:
             for hit in hits:
                 on_recall(hit)
 
         reinforced = bool(reinforce and hits)
+        if reinforce:
+            _warn_reinforce("recall")
         if reinforced:
-            self._apply_reinforcement(hits)
+            self.touch([hit.id for hit in hits])
 
         ctx = {
             "query": query,
@@ -819,6 +871,171 @@ class Memory:
         }
         self._run_post_recall_hooks(ctx)
         return hits
+
+    def retrieve(
+        self,
+        cue: str = "",
+        *,
+        area: str | None = None,
+        min_p: float = DEFAULT_MIN_P,
+        k: int = 5,
+        budget: int = DEFAULT_BUDGET,
+        as_of: datetime | None = None,
+        continuation: str | None = None,
+    ) -> RetrieveResult:
+        """
+        Qualified memories for *cue* (PDM v1.9 changes 12 and 14). Writes nothing.
+
+        In order: activate ids by route (the cue's words in the tag table; the
+        area; the whole scope when the tags reach too few), keep those whose
+        carried number may clear θ = *min_p* (0–100, default 30 = 0.3 of full),
+        weigh each exactly at one as-of time while the *budget* lasts, rank the
+        survivors by match score, and flag them. A result stopped on budget
+        carries a continuation that resumes under the same as-of time and order.
+        Call :meth:`touch` with what you used.
+        """
+        return self._retrieve(
+            cue, area=area, theta=float(min_p), k=k, budget=budget,
+            as_of=as_of, continuation=continuation,
+        )
+
+    def search(
+        self,
+        cue: str = "",
+        *,
+        min_p_lowered: float,
+        area: str | None = None,
+        k: int = 5,
+        budget: int = DEFAULT_BUDGET,
+        as_of: datetime | None = None,
+        continuation: str | None = None,
+    ) -> RetrieveResult:
+        """
+        As :meth:`retrieve`, with the weight gate lowered to *min_p_lowered* at every gate.
+
+        Without a named *area* the gate never goes below 10 (0.1 of full), so
+        the silent set stays out of an unnamed search; an area sets its own bound.
+        Nothing else is loosened. Writes nothing.
+        """
+        theta = float(min_p_lowered)
+        if not area:
+            theta = max(theta, SEARCH_FLOOR)
+        return self._retrieve(
+            cue, area=area, theta=theta, k=k, budget=budget,
+            as_of=as_of, continuation=continuation,
+        )
+
+    def _retrieve(
+        self,
+        cue: str,
+        *,
+        area: str | None,
+        theta: float,
+        k: int,
+        budget: int,
+        as_of: datetime | None = None,
+        continuation: str | None = None,
+        min_pressure: float = 0.0,
+        page_size: int = 500,
+        diversity_bias: float | None = DEFAULT_DIVERSITY_BIAS,
+    ) -> RetrieveResult:
+        resumed_at, phase, after = _resume(continuation)
+        as_of = resumed_at or as_of or datetime.now(tz=timezone.utc)
+        page_size = max(1, page_size)
+        words = RetrievalEngine._cue_words(cue) if cue else []
+
+        def pages(tags: builtins.list[str] | None, cursor: str | None):
+            while True:
+                batch = self._storage.list(
+                    user=self._user, limit=page_size, min_pressure=min_pressure,
+                    drawer=area, cursor_id=cursor, tag_any=tags, min_carried=theta,
+                )
+                yield from batch
+                if len(batch) < page_size:
+                    return
+                cursor = batch[-1].id
+
+        # Too few tagged rows over the gate: the whole scope joins, tagged rows first.
+        probe: builtins.list[SignatureRecord] = []
+        if words and phase in (None, "P", "L"):
+            probe = list(itertools.islice(pages(words, None), LISTING_MIN))
+        listing = not words or phase in ("P", "L") or (phase is None and len(probe) < LISTING_MIN)
+        routes = ([ROUTE_TAGS] if words else []) + ([ROUTE_AREA] if area else [])
+        if listing:
+            routes.append(ROUTE_LISTING)
+
+        def stream():
+            if not listing:
+                yield from (("T", r) for r in pages(words, after))
+                return
+            if phase != "L":
+                ids = [r.id for r in probe]
+                start = ids.index(after) + 1 if phase == "P" and after in ids else 0
+                yield from (("P", r) for r in probe[start:])
+            tagged = {r.id for r in probe}
+            yield from (
+                ("L", r)
+                for r in pages(None, after if phase == "L" else None)
+                if r.id not in tagged
+            )
+
+        survivors: builtins.list[SignatureRecord] = []
+        evaluated, last, completed = 0, None, True
+        for step, rec in stream():
+            if evaluated >= budget:
+                completed = False
+                break
+            evaluated += 1
+            last = (step, rec.id)
+            if weight_of(rec, as_of)[0] >= theta:
+                survivors.append(rec)
+
+        hits = self._engine.recall(
+            records=survivors, query=cue, k=k, theta=theta, as_of=as_of,
+            diversity_bias=diversity_bias,
+        ) if survivors else []
+        self._flag(hits, {r.id: r for r in survivors}, theta, as_of)
+        return RetrieveResult(
+            hits=hits,
+            routes=routes,
+            area=area,
+            theta=theta,
+            as_of=as_of,
+            completed=completed,
+            continuation=None if completed or last is None
+            else f"{as_of.isoformat()}|{last[0]}|{last[1]}",
+            evaluated=evaluated,
+        )
+
+    def _flag(
+        self,
+        hits: builtins.list[MemoryHit],
+        records: dict[str, SignatureRecord],
+        theta: float,
+        as_of: datetime,
+    ) -> None:
+        """Owl, duck, STANDALONE / RECOVERY and support in doubt (changes 6, 8, 9)."""
+        for hit in hits:
+            hit.owl = is_owl(records[hit.id], as_of)
+            hit.duck = is_duck(records[hit.id])
+        if not hits:
+            return
+        try:
+            links = self._storage.links(self._user, [h.id for h in hits], side="out")
+        except NotImplementedError:
+            return  # not computed: action_status stays UNVALIDATED
+        neighbours = self._storage.get_many(
+            list({link.neighbor_id for link in links}), user=self._user
+        )
+        loud = {nid for nid, rec in neighbours.items() if weight_of(rec, as_of)[0] >= theta}
+        for hit in hits:
+            mine = [link for link in links if link.pressure_id == hit.id]
+            hit.context = "RECOVERY" if any(lk.neighbor_id in loud for lk in mine) else "STANDALONE"
+            hit.support_in_doubt = any(
+                _support_doubted(neighbours.get(lk.neighbor_id), lk)
+                for lk in mine
+                if lk.kind == "support"
+            )
 
     def surface(
         self,
@@ -839,7 +1056,7 @@ class Memory:
             search_cost:        TAS threshold looseness for recall.
             torsion_threshold:  Minimum torsion_score to count.
             min_goal_pressure:  Goal-anchor pressure floor for alignment.
-            reinforce:          If True, reinforce recall hits (default False).
+            reinforce:          Deprecated; True only touches the hits.
 
         Returns:
             SurfaceReport with hits, torsion_count, and alignment status.
@@ -854,8 +1071,10 @@ class Memory:
             diversity_bias=DEFAULT_DIVERSITY_BIAS,
         )
         reinforced = bool(reinforce and hits)
+        if reinforce:
+            _warn_reinforce("surface")
         if reinforced:
-            self._apply_reinforcement(hits)
+            self.touch([hit.id for hit in hits])
         self._run_post_recall_hooks(
             {
                 "query": query,
@@ -887,87 +1106,305 @@ class Memory:
             torsion_reports=torsion_reports,
         )
 
-    def reinforce(self, memory_id: str, coupling_score: float = 0.5) -> None:
-        """
-        Manually reinforce a memory (raise its pressure) and record a correct
-        prediction in the Validation Coefficient counters.
+    def touch(
+        self,
+        ids: Sequence[str],
+        *,
+        match_scores: dict[str, float] | None = None,
+    ) -> int:
+        """Record that the caller used *ids*: resets their disuse clock. Returns how many.
 
-        recall() calls this automatically for all returned hits when
-        ``reinforce=True`` (the default).  Call this explicitly to signal
-        that a memory-driven prediction turned out to be *correct*.
-
-        Each call increments both ``validation_prediction_total`` and
-        ``validation_prediction_correct``, which raises V and therefore
-        P_effective on the next retrieval.
-
-        Args:
-            memory_id:      The memory UUID to reinforce.
-            coupling_score: Coupling strength (0–1), influences Δp magnitude.
+        The only writer of ``last_retrieved`` and ``retrieval_count`` (PDM v1.9
+        change 3). Never a grade: P and V stay where they are. Rows used together
+        are linked as coaccess, the ``COACCESS_PER_TOUCH`` best by *match_scores*
+        (else in the order given).
         """
         now = datetime.now(tz=timezone.utc)
-        atomic_reinforce = getattr(self._storage, "atomic_reinforce", None)
-        if callable(atomic_reinforce):
-            atomic_reinforce(
-                memory_id,
-                self._user,
-                compute_delta=lambda p, rc: self._engine.compute_reinforcement_delta(
-                    p, rc, coupling_score
-                ),
-                last_retrieved=now,
+        unique = list(dict.fromkeys(str(i) for i in ids if i))
+        remote = getattr(self._storage, "touch", None)
+        if callable(remote):
+            # The server stamps and links in one call.
+            return remote(self._user, unique) if unique else 0
+        touched = 0
+        for memory_id in unique:
+            touched += self._storage.increment(
+                memory_id, self._user, {"retrieval_count": 1}, last_retrieved=now
             )
-            logger.debug("[PDM] reinforce(%s) atomic", memory_id)
-            return
+        if len(unique) > 1:
+            # Links are a side effect of the caller's use: log, never raise into it.
+            try:
+                self._write_coaccess(unique, match_scores or {}, now)
+            except Exception as exc:
+                logger.warning("[PDM] touch: coaccess links not written: %s", exc)
+        return touched
 
-        rec = self._storage.get(memory_id, user=self._user)
-        if rec is None:
-            raise ValueError(f"Memory '{memory_id}' not found for user '{self._user}'")
-        delta = self._engine.compute_reinforcement_delta(
-            rec.p_magnitude, rec.retrieval_count, coupling_score
-        )
-        new_p = min(100.0, rec.p_magnitude + delta)
-        new_spike = calculate_effective_spike(new_p, rec.t_persistence, rec.phase_privilege)
-        new_total = (rec.validation_prediction_total or 0) + 1
-        new_correct = (rec.validation_prediction_correct or 0) + 1
-        self._storage.update(
-            memory_id,
-            user=self._user,
-            p_magnitude=new_p,
-            effective_spike=new_spike,
-            retrieval_count=(rec.retrieval_count or 0) + 1,
-            last_retrieved=now,
-            validation_prediction_total=new_total,
-            validation_prediction_correct=new_correct,
-        )
-        logger.debug(
-            "[PDM] reinforce(%s) Δp=+%.2f → P=%.1f  V_total=%d V_correct=%d",
-            memory_id, delta, new_p, new_total, new_correct,
+    def root_count(self, memory_id: str) -> int:
+        """How many memories rest directly on *memory_id*: a correction's first ring."""
+        return len(self._storage.links(self._user, [memory_id], side="in", kind="support"))
+
+    def _write_support(self, memory_id: str, rests_on: Sequence[str]) -> int:
+        ids = [i for i in dict.fromkeys(str(x) for x in rests_on if x) if i != memory_id]
+        supports = self._storage.get_many(ids, user=self._user)
+        now = datetime.now(tz=timezone.utc)
+        return self._storage.write_links(
+            self._user,
+            [_link(memory_id, rec, "support", now) for _, rec in sorted(supports.items())],
         )
 
-    def penalize(self, memory_id: str, coupling_score: float = 0.5) -> None:
+    def _write_coaccess(
+        self, ids: builtins.list[str], match_scores: dict[str, float], now: datetime
+    ) -> int:
+        order = {mid: i for i, mid in enumerate(ids)}
+        top = sorted(ids, key=lambda i: (-float(match_scores.get(i, 0.0)), order[i]))
+        used = self._storage.get_many(top[:COACCESS_PER_TOUCH], user=self._user)
+        return self._storage.write_links(
+            self._user,
+            [
+                _link(a, b, "coaccess", now)
+                for a in used
+                for b in used.values()
+                if b.id != a
+            ],
+        )
+
+    def _reopen_dependents(self, memory_id: str) -> set[str]:
+        """Mark REOPENED everything resting on *memory_id* along support, however far up."""
+        seen: set[str] = set()
+        frontier = {memory_id}
+        try:
+            while frontier:
+                ring = {
+                    link.pressure_id
+                    for link in self._storage.links(
+                        self._user, sorted(frontier), side="in", kind="support"
+                    )
+                }
+                frontier = ring - seen
+                seen |= ring
+        except NotImplementedError:
+            return set()  # a store without links has nothing resting on anything
+        affected = seen - {memory_id}
+        if affected:
+            self._storage.update_batch(
+                [(mid, {"validation_status": REOPENED}) for mid in sorted(affected)],
+                user=self._user,
+            )
+        return affected
+
+    def report_coverage_gap(self, source: str, gap_from: datetime, gap_to: datetime) -> int:
         """
-        Penalise a memory after a *wrong* prediction and lower its authority.
+        Record that *source* did not report from *gap_from* to *gap_to* (PDM v1.9 change 4).
 
-        This is the consequence signal **E*** described in the Correctability
-        Benchmark spec.  Call it when the memory that was used as the basis
-        for a prediction turned out to be **incorrect**.
+        A claim bound to *source* whose interval the gap touches is never settled
+        by a missing report: every ``not_by_due`` verdict on that source whose
+        interval the gap touches and whose watch window is still open is amended
+        to ``expired_unobserved`` and its count restored (change 5). Dependents
+        it re-opened stay re-opened. Returns how many verdicts were amended.
+        """
+        source = (source or "").strip()
+        if not source:
+            raise ValueError("A coverage gap names its source.")
+        if gap_from.tzinfo is None or gap_to.tzinfo is None:
+            raise ValueError("A coverage gap's bounds must be timezone-aware.")
+        if gap_to <= gap_from:
+            raise ValueError("A coverage gap ends after it starts.")
+        amended = self._storage.save_coverage_gap(self._user, source, gap_from, gap_to)
+        if self._is_cloud():
+            return amended  # the server amends its own verdicts
+        now = datetime.now(tz=timezone.utc)
+        for rec in self._storage.claims(self._user, verdict=NOT_BY_DUE, source=source):
+            if rec.due is None or now > watch_window_end(rec):
+                continue
+            if rec.created_at < gap_to and rec.due > gap_from:
+                if self._write_verdict(rec, EXPIRED_UNOBSERVED, "", None, now):
+                    amended += 1
+        return amended
 
-        Mechanically:
-        - Increments ``validation_prediction_total`` (prediction was made).
-        - Does **not** increment ``validation_prediction_correct`` (it was wrong).
-        - This lowers V = (correct+1)/(total+2), which lowers P_effective on
-          the next retrieval — the wrong signature loses authority over time.
-        - Also decrements ``p_magnitude`` by the same delta formula used in
-          reinforcement, so the raw pressure drops too.
+    def validate_claim(
+        self,
+        memory_id: str,
+        outcome: str,
+        *,
+        event_time: datetime | None = None,
+        report_time: datetime | None = None,
+    ) -> ClaimResult | None:
+        """
+        Settle a claim on a supplied observation, or amend its one verdict (PDM v1.9 change 5).
 
-        Args:
-            memory_id:      The memory UUID to penalise.
-            coupling_score: Coupling strength (0–1), influences Δp magnitude.
+        *outcome* is ``occurred``, ``observed_absent`` or ``unknown``.
+        *event_time* is when it happened (default: the report time) and is read
+        against the due; *report_time* is when the memory learned of it
+        (default: now). ``occurred`` at or before the due is on time, inside the
+        watch window late, past it outside the claim. ``unknown`` grades
+        nothing. An observation that gives the verdict and outcome the claim
+        already holds changes nothing, its stored times included. Returns None
+        when the observation changes nothing.
+
+        Raises:
+            ValueError: No such claim, or an observation the claim cannot take.
+            RuntimeError: Other writers kept changing the claim's verdict.
+        """
+        if self._is_cloud():
+            # The server grades, and stamps the report time itself.
+            data = self._storage.observe_claim(memory_id, outcome, event_time)
+            if not data.get("changed"):
+                return None
+            return ClaimResult(
+                verdict=str(data.get("verdict") or ""),
+                reopened=int(data.get("reopened") or 0),
+            )
+        report_time = report_time or datetime.now(tz=timezone.utc)
+        event_time = event_time or report_time
+        if event_time.tzinfo is None or report_time.tzinfo is None:
+            raise ValueError("An observation's times must be timezone-aware.")
+        # A settlement pass may write between the read and the write: read again and regrade.
+        for _ in range(3):
+            rec = self._storage.get(memory_id, user=self._user)
+            if rec is None or not rec.direction or rec.due is None:
+                raise ValueError(f"No claim '{memory_id}' for user '{self._user}'.")
+            verdict = observed_verdict(rec, outcome, event_time, report_time)
+            if verdict is None:
+                return None
+            result = self._write_verdict(rec, verdict, outcome, event_time, report_time)
+            if result is not None:
+                return result if result.changed else None
+        raise RuntimeError(f"Claim '{memory_id}' kept changing while it was observed.")
+
+    def settle_due_claims(self, now: datetime | None = None) -> SettlementReport:
+        """
+        The settlement pass (PDM v1.9 change 5): every open claim whose due has come.
+
+        A bound claim with nothing reported is ``not_by_due`` and graded,
+        incorrect for occurs and correct for absent, unless a reported gap on
+        its source touches its interval. That claim, and an unbound one, is
+        ``expired_unobserved``: no longer live, V unchanged. A supplied
+        observation may still amend either through :meth:`validate_claim`.
+        Run it at least once per cycle; it visits only claims with no verdict.
+
+        Raises:
+            RuntimeError: In cloud mode, where the server runs the pass itself.
+        """
+        if self._is_cloud():
+            raise RuntimeError("The cloud settles claims in its own cycle.")
+        now = now or datetime.now(tz=timezone.utc)
+        if now.tzinfo is None:
+            raise ValueError("now must be timezone-aware.")
+        report = SettlementReport()
+        gaps: dict[str, builtins.list[tuple[datetime, datetime]]] = {}
+        # A due is stored as ISO text in its own offset (at most 14 h from UTC), so
+        # the index bound reaches 14 h past now and the exact test runs here.
+        bound = (now + timedelta(hours=14)).astimezone(timezone.utc)
+        open_claims = self._storage.claims(self._user, verdict="", due_by=bound)
+        due = [r for r in open_claims if r.due and r.due <= now]
+        for rec in sorted(due, key=lambda r: (r.due, r.id)):
+            source = rec.outcome_source
+            if source and source not in gaps:
+                gaps[source] = self._storage.coverage_gaps(self._user, source)
+            if source and not gap_touches(gaps[source], rec.created_at, rec.due):
+                verdict = NOT_BY_DUE
+            else:
+                verdict = EXPIRED_UNOBSERVED
+            try:
+                result = self._write_verdict(rec, verdict, "", None, now)
+            except Exception:
+                logger.exception("[PDM] settling claim %s failed", rec.id)
+                report.failed.append(rec.id)
+                continue
+            if result is None:
+                continue  # an observation settled it first
+            report.settled[verdict] = report.settled.get(verdict, 0) + 1
+            report.reopened += result.reopened
+        return report
+
+    def _write_verdict(
+        self,
+        rec: SignatureRecord,
+        verdict: str,
+        outcome: str,
+        event_time: datetime | None,
+        report_time: datetime,
+    ) -> ClaimResult | None:
+        """
+        Amend the claim's one verdict in place and move its one count; a correction re-opens dependents.
+
+        The counts move from ``rec.verdict``, so the write lands only while the
+        row still holds it. None when another writer changed it first.
+        """
+        if (rec.verdict, rec.outcome) == (verdict, outcome):
+            return ClaimResult(verdict=verdict, changed=False)  # the first report's times stand
+        old_correct, old_total = counts_for(rec.direction, rec.verdict)
+        new_correct, new_total = counts_for(rec.direction, verdict)
+        grade = graded(rec.direction, verdict)
+        corrected = grade is False and rec.validation_status == VALIDATED
+        fields: dict[str, Any] = {
+            "verdict": verdict,
+            "outcome": outcome,
+            "event_time": event_time,
+            "report_time": report_time,
+        }
+        if grade is True:
+            fields["validation_status"] = VALIDATED
+        elif corrected or (grade is None and graded(rec.direction, rec.verdict) is True):
+            # A withdrawn grade leaves nothing validated, but corrects nothing either.
+            fields["validation_status"] = UNVALIDATED
+        with self._storage.transaction():
+            written = self._storage.increment(
+                rec.id,
+                self._user,
+                {
+                    "validation_prediction_correct": new_correct - old_correct,
+                    "validation_prediction_total": new_total - old_total,
+                },
+                expect_verdict=rec.verdict,
+                **fields,
+            )
+            if not written:
+                return None  # another writer moved the verdict since *rec* was read
+            reopened = self._reopen_dependents(rec.id) if corrected else set()
+        rec.verdict, rec.outcome = verdict, outcome
+        rec.event_time, rec.report_time = event_time, report_time
+        return ClaimResult(verdict=verdict, reopened=len(reopened))
+
+    def _is_cloud(self) -> bool:
+        from pdm_memory.storage.cloud_driver import CloudDriver
+
+        return isinstance(self._storage, CloudDriver)
+
+    def reinforce(self, memory_id: str, coupling_score: float = 0.5) -> set[str]:
+        """
+        Validate a memory's prediction as correct: ``correct + 1``, ``total + 1``.
+
+        V rises; P and the disuse clock do not move (PDM v1.9 change 3).
+        ``coupling_score`` is accepted for compatibility and ignored. Returns the
+        ids a correction re-opened (none, on the correct path).
+
+        Raises:
+            ValueError: Memory not found.
+        """
+        found = self._storage.increment(
+            memory_id,
+            self._user,
+            {"validation_prediction_total": 1, "validation_prediction_correct": 1},
+            validation_status=VALIDATED,
+        )
+        if not found:
+            raise ValueError(f"Memory '{memory_id}' not found for user '{self._user}'")
+        return set()
+
+    def penalize(self, memory_id: str, coupling_score: float = 0.5) -> set[str]:
+        """
+        Validate a memory's prediction as wrong: ``total + 1``, ``correct`` unchanged.
+
+        V falls, so the weight falls; P and the disuse clock do not move (PDM
+        v1.9 change 3). On a VALIDATED memory this is a correction: it leaves
+        VALIDATED and everything resting on it is REOPENED (change 8).
+        ``coupling_score`` is accepted and ignored. Returns the re-opened ids.
         """
         rec = self._storage.get(memory_id, user=self._user)
         if rec is None:
             logger.warning("[PDM] penalize(%s): not found", memory_id)
-            return
-        self._apply_prediction_miss(rec, coupling_score=coupling_score)
+            return set()
+        return self._apply_prediction_miss(rec)[1]
 
     def apply_contrary_evidence(
         self,
@@ -980,10 +1417,10 @@ class Memory:
         evidence_shape: str | None = None,
     ) -> ContraryEvidenceResult:
         """
-        Immediately lower active pressure on ``target`` when contrary evidence arrives.
+        Immediately lower the weight of ``target`` when contrary evidence arrives.
 
-        Applies the same V-miss + Δp update as :meth:`penalize` without rewriting
-        the target's ``compressed_fact``, ``created_at``, or
+        Records the same miss as :meth:`penalize` (V falls; P and the clock stay)
+        without rewriting the target's ``compressed_fact``, ``created_at``, or
         ``validation_prediction_correct``. Optionally persists the evidence as a
         new signature linked via ``metadata["contrary_to"]``.
 
@@ -991,7 +1428,7 @@ class Memory:
             target:            Target memory id or loaded ``SignatureRecord``.
             evidence:          Contrary fact as text, record, or mapping with
                                ``text`` / ``tags`` / ``shape`` / ``metadata``.
-            coupling_score:    Strength of the miss (0–1), same as ``penalize``.
+            coupling_score:    Accepted for compatibility and ignored, as in ``penalize``.
             persist_evidence:  If True, ``save`` the evidence as a new signature.
             evidence_tags:     Tags for the evidence signature (overrides mapping).
             evidence_shape:    Optional shape for the evidence signature.
@@ -1049,9 +1486,7 @@ class Memory:
                 dedupe=False,
             )
 
-        updated = self._apply_prediction_miss(
-            rec, coupling_score=coupling_score, touch=False
-        )
+        updated, _ = self._apply_prediction_miss(rec)
         v_after = calculate_v(
             updated.validation_prediction_correct,
             updated.validation_prediction_total,
@@ -1082,59 +1517,18 @@ class Memory:
         )
 
     def _apply_prediction_miss(
-        self,
-        rec: SignatureRecord,
-        *,
-        coupling_score: float = 0.5,
-        touch: bool = True,
-    ) -> SignatureRecord:
-        """
-        Record a wrong prediction: Δp down, V total +1, correct unchanged.
-
-        Does not modify ``compressed_fact`` or ``created_at``.
-
-        Args:
-            touch: When True (default, ``penalize``), bump ``last_retrieved``.
-                   When False (``apply_contrary_evidence``), leave the decay
-                   clock alone so live ``P_effective`` does not rebound.
-        """
-        delta = self._engine.compute_reinforcement_delta(
-            rec.p_magnitude, rec.retrieval_count, coupling_score
-        )
-        new_p = max(0.0, rec.p_magnitude - delta)
-        new_spike = calculate_effective_spike(
-            new_p, rec.t_persistence, rec.phase_privilege
-        )
-        new_total = (rec.validation_prediction_total or 0) + 1
-        fields: dict[str, Any] = {
-            "p_magnitude": new_p,
-            "effective_spike": new_spike,
-            "validation_prediction_total": new_total,
-        }
-        if touch:
-            now = datetime.now(tz=timezone.utc)
-            fields["retrieval_count"] = (rec.retrieval_count or 0) + 1
-            fields["last_retrieved"] = now
-        self._storage.update(rec.id, user=self._user, **fields)
-        logger.debug(
-            "[PDM] prediction_miss(%s) Δp=-%.2f → P=%.1f  V_total=%d V_correct=%d touch=%s",
-            rec.id,
-            delta,
-            new_p,
-            new_total,
-            rec.validation_prediction_correct or 0,
-            touch,
-        )
+        self, rec: SignatureRecord
+    ) -> tuple[SignatureRecord, set[str]]:
+        """Record a wrong prediction: ``total + 1``, re-opening on a correction. P, text, clock stay."""
+        corrected = rec.validation_status == VALIDATED
+        fields = {"validation_status": UNVALIDATED} if corrected else {}
+        self._storage.increment(rec.id, self._user, {"validation_prediction_total": 1}, **fields)
+        reopened = self._reopen_dependents(rec.id) if corrected else set()
         updated = self._storage.get(rec.id, user=self._user)
         if updated is None:
-            rec.p_magnitude = new_p
-            rec.effective_spike = new_spike
-            rec.validation_prediction_total = new_total
-            if touch:
-                rec.retrieval_count = (rec.retrieval_count or 0) + 1
-                rec.last_retrieved = fields["last_retrieved"]
-            return rec
-        return updated
+            rec.validation_prediction_total = (rec.validation_prediction_total or 0) + 1
+            return rec, reopened
+        return updated, reopened
 
     @staticmethod
     def _normalize_contrary_evidence(
@@ -1250,12 +1644,12 @@ class Memory:
         limit: int = 10_000,
     ) -> dict[str, Any]:
         """
-        Full-store self-maintenance: torsion scan, auto-reconcile, decay purge.
+        Full-store self-maintenance: torsion scan, auto-reconcile, silent count.
 
         1. ``detect_torsion`` across the store (optional drawer filter).
         2. Auto-reconcile pairs with ``torsion_score > auto_reconcile_threshold``
            (default ``0.85``), highest score first; overlapping IDs skipped.
-        3. Optional ``decay()`` purge of low ``P_effective`` signatures.
+        3. Optional count of the silent set (nothing is deleted).
 
         Returns:
             Dict with ``scanned_pairs``, ``reconciled``, ``skipped``,
@@ -1339,7 +1733,7 @@ class Memory:
 
         decay_counts: dict[str, int] | None = None
         if run_decay:
-            decay_counts = self.decay(dry_run=dry_run)
+            decay_counts = self._silent_counts()
 
         narrative = self._heal_narrative(
             reconciled=reconciled,
@@ -1385,12 +1779,9 @@ class Memory:
         else:
             parts.append("No high-confidence torsion pairs required reconciliation.")
 
-        purged = int((decay or {}).get("deleted", 0) or 0)
-        if purged > 0:
-            residue = "residue" if purged == 1 else "residues"
-            parts.append(f"Purged {purged} low-pressure {residue}.")
-        elif decay is not None:
-            parts.append("No low-pressure residues required purge.")
+        if decay is not None:
+            silent = int(decay.get("silent", 0) or 0)
+            parts.append(f"{silent} silent below the default gate; nothing deleted.")
 
         return " ".join(parts)
 
@@ -1445,7 +1836,7 @@ class Memory:
         Live shape-aware decay metrics for one signature (read-only).
 
         Does not mutate storage. Uses the same half-life law as ``recall`` /
-        ``explain``. For store-wide purge, use :meth:`decay`.
+        ``explain``. For the store-wide silent set, use :meth:`count_silent`.
         """
         as_of = now or datetime.now(tz=timezone.utc)
         if isinstance(signature, SignatureRecord):
@@ -1458,7 +1849,7 @@ class Memory:
                 f"Memory '{memory_id}' not found for user '{self._user}'."
             )
 
-        days_since = self._days_since(rec.last_retrieved or rec.created_at, as_of)
+        days_since = self._days_since(disuse_clock(rec), as_of)
         days_since_created = self._days_since(rec.created_at, as_of)
         shape = resolve_memory_shape(
             rec.metadata, rec.intent_tags, rec.compressed_fact
@@ -1470,19 +1861,7 @@ class Memory:
             metadata=rec.metadata,
             text=rec.compressed_fact,
         )
-        decay = calculate_decay_factor(
-            days_since,
-            half_life,
-            days_since_created=days_since_created,
-            t_persistence=rec.t_persistence,
-        )
-        v = calculate_v(
-            rec.validation_prediction_correct,
-            rec.validation_prediction_total,
-        )
-        p_eff = calculate_p_effective(
-            rec.p_magnitude, v, decay, intent_weight=1.0, quality=0.80
-        )
+        p_eff, v, decay = weight_of(rec, as_of)
         return DecaySnapshot(
             memory_id=rec.id,
             shape=shape,
@@ -1497,64 +1876,52 @@ class Memory:
             as_of=as_of,
         )
 
+    def count_silent(self, theta: float = DEFAULT_MIN_P, as_of: datetime | None = None) -> int:
+        """
+        How many live memories weigh under *theta* (0–100; default 30 = 0.3 of full).
+
+        The silent set: below the default gate, still there for a search. Rows
+        whose carried number is under θ count without weighing; the rest are
+        weighed exactly at *as_of*. Writes nothing (PDM v1.9 change 3).
+        """
+        as_of = as_of or datetime.now(tz=timezone.utc)
+        remote = getattr(self._storage, "count_silent", None)
+        if callable(remote):
+            return remote(self._user, theta, as_of)
+        silent = self._storage.count_below_carried(self._user, theta)
+        cursor: str | None = None
+        while True:
+            page = self._storage.list(
+                user=self._user, limit=500, cursor_id=cursor, min_carried=theta
+            )
+            silent += sum(1 for rec in page if weight_of(rec, as_of)[0] < theta)
+            if len(page) < 500:
+                return silent
+            cursor = page[-1].id
+
     def decay(self, dry_run: bool = False) -> dict[str, int]:
         """
-        Soft-delete memories whose live ``P_effective`` is below the delete threshold.
+        Deprecated: count the silent set; nothing is deleted (PDM v1.9).
 
-        Uses the same half-life law as ``recall()`` / ``explain()``. Does not
-        rewrite ``p_magnitude``. ``decayed`` stays in the return dict for API
-        compat and is always 0.
-
-        For a single-memory live snapshot, use :meth:`decay_at`.
-
-        Args:
-            dry_run: If True, compute what would be deleted but make no writes.
-
-        Returns:
-            Dict with keys: decayed, deleted, skipped.
+        Returns ``decayed`` and ``deleted`` (always 0), ``skipped`` (live rows at
+        or over the default gate) and ``silent``. Use :meth:`count_silent`.
         """
-        records = self._storage.list(user=self._user, limit=10_000)
-        now = datetime.now(tz=timezone.utc)
-        counts = {"decayed": 0, "deleted": 0, "skipped": 0}
-        to_delete: list[str] = []
+        warnings.warn(
+            "decay() deletes nothing now; call Memory.count_silent().",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self._silent_counts()
 
-        for rec in records:
-            days_since_touch = self._days_since(rec.last_retrieved or rec.created_at, now)
-            days_since_created = self._days_since(rec.created_at, now)
-            half_life = half_life_for_signature(
-                rec.domain,
-                intent_tags=rec.intent_tags,
-                metadata=rec.metadata,
-                text=rec.compressed_fact,
-            )
-            decay = calculate_decay_factor(
-                days_since_touch,
-                half_life,
-                days_since_created=days_since_created,
-                t_persistence=rec.t_persistence,
-            )
-            v = calculate_v(
-                rec.validation_prediction_correct,
-                rec.validation_prediction_total,
-            )
-            p_eff = calculate_p_effective(
-                rec.p_magnitude, v, decay, intent_weight=1.0, quality=0.80
-            )
-
-            if p_eff < DECAY_DELETE_THRESHOLD:
-                to_delete.append(rec.id)
-                counts["deleted"] += 1
-            else:
-                counts["skipped"] += 1
-
-        if to_delete and not dry_run:
-            txn = getattr(self._storage, "transaction", None)
-            ctx: AbstractContextManager[None] = txn() if callable(txn) else nullcontext()
-            with ctx:
-                for memory_id in to_delete:
-                    self._storage.delete(memory_id, user=self._user)
-
-        logger.info("[PDM] decay() %s | %s", "(dry_run)" if dry_run else "", counts)
+    def _silent_counts(self) -> dict[str, int]:
+        silent = self.count_silent()
+        counts = {
+            "decayed": 0,
+            "deleted": 0,
+            "skipped": max(0, self.count() - silent),
+            "silent": silent,
+        }
+        logger.info("[PDM] silent set | %s", counts)
         return counts
 
     @staticmethod
@@ -1570,22 +1937,7 @@ class Memory:
     def _record_to_hit(self, rec: SignatureRecord) -> MemoryHit:
         """Build a MemoryHit with live decay / P_effective (no query coupling)."""
         now = datetime.now(tz=timezone.utc)
-        days_since = self._days_since(rec.last_retrieved or rec.created_at, now)
-        days_since_created = self._days_since(rec.created_at, now)
-        half_life = half_life_for_signature(
-            rec.domain,
-            intent_tags=rec.intent_tags,
-            metadata=rec.metadata,
-            text=rec.compressed_fact,
-        )
-        decay = calculate_decay_factor(
-            days_since,
-            half_life,
-            days_since_created=days_since_created,
-            t_persistence=rec.t_persistence,
-        )
-        v = calculate_v(rec.validation_prediction_correct, rec.validation_prediction_total)
-        p_eff = calculate_p_effective(rec.p_magnitude, v, decay, 1.0, 0.80)
+        p_eff, v, decay = weight_of(rec, now)
         e_temporal, is_urgent = self._engine._temporal_energy(rec, now)
         return MemoryHit.from_record(
             rec,
@@ -1610,14 +1962,14 @@ class Memory:
 
         Compares signatures within ``cluster_id`` buckets, ``drawer|domain``
         fallbacks, and auto-discovered virtual clusters (topic similarity > 0.85
-        when ``cluster_id`` is absent). Optional ``apply_v_penalty`` records a
-        validation miss on each involved signature so future ``P_effective``
-        drops via Laplace V.
+        when ``cluster_id`` is absent). Writes nothing: a conflict is not a
+        verdict, so grade a signature with :meth:`penalize` or :meth:`reinforce`
+        once the world answers (PDM v1.9 change 3).
 
         Args:
             drawer:    Limit to one drawer (``drawer_domain``). None = all drawers.
             threshold: Minimum ``torsion_score`` to report (default 0.7).
-            apply_v_penalty: If True, write V penalty to storage for conflicting IDs.
+            apply_v_penalty: Deprecated; True only warns. Torsion writes no verdict.
             limit:     Max signatures to load from storage.
 
         Returns:
@@ -1633,8 +1985,14 @@ class Memory:
             threshold=threshold,
             judge=self._torsion_judge,
         )
-        if apply_v_penalty and reports:
-            self._apply_torsion_v_penalty(reports)
+        if apply_v_penalty:
+            warnings.warn(
+                "detect_torsion(apply_v_penalty=True) writes nothing now: verdict counts "
+                "are written only at validate. Call Memory.penalize() or "
+                "Memory.reinforce() when the outcome is known.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         return reports
 
     def explain(self, memory_id: str, query: str | None = None) -> ExplainReport:
@@ -1661,8 +2019,7 @@ class Memory:
             raise KeyError(f"Memory '{memory_id}' not found for user '{self._user}'.")
 
         now = datetime.now(tz=timezone.utc)
-        days_since = self._days_since(rec.last_retrieved or rec.created_at, now)
-        days_since_created = self._days_since(rec.created_at, now)
+        days_since = self._days_since(disuse_clock(rec), now)
 
         domain = rec.domain or infer_domain(rec.intent_tags)
         half_life = half_life_for_signature(
@@ -1671,21 +2028,8 @@ class Memory:
             metadata=rec.metadata,
             text=rec.compressed_fact,
         )
-        decay = calculate_decay_factor(
-            days_since,
-            half_life,
-            days_since_created=days_since_created,
-            t_persistence=rec.t_persistence,
-        )
-        v = calculate_v(rec.validation_prediction_correct, rec.validation_prediction_total)
+        p_eff, v, decay = weight_of(rec, now)
         i_weight = calculate_intent_weight(rec.intent_tags, query) if query else None
-        p_eff = calculate_p_effective(
-            rec.p_magnitude,
-            v,
-            decay,
-            i_weight if i_weight is not None else 1.0,
-            0.80,
-        )
 
         # TAS coupling for the query
         coupling_score = tag_overlap = domain_match = regime_match = press_prox = None
@@ -2194,6 +2538,15 @@ class Memory:
         event_at: datetime | None = None,
         extra_fields: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        refused = sorted(_WRITER_OWNED_FIELDS & set(extra_fields or {}))
+        if p_magnitude is not None:
+            refused.insert(0, "p_magnitude")
+        if refused:
+            raise ValueError(
+                f"update() cannot set {', '.join(refused)}: P is written only at ingest, "
+                "verdict counts only at validate, the use clock only at touch "
+                "(PDM v1.9 change 3). Save a new memory to state a new pressure."
+            )
         fields: dict[str, Any] = dict(extra_fields or {})
         if text is not None:
             if not text.strip():
@@ -2208,10 +2561,6 @@ class Memory:
         if tags is not None:
             fields["intent_tags"] = tags
             fields["domain"] = infer_domain(tags)
-        if p_magnitude is not None:
-            if not 0.0 <= p_magnitude <= 100.0:
-                raise ValueError("p_magnitude must be between 0 and 100")
-            fields["p_magnitude"] = p_magnitude
         if t_persistence is not None:
             fields["t_persistence"] = t_persistence
         if drawer is not None:
@@ -2244,8 +2593,8 @@ class Memory:
             # Same backfill rule as save(): deadline implies event when unset.
             fields["t_event_at"] = deadline
 
-        if any(key in fields for key in ("p_magnitude", "t_persistence", "phase_privilege")):
-            new_p = fields.get("p_magnitude", rec.p_magnitude)
+        if any(key in fields for key in ("t_persistence", "phase_privilege")):
+            new_p = rec.p_magnitude
             new_t = fields.get("t_persistence", rec.t_persistence)
             new_phase = fields.get("phase_privilege", rec.phase_privilege)
             fields["effective_spike"] = calculate_effective_spike(new_p, new_t, new_phase)
@@ -2319,7 +2668,7 @@ class Memory:
             return []
 
         page_size = max(1, min(page_size, candidate_limit))
-        query_tokens = RetrievalEngine._tokenize_query(query) if query else []
+        query_tokens = RetrievalEngine._cue_words(query) if query else []
 
         def _paginate(tag_any: builtins.list[str] | None) -> builtins.list[SignatureRecord]:
             records: list[SignatureRecord] = []
@@ -2433,75 +2782,49 @@ class Memory:
             return CloudDriver(auth=auth, base_url=resolved_url, user=self._user)
         return None
 
-    def _apply_torsion_v_penalty(self, reports: builtins.list[TorsionReport]) -> None:
-        """Record a validation miss on each signature involved in high torsion."""
-        affected: set[str] = set()
-        for report in reports:
-            affected.add(report.signature_a_id)
-            affected.add(report.signature_b_id)
-        if not affected:
-            return
 
-        records = self._storage.get_many(list(affected), user=self._user)
-        batch_updates: list[tuple[str, dict]] = []
-        for sig_id, rec in records.items():
-            new_total = int(rec.validation_prediction_total or 0) + 1
-            # correct unchanged → Laplace V decreases
-            batch_updates.append(
-                (
-                    sig_id,
-                    {"validation_prediction_total": new_total},
-                )
-            )
-        if batch_updates:
-            try:
-                results = self._storage.update_batch(batch_updates, user=self._user)
-                for res in results:
-                    if res.error:
-                        logger.warning("[PDM] torsion V penalty failed for %s: %s", res.id, res.error)
-            except Exception as e:
-                logger.warning("[PDM] torsion V penalty batch failed: %s", e)
+def _resume(token: str | None) -> tuple[datetime | None, str | None, str | None]:
+    """``(as_of, phase, last_id)`` from a continuation this memory wrote."""
+    if not token:
+        return None, None, None
+    as_of, _, rest = token.partition("|")
+    phase, _, last = rest.partition("|")
+    try:
+        parsed = datetime.fromisoformat(as_of)
+    except ValueError:
+        parsed = None
+    if parsed is None or phase not in ("T", "P", "L") or not last:
+        raise ValueError("Not a continuation this memory wrote.")
+    return parsed, phase, last
 
-    def _apply_reinforcement(self, hits: builtins.list[MemoryHit]) -> None:
-        """Write retrieval reinforcement back to storage for all hits.
 
-        Also increments Validation Coefficient counters so repeated successful
-        retrievals raise V and therefore P_effective over time.
-        """
-        if not hits:
-            return
-        now = datetime.now(tz=timezone.utc)
-        records = self._storage.get_many([hit.id for hit in hits], user=self._user)
-        batch_updates: list[tuple[str, dict]] = []
-        for hit in hits:
-            rec = records.get(hit.id)
-            if rec is None:
-                continue
-            try:
-                delta = self._engine.compute_reinforcement_delta(
-                    rec.p_magnitude, rec.retrieval_count, hit.coupling_score
-                )
-                new_p = min(100.0, rec.p_magnitude + delta)
-                new_spike = calculate_effective_spike(new_p, rec.t_persistence, rec.phase_privilege)
-                batch_updates.append(
-                    (
-                        hit.id,
-                        {
-                            "p_magnitude": new_p,
-                            "effective_spike": new_spike,
-                            "retrieval_count": (rec.retrieval_count or 0) + 1,
-                            "last_retrieved": now,
-                        },
-                    )
-                )
-            except (TypeError, ValueError) as e:
-                logger.warning("[PDM] reinforcement check failed for %s: %s", hit.id, e)
+def _support_doubted(support: SignatureRecord | None, link: LinkRow) -> bool:
+    """Something rested on is REOPENED, or its V fell below the V on the link."""
+    if support is None:
+        return False
+    if support.validation_status == REOPENED:
+        return True
+    v = calculate_v(support.validation_prediction_correct, support.validation_prediction_total)
+    return v < link.v_at_write
 
-        if batch_updates:
-            try:
-                results = self._storage.update_batch(batch_updates, user=self._user)
-                for res in results:
-                    if res.error:
-                        logger.warning("[PDM] reinforcement update failed for %s: %s", res.id, res.error)
-            except Exception as e:
-                logger.warning("[PDM] reinforcement batch update failed: %s", e)
+
+def _link(pressure_id: str, neighbor: SignatureRecord, kind: str, now: datetime) -> LinkRow:
+    return LinkRow(
+        pressure_id=pressure_id,
+        neighbor_id=neighbor.id,
+        kind=kind,
+        status_at_write=neighbor.validation_status,
+        v_at_write=calculate_v(
+            neighbor.validation_prediction_correct, neighbor.validation_prediction_total
+        ),
+        written_at=now,
+    )
+
+
+def _warn_reinforce(where: str) -> None:
+    warnings.warn(
+        f"{where}(reinforce=True) is deprecated: retrieve writes nothing. "
+        "Call Memory.touch() with the ids you used.",
+        DeprecationWarning,
+        stacklevel=3,
+    )

@@ -12,11 +12,13 @@ Formula reference (ONE canonical decay law):
   effective_spike = min(100, P_magnitude × (t_persistence/30) × phase_privilege)
   decay_factor    = 1 - exp(-λ × t)     where λ = ln2 / half_life
   V               = (correct + 1) / (total + 2)   [Laplace smoothing]
-  P_effective     = P × V × (1 - decay_factor) × intent_weight × quality × comparator
+  weight          = P × V × (1 - decay_factor)        [PDM v1.9: P_effective]
+  match score     = weight × intent_weight × quality × comparator  (after the gate)
 
   Grace: if days_since_created ≤ t_persistence → decay_factor = 0.
   Surviving fraction = (1 - decay_factor) = exp(-λ × t).
   Half-life clock: memory_shape overrides domain when set; structural shape → T½ = ∞.
+  The clock runs from the later of created_at and last_retrieved.
 
   Legacy power-law (p × decay_rate^days) is REMOVED — it double-penalized recall.
 """
@@ -25,7 +27,11 @@ from __future__ import annotations
 
 import math
 import warnings
-from typing import Any, Mapping
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Mapping
+
+if TYPE_CHECKING:
+    from pdm_memory.core.signature import SignatureRecord
 
 # ---------------------------------------------------------------------------
 # Domain half-lives (ported from kernel.py DOMAIN_HALF_LIVES)
@@ -55,12 +61,16 @@ SHAPE_HALF_LIVES: dict[str, float] = {
     "structural": math.inf,   # zero decay
 }
 
-# Pressure constants
+# Pressure constants. The spec states pressure as a fraction of full (0–1);
+# this module keeps 0–100, so every threshold is the spec value × 100.
 P_MAX: float = 100.0
 P_FLOOR: float = 0.0
+FULL_SCALE: float = P_MAX
 
-# Decay trigger — signatures below this live P_eff are eligible for deletion
-DECAY_DELETE_THRESHOLD: float = 30.0
+# Default weight gate (min_P): 30 = 0.3 of full.
+DEFAULT_MIN_P: float = 30.0
+# Lowest a search may lower the gate without naming an area: 10 = 0.1 of full.
+SEARCH_FLOOR: float = 0.1 * FULL_SCALE
 
 # Kept for SignatureRecord/schema backward-compat only — NOT used by pressure decay.
 DEFAULT_DECAY_RATE: float = 0.9
@@ -184,9 +194,12 @@ def calculate_p_effective(
     comparator: float = 1.0,
 ) -> float:
     """
-    P_effective — the live pressure value used for retrieval ranking.
+    Match-score pressure: the weight times the retrieve-time modifiers.
 
     P_eff = P_magnitude × V × (1 - decay_factor) × intent_weight × quality × comparator
+
+    Not the weight: the weight gate reads :func:`calculate_weight`, and these
+    modifiers apply only after it (PDM v1.9 change 2).
 
     Args:
         p_magnitude:  Raw stored pressure (0–100).
@@ -208,6 +221,48 @@ def calculate_p_effective(
         * comparator
     )
     return round(min(P_MAX, max(P_FLOOR, p_eff)), 6)
+
+
+def calculate_weight(p_magnitude: float, v: float, decay_factor: float) -> float:
+    """Weight (PDM v1.9 change 2): ``P × V × (1 - decay_factor)``, 0–100. V applies once."""
+    return round(min(P_MAX, max(P_FLOOR, p_magnitude * v * (1.0 - decay_factor))), 6)
+
+
+def _aware(dt: datetime) -> datetime:
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _days(later: datetime, earlier: datetime | None) -> float:
+    if earlier is None:
+        return 0.0
+    return max(0.0, (_aware(later) - _aware(earlier)).total_seconds() / 86400.0)
+
+
+def disuse_clock(rec: SignatureRecord) -> datetime | None:
+    """Where disuse decay starts: the later of ``created_at`` and ``last_retrieved``."""
+    created, used = rec.created_at, rec.last_retrieved
+    if used is None or (created is not None and _aware(created) >= _aware(used)):
+        return created
+    return used
+
+
+def weight_of(rec: SignatureRecord, as_of: datetime) -> tuple[float, float, float]:
+    """``(weight, V, decay_factor)`` of *rec* at *as_of*."""
+    clock = disuse_clock(rec)
+    half_life = half_life_for_signature(
+        rec.domain,
+        intent_tags=rec.intent_tags,
+        metadata=rec.metadata,
+        text=rec.compressed_fact,
+    )
+    decay = calculate_decay_factor(
+        _days(as_of, clock),
+        half_life,
+        days_since_created=_days(as_of, rec.created_at),
+        t_persistence=rec.t_persistence,
+    )
+    v = calculate_v(rec.validation_prediction_correct, rec.validation_prediction_total)
+    return calculate_weight(rec.p_magnitude, v, decay), v, decay
 
 
 # ---------------------------------------------------------------------------

@@ -63,6 +63,15 @@ def record_to_dict(rec: SignatureRecord) -> dict[str, Any]:
         "t_event_at": _dt_to_iso(rec.t_event_at),
         "urgency_rate": rec.urgency_rate,
         "metadata": dict(rec.metadata or {}),
+        "validation_status": rec.validation_status,
+        "direction": rec.direction,
+        "outcome_source": rec.outcome_source,
+        "due": _dt_to_iso(rec.due),
+        "watch_window": rec.watch_window,
+        "outcome": rec.outcome,
+        "verdict": rec.verdict,
+        "event_time": _dt_to_iso(rec.event_time),
+        "report_time": _dt_to_iso(rec.report_time),
     }
 
 
@@ -96,6 +105,15 @@ def dict_to_record(data: dict[str, Any], *, user: str) -> SignatureRecord:
         t_event_at=_iso_to_dt(data.get("t_event_at")),
         urgency_rate=float(data.get("urgency_rate", 2.0)),
         metadata=dict(data.get("metadata") or {}),
+        validation_status=str(data.get("validation_status") or "UNVALIDATED"),
+        direction=str(data.get("direction") or ""),
+        outcome_source=str(data.get("outcome_source") or ""),
+        due=_iso_to_dt(data.get("due")),
+        watch_window=data.get("watch_window"),
+        outcome=str(data.get("outcome") or ""),
+        verdict=str(data.get("verdict") or ""),
+        event_time=_iso_to_dt(data.get("event_time")),
+        report_time=_iso_to_dt(data.get("report_time")),
     )
 
 

@@ -9,16 +9,15 @@ from __future__ import annotations
 import logging
 import math
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from pdm_memory.core.math import (
-    calculate_decay_factor,
-    calculate_p_effective,
-    calculate_v,
+    disuse_clock,
     half_life_for_signature,
     infer_domain,
     resolve_memory_shape,
+    weight_of,
 )
 from pdm_memory.core.signature import SignatureRecord
 
@@ -49,23 +48,8 @@ def live_p_effective(
     *,
     extra_days: float = 0.0,
 ) -> float:
-    """Live P_effective with optional forward projection in days."""
-    half_life = half_life_for_signature(
-        rec.domain,
-        intent_tags=rec.intent_tags,
-        metadata=rec.metadata,
-        text=rec.compressed_fact,
-    )
-    days_since_touch = _days_since(rec.last_retrieved or rec.created_at, now) + extra_days
-    days_since_created = _days_since(rec.created_at, now) + extra_days
-    decay = calculate_decay_factor(
-        days_since_touch,
-        half_life,
-        days_since_created=days_since_created,
-        t_persistence=rec.t_persistence,
-    )
-    v = calculate_v(rec.validation_prediction_correct, rec.validation_prediction_total)
-    return calculate_p_effective(rec.p_magnitude, v, decay, intent_weight=1.0, quality=0.80)
+    """Live weight with optional forward projection in days."""
+    return weight_of(rec, now + timedelta(days=extra_days))[0]
 
 
 def record_to_node(
@@ -100,7 +84,7 @@ def record_to_node(
         "t_persistence": float(rec.t_persistence),
         "half_life": None if not math.isfinite(half_life) else float(half_life),
         "days_since_touch": round(
-            _days_since(rec.last_retrieved or rec.created_at, now), 2
+            _days_since(disuse_clock(rec), now), 2
         ),
         "days_since_created": round(_days_since(rec.created_at, now), 2),
         "v_correct": int(rec.validation_prediction_correct),

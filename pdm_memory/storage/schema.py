@@ -8,11 +8,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
-from pdm_memory.core.signature import SignatureRecord
+from pdm_memory.core.math import DEFAULT_MIN_P, weight_of
+from pdm_memory.core.signature import LinkRow, SignatureRecord
+
+logger = logging.getLogger(__name__)
 
 UPDATABLE_COLUMNS: frozenset[str] = frozenset(
     {
@@ -39,7 +43,52 @@ UPDATABLE_COLUMNS: frozenset[str] = frozenset(
         "metadata",
         "is_deleted",
         "idempotency_key",
+        "validation_status",
+        "direction",
+        "outcome_source",
+        "due",
+        "watch_window",
+        "outcome",
+        "verdict",
+        "event_time",
+        "report_time",
     }
+)
+
+# The claim on a signature (PDM v1.9 change 4); '' means none. Added by migration.
+CLAIM_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("direction", "TEXT NOT NULL DEFAULT ''"),
+    ("outcome_source", "TEXT NOT NULL DEFAULT ''"),
+    ("due", "TEXT"),
+    ("watch_window", "REAL"),
+    ("outcome", "TEXT NOT NULL DEFAULT ''"),
+    ("verdict", "TEXT NOT NULL DEFAULT ''"),
+    ("event_time", "TEXT"),
+    ("report_time", "TEXT"),
+)
+
+# The carried number (PDM v1.9 change 10): P × V on the 0–100 scale. The fade
+# 0.5^(t/T½) is at most 1, so the carried number is never below the weight and a
+# gate on it never drops a row the exact weight would keep. Kept as an index on
+# this expression: nothing writes it, so it cannot drift from the row.
+CARRIED_SQL: str = (
+    "(p_magnitude * (validation_prediction_correct + 1.0)"
+    " / (validation_prediction_total + 2.0))"
+)
+
+
+def carried_of(rec: SignatureRecord) -> float:
+    """The carried number of *rec*, as :data:`CARRIED_SQL` computes it."""
+    return (
+        rec.p_magnitude
+        * (rec.validation_prediction_correct + 1.0)
+        / (rec.validation_prediction_total + 2.0)
+    )
+
+
+# Counters a write may move by a delta, in one statement (no lost update).
+INCREMENTABLE_COLUMNS: frozenset[str] = frozenset(
+    {"retrieval_count", "validation_prediction_total", "validation_prediction_correct"}
 )
 
 SCHEMA_SQLITE = """
@@ -68,7 +117,8 @@ CREATE TABLE IF NOT EXISTS pdm_signatures (
     urgency_rate                    REAL NOT NULL DEFAULT 2.0,
     metadata                        TEXT NOT NULL DEFAULT '{}',
     is_deleted                      INTEGER NOT NULL DEFAULT 0,
-    idempotency_key                 TEXT
+    idempotency_key                 TEXT,
+    validation_status               TEXT NOT NULL DEFAULT 'UNVALIDATED'
 );
 
 CREATE INDEX IF NOT EXISTS idx_pdm_user_pressure
@@ -124,7 +174,8 @@ CREATE TABLE IF NOT EXISTS pdm_signatures (
     urgency_rate                    DOUBLE PRECISION NOT NULL DEFAULT 2.0,
     metadata                        TEXT NOT NULL DEFAULT '{}',
     is_deleted                      INTEGER NOT NULL DEFAULT 0,
-    idempotency_key                 TEXT
+    idempotency_key                 TEXT,
+    validation_status               TEXT NOT NULL DEFAULT 'UNVALIDATED'
 );
 
 CREATE INDEX IF NOT EXISTS idx_pdm_user_pressure
@@ -166,6 +217,15 @@ def apply_sqlite_migrations(conn: Any) -> None:
         conn.execute("ALTER TABLE pdm_signatures ADD COLUMN idempotency_key TEXT")
     if "t_event_at" not in cols:
         conn.execute("ALTER TABLE pdm_signatures ADD COLUMN t_event_at TEXT")
+    if "validation_status" not in cols:
+        conn.execute(
+            "ALTER TABLE pdm_signatures ADD COLUMN "
+            "validation_status TEXT NOT NULL DEFAULT 'UNVALIDATED'"
+        )
+    for name, ddl in CLAIM_COLUMNS:
+        if name not in cols:
+            conn.execute(f"ALTER TABLE pdm_signatures ADD COLUMN {name} {ddl}")
+    _create_claim_tables(conn, user_col="user")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pdm_user_active_pressure "
         "ON pdm_signatures (user, is_deleted, p_magnitude DESC, id DESC)"
@@ -183,6 +243,21 @@ def apply_sqlite_migrations(conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_pdm_user_event_at "
         "ON pdm_signatures (user, t_event_at)"
     )
+    upgrading = (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_pdm_user_carried'"
+        ).fetchone()
+        is None
+    )
+    if upgrading:
+        restore_silent(conn, dialect="sqlite")
+    _create_tag_table(conn, dialect="sqlite")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pdm_user_carried "
+        f"ON pdm_signatures (user, {CARRIED_SQL})"
+    )
+    _create_link_table(conn, user_col="user", real="REAL")
 
 
 def apply_postgres_migrations(conn: Any) -> None:
@@ -195,6 +270,14 @@ def apply_postgres_migrations(conn: Any) -> None:
     )
     conn.execute(
         "ALTER TABLE pdm_signatures ADD COLUMN IF NOT EXISTS t_event_at TEXT"
+    )
+    for name, ddl in CLAIM_COLUMNS:
+        ddl = ddl.replace("REAL", "DOUBLE PRECISION")
+        conn.execute(f"ALTER TABLE pdm_signatures ADD COLUMN IF NOT EXISTS {name} {ddl}")
+    _create_claim_tables(conn, user_col='"user"')
+    conn.execute(
+        "ALTER TABLE pdm_signatures ADD COLUMN IF NOT EXISTS "
+        "validation_status TEXT NOT NULL DEFAULT 'UNVALIDATED'"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pdm_user_active_pressure "
@@ -212,6 +295,120 @@ def apply_postgres_migrations(conn: Any) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pdm_user_event_at "
         'ON pdm_signatures ("user", t_event_at)'
+    )
+    upgrading = (
+        conn.execute(
+            "SELECT 1 FROM pg_indexes WHERE indexname = 'idx_pdm_user_carried'"
+        ).fetchone()
+        is None
+    )
+    if upgrading:
+        restore_silent(conn, dialect="postgres")
+    _create_tag_table(conn, dialect="postgres")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pdm_user_carried "
+        f'ON pdm_signatures ("user", {CARRIED_SQL})'
+    )
+    _create_link_table(conn, user_col='"user"', real="DOUBLE PRECISION")
+
+
+# The old decay() deleted below P × V × fade × 0.80 < 30, i.e. weight < 37.5;
+# weight only falls with disuse, so a deleted row at or over this was a caller's.
+OLD_DECAY_REACH: float = DEFAULT_MIN_P / 0.80
+
+
+def _create_link_table(conn: Any, *, user_col: str, real: str) -> None:
+    """``pdm_links`` (PDM v1.9 change 7): read both ways by index."""
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS pdm_links ({user_col} TEXT NOT NULL, "
+        "pressure_id TEXT NOT NULL, neighbor_id TEXT NOT NULL, kind TEXT NOT NULL, "
+        f"status_at_write TEXT NOT NULL, v_at_write {real} NOT NULL, "
+        "written_at TEXT NOT NULL, PRIMARY KEY (pressure_id, neighbor_id, kind))"
+    )
+    conn.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_pdm_links_out ON pdm_links ({user_col}, pressure_id)"
+    )
+    conn.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_pdm_links_in ON pdm_links ({user_col}, neighbor_id)"
+    )
+
+
+def link_insert_row(user: str, link: LinkRow) -> tuple[Any, ...]:
+    return (
+        user,
+        link.pressure_id,
+        link.neighbor_id,
+        link.kind,
+        link.status_at_write,
+        link.v_at_write,
+        link.written_at.isoformat(),
+    )
+
+
+def mapping_to_link(row: Mapping[str, Any]) -> LinkRow:
+    return LinkRow(
+        pressure_id=row["pressure_id"],
+        neighbor_id=row["neighbor_id"],
+        kind=row["kind"],
+        status_at_write=row["status_at_write"],
+        v_at_write=float(row["v_at_write"]),
+        written_at=parse_dt(row["written_at"]) or datetime.now(tz=timezone.utc),
+    )
+
+
+def restore_silent(conn: Any, *, dialect: str) -> tuple[int, int]:
+    """
+    Return to the memory the rows the old ``decay()`` deleted: ``(restored, kept)``.
+
+    Run once, on the upgrade that adds the carried index (PDM v1.9: nothing is
+    deleted). A flagged row the old pass could have deleted (weight now under
+    :data:`OLD_DECAY_REACH`) comes back; under 30 it is silent. One at or over
+    the reach stays deleted: only a caller could have deleted it. A row whose
+    fact is already live for the same user stays deleted too.
+    """
+    ph, user_col = ("?", "user") if dialect == "sqlite" else ("%s", '"user"')
+    flagged = conn.execute(
+        "SELECT COUNT(*) AS n FROM pdm_signatures WHERE is_deleted = 1"
+    ).fetchone()["n"]
+    if not flagged:
+        return 0, 0
+    rows = conn.execute(
+        "SELECT * FROM pdm_signatures s WHERE s.is_deleted = 1 AND NOT EXISTS ("
+        f"SELECT 1 FROM pdm_signatures l WHERE l.{user_col} = s.{user_col} "
+        "AND l.compressed_fact_hash = s.compressed_fact_hash AND l.is_deleted = 0)"
+    ).fetchall()
+    now = datetime.now(tz=timezone.utc)
+    quiet = [r["id"] for r in rows if weight_of(mapping_to_record(r), now)[0] < OLD_DECAY_REACH]
+    for i in range(0, len(quiet), 500):
+        chunk = quiet[i : i + 500]
+        conn.execute(
+            "UPDATE pdm_signatures SET is_deleted = 0 "
+            f"WHERE id IN ({', '.join([ph] * len(chunk))})",
+            chunk,
+        )
+    kept = int(flagged) - len(quiet)
+    logger.warning(
+        "[PDM] upgrade: restored %d rows the old decay() could have deleted; "
+        "kept %d deleted (a caller's delete, or a live copy exists)",
+        len(quiet),
+        kept,
+    )
+    return len(quiet), kept
+
+
+def _create_claim_tables(conn: Any, *, user_col: str) -> None:
+    """Open claims by due, and the caller's coverage gaps (PDM v1.9 change 4)."""
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pdm_open_claims "
+        f"ON pdm_signatures ({user_col}, due) WHERE direction != '' AND verdict = ''"
+    )
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS pdm_coverage_gaps ({user_col} TEXT NOT NULL, "
+        "source TEXT NOT NULL, gap_from TEXT NOT NULL, gap_to TEXT NOT NULL)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pdm_coverage_gaps "
+        f"ON pdm_coverage_gaps ({user_col}, source)"
     )
 
 
@@ -256,11 +453,75 @@ def prepare_update_fields(fields: dict) -> dict:
             "created_at",
             "t_deadline",
             "t_event_at",
+            "due",
+            "event_time",
+            "report_time",
         ) and isinstance(value, datetime):
             prepared[col] = value.isoformat()
         else:
             prepared[col] = value
     return prepared
+
+
+def tag_words(tags: Any) -> list[str]:
+    """The words a signature is found by: its tags, stripped and lower-cased, once each."""
+    return list(dict.fromkeys(w for w in (str(t).strip().lower() for t in tags or ()) if w))
+
+
+def write_tags(conn: Any, rows: Any, *, dialect: str) -> None:
+    """Rewrite the tag rows of each ``(user, pressure_id, tags)`` in *rows* (PDM v1.9 change 11)."""
+    ph, user_col = ("?", "user") if dialect == "sqlite" else ("%s", '"user"')
+    rows = list(rows)
+    if not rows:
+        return
+    cur = conn.cursor()
+    cur.executemany(
+        f"DELETE FROM pdm_tags WHERE pressure_id = {ph}", [(pid,) for _, pid, _ in rows]
+    )
+    words = [(user, w, pid) for user, pid, tags in rows for w in tag_words(tags)]
+    if words:
+        cur.executemany(
+            f"INSERT INTO pdm_tags ({user_col}, word, pressure_id) VALUES ({ph}, {ph}, {ph})",
+            words,
+        )
+
+
+def _create_tag_table(conn: Any, *, dialect: str) -> None:
+    """Create ``pdm_tags`` and, the first time, fill it from every row's ``intent_tags``."""
+    if dialect == "sqlite":
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pdm_tags'"
+        ).fetchone()
+        user_col = "user"
+    else:
+        exists = conn.execute("SELECT to_regclass('pdm_tags') AS t").fetchone()["t"]
+        user_col = '"user"'
+    if exists:
+        return
+    conn.execute(
+        f"CREATE TABLE pdm_tags ({user_col} TEXT NOT NULL, word TEXT NOT NULL, "
+        f"pressure_id TEXT NOT NULL, PRIMARY KEY ({user_col}, word, pressure_id))"
+    )
+    conn.execute("CREATE INDEX idx_pdm_tags_pressure ON pdm_tags (pressure_id)")
+    rows = conn.execute(f"SELECT id, {user_col} AS u, intent_tags FROM pdm_signatures").fetchall()
+    write_tags(
+        conn,
+        ((r["u"], r["id"], json.loads(r["intent_tags"] or "[]")) for r in rows),
+        dialect=dialect,
+    )
+
+
+def increment_set_clause(
+    deltas: Mapping[str, int], fields: dict, placeholder: str
+) -> tuple[str, list[Any]]:
+    """SET clause adding *deltas* to counters and assigning *fields*, with its values."""
+    unknown = set(deltas) - INCREMENTABLE_COLUMNS
+    if unknown:
+        raise ValueError(f"Not a counter: {sorted(unknown)}")
+    prepared = prepare_update_fields(fields)
+    parts = [f"{col} = {col} + {placeholder}" for col in deltas]
+    parts += [f"{col} = {placeholder}" for col in prepared]
+    return ", ".join(parts), [int(v) for v in deltas.values()] + list(prepared.values())
 
 
 def signature_insert_row(sig: SignatureRecord, *, store_raw: bool) -> tuple[Any, ...]:
@@ -294,6 +555,26 @@ def signature_insert_row(sig: SignatureRecord, *, store_raw: bool) -> tuple[Any,
         json.dumps(sig.metadata),
         1 if getattr(sig, "is_deleted", False) else 0,
         getattr(sig, "idempotency_key", None),
+        sig.validation_status,
+        *claim_insert_values(sig),
+    )
+
+
+def claim_insert_values(sig: SignatureRecord) -> tuple[Any, ...]:
+    """The claim columns of *sig*, in :data:`CLAIM_COLUMNS` order."""
+
+    def iso(dt: datetime | None) -> str | None:
+        return dt.isoformat() if dt else None
+
+    return (
+        sig.direction,
+        sig.outcome_source,
+        iso(sig.due),
+        sig.watch_window,
+        sig.outcome,
+        sig.verdict,
+        iso(sig.event_time),
+        iso(sig.report_time),
     )
 
 
@@ -333,4 +614,13 @@ def mapping_to_record(row: Mapping[str, Any]) -> SignatureRecord:
         metadata=json.loads(col("metadata") or "{}"),
         is_deleted=bool(col("is_deleted", 0)),
         idempotency_key=col("idempotency_key"),
+        validation_status=col("validation_status") or "UNVALIDATED",
+        direction=col("direction") or "",
+        outcome_source=col("outcome_source") or "",
+        due=parse_dt(col("due")),
+        watch_window=col("watch_window"),
+        outcome=col("outcome") or "",
+        verdict=col("verdict") or "",
+        event_time=parse_dt(col("event_time")),
+        report_time=parse_dt(col("report_time")),
     )
