@@ -196,6 +196,7 @@ def test_a_late_gap_amends_not_by_due_and_restores_the_count(mem):
     assert amended == 1
     assert _rec(mem, mid).verdict == "expired_unobserved"
     assert _counts(mem, mid) == (0, 0)
+    assert _rec(mem, mid).validation_status == "UNVALIDATED"
 
 
 def test_a_late_gap_after_the_window_amends_nothing(mem):

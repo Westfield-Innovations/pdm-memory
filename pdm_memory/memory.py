@@ -1269,7 +1269,8 @@ class Memory:
         }
         if grade is True:
             fields["validation_status"] = VALIDATED
-        elif corrected:
+        elif corrected or (grade is None and graded(rec.direction, rec.verdict) is True):
+            # A withdrawn grade leaves nothing validated, but corrects nothing either.
             fields["validation_status"] = UNVALIDATED
         with self._storage.transaction():
             written = self._storage.increment(
