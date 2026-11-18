@@ -134,7 +134,8 @@ if not result.completed:
 quiet = mem.search("north flare", min_p_lowered=12)
 
 mem.touch([h.id for h in result.hits])  # what you used
-mem.penalize(sensor)  # the sensor was stuck: returns the ids it re-opened
+mem.reinforce(sensor)  # the sensor was checked: VALIDATED
+mem.penalize(sensor)   # later found stuck: a correction, returns the ids it re-opened
 now = datetime.now(timezone.utc)
 mem.report_coverage_gap("failure-feed", now - timedelta(hours=6), now)  # a feed that was down
 ```
@@ -835,12 +836,12 @@ Use `report.is_safe_to_act` (True only when `status == "ALIGNED"`) before trigge
 | `recall(query, k, min_pressure, search_cost, drawer, reinforce)` → `List[MemoryHit]` | Retrieve top-k relevant memories |
 | `verify_alignment(intent_text, min_pressure, k_goals, torsion_threshold)` → `AlignmentReport` | Same GAA gate against goals already stored in Memory |
 | `detect_torsion(drawer, threshold)` → `List[TorsionReport]` | Find contradicting facts (Reverse Resonance) |
-| `reinforce(memory_id, coupling_score)` | Manually raise a memory's pressure (and V-counters where supported) |
-| `penalize(memory_id, coupling_score)` | Record a wrong prediction: lower P and V |
+| `reinforce(memory_id, coupling_score)` | Record a correct prediction: V rises, the memory becomes `VALIDATED`; P does not move |
+| `penalize(memory_id, coupling_score)` → `set[str]` | Record a wrong prediction: V falls; P does not move. On a `VALIDATED` memory it is a correction and returns the ids it re-opened |
 | `apply_contrary_evidence(target, evidence, …)` → `ContraryEvidenceResult` | Immediate V-miss + Δp on conflicting evidence; does not rewrite historical fact fields |
 | `delete(memory_id)` → `bool` | Soft-delete when storage supports it |
 | `decay_at(signature, now=None)` → `DecaySnapshot` | Live shape-aware decay metrics for one memory (read-only) |
-| `decay(dry_run=False)` → `dict` | Soft-delete signatures whose live `P_effective` is below threshold |
+| `decay(dry_run=False)` → `dict` | Deprecated: deletes nothing, only counts the silent set; call `count_silent()` |
 | `explain(memory_id, query)` → `ExplainReport` | Show why a memory has its current pressure |
 | `list(limit, min_pressure, drawer, cursor_id)` → `MemoryListPage` | Keyset page of memories (storage list API on cloud) |
 | `sync(direction, token, cloud_url)` → `SyncReport` | Sync local ↔ cloud |
