@@ -661,6 +661,16 @@ The ledger is its own SQLite file, kept outside the worker's authority like the
 guard's, and never writes to a PDM store. It follows the AZUS Consequence and
 Learning Specification V1.
 
+### Ledgers in Postgres
+
+`GuardedEffects` and `ConsequenceLedger` take either a file path or a
+`postgresql://` URL; the goal loop has `PostgresJobStore(dsn)` beside
+`SqliteJobStore`. Install `pdm-memory[postgres]`. Postgres keeps the same
+guarantees as the SQLite file: one writer at a time per ledger kind, history
+tables that refuse `UPDATE`, `DELETE` and `TRUNCATE`, and a commit that is durable
+when it returns (a server running with `fsync=off` is refused). Tables go into
+the connection's current schema, so `?options=-csearch_path%3Dledgers` picks one.
+
 ### Goal Loop preview: the Goal Contract
 
 A Goal Loop job is written down once, as one `GoalContract` record that every
@@ -770,7 +780,7 @@ def delivered(contract, step, result, evidence, now):      # your proof of the r
                         ProofReceipt("sms_delivery_receipt", "dlr-1", now))
 
 controller = GoalLoopController(
-    store=SqliteJobStore("jobs.db"),                       # omit for an in-memory store
+    store=SqliteJobStore("jobs.db"),                       # or PostgresJobStore(url); omit for in-memory
     checkers={"sms_delivery_receipt": CallableChecker("sms_delivery_receipt", delivered)},
     executors={"sms.send": send_sms},
 )
