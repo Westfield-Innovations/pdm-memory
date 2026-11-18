@@ -142,7 +142,8 @@ def test_the_same_observation_twice_changes_nothing(mem):
 
 
 def test_the_same_observation_at_default_times_changes_nothing(mem):
-    mid = _claim(mem, "absent", PAST_DUE, source="feed")
+    # An open watch window, so only the repeat itself can turn the second report away.
+    mid = _claim(mem, "absent", PAST_DUE, source="feed", window=1.0)
     assert mem.validate_claim(mid, "observed_absent") is not None
     first = _rec(mem, mid).report_time
     assert mem.validate_claim(mid, "observed_absent") is None
