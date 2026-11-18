@@ -8,8 +8,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
+
 from pdm_memory import Memory, TorsionReport
-from pdm_memory.core.math import calculate_v
 from pdm_memory.core.retrieval import RetrievalEngine
 from pdm_memory.core.signature import SignatureRecord
 
@@ -187,7 +188,7 @@ class TestDetectTorsionEngine:
 
 
 class TestDetectTorsionMemory:
-    def test_memory_api_and_v_penalty(self, tmp_path) -> None:
+    def test_v_penalty_is_deprecated_and_writes_nothing(self, tmp_path) -> None:
         db = str(tmp_path / "torsion.db")
         with Memory(store=db, user="u1") as mem:
             mem.save(
@@ -204,23 +205,21 @@ class TestDetectTorsionMemory:
                 p_magnitude=70,
                 deadline=datetime(2026, 9, 1, tzinfo=timezone.utc),
             )
-            before = mem._storage.list(user="u1", limit=10)
-            assert len(before) == 2
-            v_before = [
-                calculate_v(r.validation_prediction_correct, r.validation_prediction_total)
-                for r in before
-            ]
+            def counts():
+                return sorted(
+                    (r.id, r.validation_prediction_correct, r.validation_prediction_total)
+                    for r in mem._storage.list(user="u1", limit=10)
+                )
 
-            reports = mem.detect_torsion(threshold=0.5, apply_v_penalty=True)
+            before = counts()
+            assert len(before) == 2
+
+            # Torsion is not a verdict: only validate writes the counts (PDM v1.9 change 3).
+            with pytest.warns(DeprecationWarning, match="reinforce"):
+                reports = mem.detect_torsion(threshold=0.5, apply_v_penalty=True)
             assert len(reports) >= 1
             assert all(isinstance(r, TorsionReport) for r in reports)
-
-            after = mem._storage.list(user="u1", limit=10)
-            v_after = [
-                calculate_v(r.validation_prediction_correct, r.validation_prediction_total)
-                for r in after
-            ]
-            assert all(va < vb for va, vb in zip(v_after, v_before))
+            assert counts() == before
 
     def test_cluster_id_limits_search(self, tmp_path) -> None:
         db = str(tmp_path / "cluster.db")

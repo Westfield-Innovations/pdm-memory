@@ -439,7 +439,7 @@ def main() -> None:
     p_torsion.add_argument(
         "--apply-v-penalty",
         action="store_true",
-        help="Lower Validation Coefficient (V) on conflicting signatures",
+        help="Deprecated: writes nothing; grade with reinforce / penalize",
     )
     p_torsion.set_defaults(func=cmd_detect_torsion)
 

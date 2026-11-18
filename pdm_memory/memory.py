@@ -1903,14 +1903,14 @@ class Memory:
 
         Compares signatures within ``cluster_id`` buckets, ``drawer|domain``
         fallbacks, and auto-discovered virtual clusters (topic similarity > 0.85
-        when ``cluster_id`` is absent). Optional ``apply_v_penalty`` records a
-        validation miss on each involved signature so future ``P_effective``
-        drops via Laplace V.
+        when ``cluster_id`` is absent). Writes nothing: a conflict is not a
+        verdict, so grade a signature with :meth:`penalize` or :meth:`reinforce`
+        once the world answers (PDM v1.9 change 3).
 
         Args:
             drawer:    Limit to one drawer (``drawer_domain``). None = all drawers.
             threshold: Minimum ``torsion_score`` to report (default 0.7).
-            apply_v_penalty: If True, write V penalty to storage for conflicting IDs.
+            apply_v_penalty: Deprecated; True only warns. Torsion writes no verdict.
             limit:     Max signatures to load from storage.
 
         Returns:
@@ -1926,8 +1926,14 @@ class Memory:
             threshold=threshold,
             judge=self._torsion_judge,
         )
-        if apply_v_penalty and reports:
-            self._apply_torsion_v_penalty(reports)
+        if apply_v_penalty:
+            warnings.warn(
+                "detect_torsion(apply_v_penalty=True) writes nothing now: verdict counts "
+                "are written only at validate. Call Memory.penalize() or "
+                "Memory.reinforce() when the outcome is known.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         return reports
 
     def explain(self, memory_id: str, query: str | None = None) -> ExplainReport:
@@ -2711,35 +2717,6 @@ class Memory:
             )
             return CloudDriver(auth=auth, base_url=resolved_url, user=self._user)
         return None
-
-    def _apply_torsion_v_penalty(self, reports: builtins.list[TorsionReport]) -> None:
-        """Record a validation miss on each signature involved in high torsion."""
-        affected: set[str] = set()
-        for report in reports:
-            affected.add(report.signature_a_id)
-            affected.add(report.signature_b_id)
-        if not affected:
-            return
-
-        records = self._storage.get_many(list(affected), user=self._user)
-        batch_updates: list[tuple[str, dict]] = []
-        for sig_id, rec in records.items():
-            new_total = int(rec.validation_prediction_total or 0) + 1
-            # correct unchanged → Laplace V decreases
-            batch_updates.append(
-                (
-                    sig_id,
-                    {"validation_prediction_total": new_total},
-                )
-            )
-        if batch_updates:
-            try:
-                results = self._storage.update_batch(batch_updates, user=self._user)
-                for res in results:
-                    if res.error:
-                        logger.warning("[PDM] torsion V penalty failed for %s: %s", res.id, res.error)
-            except Exception as e:
-                logger.warning("[PDM] torsion V penalty batch failed: %s", e)
 
 
 def _resume(token: str | None) -> tuple[datetime | None, str | None, str | None]:
