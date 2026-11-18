@@ -223,3 +223,12 @@ def test_a_wrong_verdict_on_a_validated_claim_reopens_what_rests_on_it(mem):
     # A gap that restores the root clears none of its dependents' reopen marks.
     mem.report_coverage_gap("feed", NOW - timedelta(days=1), NOW)
     assert _rec(mem, leaf).validation_status == "REOPENED"
+
+
+def test_a_verdict_computed_from_a_stale_read_writes_nothing(mem):
+    mid = _claim(mem, "occurs", PAST_DUE, source="feed")
+    stale = _rec(mem, mid)  # what a settlement pass read before the observation landed
+    mem.validate_claim(mid, "occurred", event_time=PAST_DUE - timedelta(minutes=5))
+    assert mem._write_verdict(stale, "not_by_due", "", None, NOW) is None
+    assert _rec(mem, mid).verdict == "on_time"
+    assert _counts(mem, mid) == (1, 1)

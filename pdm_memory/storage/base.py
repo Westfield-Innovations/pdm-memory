@@ -93,14 +93,18 @@ class BaseStorage(ABC):
         memory_id: str,
         user: str = "default",
         deltas: dict[str, int] | None = None,
+        *,
+        expect_verdict: str | None = None,
         **fields,
     ) -> bool:
         """Add *deltas* to counters and set *fields*. False when the row is not there.
 
+        With *expect_verdict*, only while the row still holds that verdict, so a
+        write computed from a stale read changes nothing and returns False.
         SQL drivers do it in one UPDATE; this fallback reads, then writes.
         """
         rec = self.get(memory_id, user=user)
-        if rec is None:
+        if rec is None or (expect_verdict is not None and rec.verdict != expect_verdict):
             return False
         for col, delta in (deltas or {}).items():
             fields[col] = int(getattr(rec, col) or 0) + int(delta)

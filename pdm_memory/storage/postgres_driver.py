@@ -360,15 +360,21 @@ class PostgresDriver(BaseStorage):
         memory_id: str,
         user: str = "default",
         deltas: dict[str, int] | None = None,
+        *,
+        expect_verdict: str | None = None,
         **fields,
     ) -> bool:
         """Add *deltas* to counters and set *fields* in one UPDATE."""
         set_clause, values = increment_set_clause(deltas or {}, fields, "%s")
         if not set_clause:
             return self.get(memory_id, user=user) is not None
+        where = 'id = %s AND "user" = %s'
+        params = [memory_id, user]
+        if expect_verdict is not None:
+            where += " AND verdict = %s"
+            params.append(expect_verdict)
         cur = self._conn().execute(
-            f'UPDATE pdm_signatures SET {set_clause} WHERE id = %s AND "user" = %s',
-            values + [memory_id, user],
+            f"UPDATE pdm_signatures SET {set_clause} WHERE {where}", values + params
         )
         self._commit_if_idle(self._conn())
         return cur.rowcount > 0

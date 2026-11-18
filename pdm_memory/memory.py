@@ -1146,8 +1146,8 @@ class Memory:
             if rec.due is None or now > watch_window_end(rec):
                 continue
             if rec.created_at < gap_to and rec.due > gap_from:
-                self._write_verdict(rec, EXPIRED_UNOBSERVED, "", None, now)
-                amended += 1
+                if self._write_verdict(rec, EXPIRED_UNOBSERVED, "", None, now):
+                    amended += 1
         return amended
 
     def validate_claim(
@@ -1171,6 +1171,7 @@ class Memory:
 
         Raises:
             ValueError: No such claim, or an observation the claim cannot take.
+            RuntimeError: Other writers kept changing the claim's verdict.
         """
         if self._is_cloud():
             # The server grades, and stamps the report time itself.
@@ -1181,18 +1182,22 @@ class Memory:
                 verdict=str(data.get("verdict") or ""),
                 reopened=int(data.get("reopened") or 0),
             )
-        rec = self._storage.get(memory_id, user=self._user)
-        if rec is None or not rec.direction or rec.due is None:
-            raise ValueError(f"No claim '{memory_id}' for user '{self._user}'.")
         report_time = report_time or datetime.now(tz=timezone.utc)
         event_time = event_time or report_time
         if event_time.tzinfo is None or report_time.tzinfo is None:
             raise ValueError("An observation's times must be timezone-aware.")
-        verdict = observed_verdict(rec, outcome, event_time, report_time)
-        if verdict is None:
-            return None
-        result = self._write_verdict(rec, verdict, outcome, event_time, report_time)
-        return result if result.changed else None
+        # A settlement pass may write between the read and the write: read again and regrade.
+        for _ in range(3):
+            rec = self._storage.get(memory_id, user=self._user)
+            if rec is None or not rec.direction or rec.due is None:
+                raise ValueError(f"No claim '{memory_id}' for user '{self._user}'.")
+            verdict = observed_verdict(rec, outcome, event_time, report_time)
+            if verdict is None:
+                return None
+            result = self._write_verdict(rec, verdict, outcome, event_time, report_time)
+            if result is not None:
+                return result if result.changed else None
+        raise RuntimeError(f"Claim '{memory_id}' kept changing while it was observed.")
 
     def settle_due_claims(self, now: datetime | None = None) -> SettlementReport:
         """
@@ -1230,6 +1235,8 @@ class Memory:
                 logger.exception("[PDM] settling claim %s failed", rec.id)
                 report.failed.append(rec.id)
                 continue
+            if result is None:
+                continue  # an observation settled it first
             report.settled[verdict] = report.settled.get(verdict, 0) + 1
             report.reopened += result.reopened
         return report
@@ -1241,8 +1248,13 @@ class Memory:
         outcome: str,
         event_time: datetime | None,
         report_time: datetime,
-    ) -> ClaimResult:
-        """Amend the claim's one verdict in place and move its one count; a correction re-opens dependents."""
+    ) -> ClaimResult | None:
+        """
+        Amend the claim's one verdict in place and move its one count; a correction re-opens dependents.
+
+        The counts move from ``rec.verdict``, so the write lands only while the
+        row still holds it. None when another writer changed it first.
+        """
         if (rec.verdict, rec.outcome, rec.event_time) == (verdict, outcome, event_time):
             return ClaimResult(verdict=verdict, changed=False)
         old_correct, old_total = counts_for(rec.direction, rec.verdict)
@@ -1260,15 +1272,18 @@ class Memory:
         elif corrected:
             fields["validation_status"] = UNVALIDATED
         with self._storage.transaction():
-            self._storage.increment(
+            written = self._storage.increment(
                 rec.id,
                 self._user,
                 {
                     "validation_prediction_correct": new_correct - old_correct,
                     "validation_prediction_total": new_total - old_total,
                 },
+                expect_verdict=rec.verdict,
                 **fields,
             )
+            if not written:
+                return None  # another writer moved the verdict since *rec* was read
             reopened = self._reopen_dependents(rec.id) if corrected else set()
         rec.verdict, rec.outcome = verdict, outcome
         rec.event_time, rec.report_time = event_time, report_time
