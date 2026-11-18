@@ -173,7 +173,7 @@ def test_an_update_without_text_is_not_filtered(tmp_path):
     mem = Memory(store=str(tmp_path / "f.db"), user=USER)
     memory_id = mem.save("The budget accumulates.", tags=TAGS)
     mem.add_filter(Boom())
-    mem.update(memory_id, p_magnitude=70.0)
+    mem.update(memory_id, tags=TAGS + ["review"])
 
 
 def _token():
