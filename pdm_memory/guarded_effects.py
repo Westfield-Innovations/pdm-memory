@@ -21,7 +21,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import sqlite3
 import threading
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
@@ -30,6 +29,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+from pdm_memory._sqldb import Database, Row
 
 __all__ = [
     "ActionReceipt",
@@ -277,13 +278,9 @@ class GuardedEffects:
         self._openings_hash = _openings_hash(self._openings)
         self._lock = threading.RLock()
         self._in_flight: set[str] = set()
-        self._conn = sqlite3.connect(
-            str(path), timeout=30, isolation_level=None, check_same_thread=False
-        )
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=FULL")
-        self._conn.executescript("""
+        self._conn = Database.open(path, lock_key="pdm:ge")
+        self._conn.create_schema(
+            """
         CREATE TABLE IF NOT EXISTS ge_owners (
           owner TEXT PRIMARY KEY, active_branch TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS ge_config (
@@ -313,21 +310,15 @@ class GuardedEffects:
           program_version TEXT NOT NULL, policy_version TEXT NOT NULL,
           state_json TEXT NOT NULL, state_hash TEXT NOT NULL, sequence INTEGER NOT NULL,
           PRIMARY KEY(owner, checkpoint_id));
-        CREATE TRIGGER IF NOT EXISTS ge_events_no_update BEFORE UPDATE ON ge_events
-          BEGIN SELECT RAISE(ABORT, 'guard history is append-only'); END;
-        CREATE TRIGGER IF NOT EXISTS ge_events_no_delete BEFORE DELETE ON ge_events
-          BEGIN SELECT RAISE(ABORT, 'guard history is append-only'); END;
-        CREATE TRIGGER IF NOT EXISTS ge_checkpoints_no_update BEFORE UPDATE ON ge_checkpoints
-          BEGIN SELECT RAISE(ABORT, 'guard checkpoints are immutable'); END;
-        CREATE TRIGGER IF NOT EXISTS ge_checkpoints_no_delete BEFORE DELETE ON ge_checkpoints
-          BEGIN SELECT RAISE(ABORT, 'guard checkpoints are immutable'); END;
-        """)
+        """,
+            append_only={
+                "ge_events": "guard history is append-only",
+                "ge_checkpoints": "guard checkpoints are immutable",
+            },
+        )
         try:
             with self._transaction():
-                columns = {
-                    row["name"] for row in self._conn.execute("PRAGMA table_info(ge_config)")
-                }
-                if "openings_hash" not in columns:
+                if "openings_hash" not in self._conn.columns("ge_config"):
                     # Ledgers from the 0.2.6a1 preview predate the openings
                     # fingerprint; the first reopen records it (see below).
                     self._conn.execute(
@@ -403,7 +394,7 @@ class GuardedEffects:
     @contextmanager
     def _transaction(self):
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.begin()
             try:
                 yield
                 self._conn.commit()
@@ -495,7 +486,7 @@ class GuardedEffects:
     def _request(encoded: str) -> EffectRequest:
         return EffectRequest(**json.loads(encoded))
 
-    def _row(self, action_id: str) -> sqlite3.Row:
+    def _row(self, action_id: str) -> Row:
         row = self._conn.execute(
             "SELECT * FROM ge_actions WHERE owner=? AND action_id=?", (self.owner, action_id)
         ).fetchone()
@@ -512,7 +503,7 @@ class GuardedEffects:
         return _hash(json.dumps([epoch, encoded], ensure_ascii=False, separators=(",", ":")))
 
     @staticmethod
-    def _receipt(row: sqlite3.Row) -> ActionReceipt:
+    def _receipt(row: Row) -> ActionReceipt:
         request = json.loads(row["request_json"])
         return ActionReceipt(
             row["action_id"],
@@ -786,7 +777,7 @@ class GuardedEffects:
                 )
             self._conn.execute(
                 """INSERT INTO ge_counts VALUES (?, ?, ?, 1)
-              ON CONFLICT(owner, operation, target) DO UPDATE SET dispatches=dispatches+1""",
+              ON CONFLICT(owner, operation, target) DO UPDATE SET dispatches=ge_counts.dispatches+1""",
                 (self.owner, request.operation, request.target),
             )
             self._set(

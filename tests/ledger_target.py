@@ -12,9 +12,13 @@ import hashlib
 import os
 from pathlib import Path
 
+import pytest
+
 PG_URL = os.environ.get("PDM_TEST_POSTGRES_URL")
 ON_POSTGRES = os.environ.get("PDM_TEST_LEDGER_BACKEND") == "postgres"
 _created: list[str] = []
+# For what only exists in a file: an older file's layout, a :memory: path.
+sqlite_only = pytest.mark.skipif(ON_POSTGRES, reason="exercises a SQLite file")
 
 
 def postgres_target(key: str) -> str:
