@@ -46,7 +46,20 @@ from typing import Any, Mapping
 
 from typing_extensions import Self
 
-from pdm_memory.claims import Claim, is_duck, is_owl
+from pdm_memory.claims import (
+    EXPIRED_UNOBSERVED,
+    NOT_BY_DUE,
+    Claim,
+    ClaimResult,
+    SettlementReport,
+    counts_for,
+    gap_touches,
+    graded,
+    is_duck,
+    is_owl,
+    observed_verdict,
+    watch_window_end,
+)
 from pdm_memory.core.alignment import verify_records
 from pdm_memory.core.math import (
     DEFAULT_MIN_P,
@@ -1113,8 +1126,10 @@ class Memory:
         Record that *source* did not report from *gap_from* to *gap_to* (PDM v1.9 change 4).
 
         A claim bound to *source* whose interval the gap touches is never settled
-        by a missing report. Returns how many verdicts the gap amended: the
-        cloud settles claims; a local store has no settlement yet and returns 0.
+        by a missing report: every ``not_by_due`` verdict on that source whose
+        interval the gap touches and whose watch window is still open is amended
+        to ``expired_unobserved`` and its count restored (change 5). Dependents
+        it re-opened stay re-opened. Returns how many verdicts were amended.
         """
         source = (source or "").strip()
         if not source:
@@ -1123,7 +1138,146 @@ class Memory:
             raise ValueError("A coverage gap's bounds must be timezone-aware.")
         if gap_to <= gap_from:
             raise ValueError("A coverage gap ends after it starts.")
-        return self._storage.save_coverage_gap(self._user, source, gap_from, gap_to)
+        amended = self._storage.save_coverage_gap(self._user, source, gap_from, gap_to)
+        if self._is_cloud():
+            return amended  # the server amends its own verdicts
+        now = datetime.now(tz=timezone.utc)
+        for rec in self._storage.claims(self._user, verdict=NOT_BY_DUE, source=source):
+            if rec.due is None or now > watch_window_end(rec):
+                continue
+            if rec.created_at < gap_to and rec.due > gap_from:
+                self._write_verdict(rec, EXPIRED_UNOBSERVED, "", None, now)
+                amended += 1
+        return amended
+
+    def validate_claim(
+        self,
+        memory_id: str,
+        outcome: str,
+        *,
+        event_time: datetime | None = None,
+        report_time: datetime | None = None,
+    ) -> ClaimResult | None:
+        """
+        Settle a claim on a supplied observation, or amend its one verdict (PDM v1.9 change 5).
+
+        *outcome* is ``occurred``, ``observed_absent`` or ``unknown``.
+        *event_time* is when it happened (default: the report time) and is read
+        against the due; *report_time* is when the memory learned of it
+        (default: now). ``occurred`` at or before the due is on time, inside the
+        watch window late, past it outside the claim. ``unknown`` grades
+        nothing. The same observation twice changes nothing. Returns None when
+        the observation changes nothing.
+
+        Raises:
+            ValueError: No such claim, or an observation the claim cannot take.
+        """
+        if self._is_cloud():
+            # The server grades, and stamps the report time itself.
+            data = self._storage.observe_claim(memory_id, outcome, event_time)
+            if not data.get("changed"):
+                return None
+            return ClaimResult(
+                verdict=str(data.get("verdict") or ""),
+                reopened=int(data.get("reopened") or 0),
+            )
+        rec = self._storage.get(memory_id, user=self._user)
+        if rec is None or not rec.direction or rec.due is None:
+            raise ValueError(f"No claim '{memory_id}' for user '{self._user}'.")
+        report_time = report_time or datetime.now(tz=timezone.utc)
+        event_time = event_time or report_time
+        if event_time.tzinfo is None or report_time.tzinfo is None:
+            raise ValueError("An observation's times must be timezone-aware.")
+        verdict = observed_verdict(rec, outcome, event_time, report_time)
+        if verdict is None:
+            return None
+        result = self._write_verdict(rec, verdict, outcome, event_time, report_time)
+        return result if result.changed else None
+
+    def settle_due_claims(self, now: datetime | None = None) -> SettlementReport:
+        """
+        The settlement pass (PDM v1.9 change 5): every open claim whose due has come.
+
+        A bound claim with nothing reported is ``not_by_due`` and graded,
+        incorrect for occurs and correct for absent, unless a reported gap on
+        its source touches its interval. That claim, and an unbound one, is
+        ``expired_unobserved``: no longer live, V unchanged. A supplied
+        observation may still amend either through :meth:`validate_claim`.
+        Run it at least once per cycle; it visits only claims with no verdict.
+
+        Raises:
+            RuntimeError: In cloud mode, where the server runs the pass itself.
+        """
+        if self._is_cloud():
+            raise RuntimeError("The cloud settles claims in its own cycle.")
+        now = now or datetime.now(tz=timezone.utc)
+        if now.tzinfo is None:
+            raise ValueError("now must be timezone-aware.")
+        report = SettlementReport()
+        gaps: dict[str, builtins.list[tuple[datetime, datetime]]] = {}
+        due = [r for r in self._storage.claims(self._user, verdict="") if r.due and r.due <= now]
+        for rec in sorted(due, key=lambda r: (r.due, r.id)):
+            source = rec.outcome_source
+            if source and source not in gaps:
+                gaps[source] = self._storage.coverage_gaps(self._user, source)
+            if source and not gap_touches(gaps[source], rec.created_at, rec.due):
+                verdict = NOT_BY_DUE
+            else:
+                verdict = EXPIRED_UNOBSERVED
+            try:
+                result = self._write_verdict(rec, verdict, "", None, now)
+            except Exception:
+                logger.exception("[PDM] settling claim %s failed", rec.id)
+                report.failed.append(rec.id)
+                continue
+            report.settled[verdict] = report.settled.get(verdict, 0) + 1
+            report.reopened += result.reopened
+        return report
+
+    def _write_verdict(
+        self,
+        rec: SignatureRecord,
+        verdict: str,
+        outcome: str,
+        event_time: datetime | None,
+        report_time: datetime,
+    ) -> ClaimResult:
+        """Amend the claim's one verdict in place and move its one count; a correction re-opens dependents."""
+        if (rec.verdict, rec.outcome, rec.event_time) == (verdict, outcome, event_time):
+            return ClaimResult(verdict=verdict, changed=False)
+        old_correct, old_total = counts_for(rec.direction, rec.verdict)
+        new_correct, new_total = counts_for(rec.direction, verdict)
+        grade = graded(rec.direction, verdict)
+        corrected = grade is False and rec.validation_status == VALIDATED
+        fields: dict[str, Any] = {
+            "verdict": verdict,
+            "outcome": outcome,
+            "event_time": event_time,
+            "report_time": report_time,
+        }
+        if grade is True:
+            fields["validation_status"] = VALIDATED
+        elif corrected:
+            fields["validation_status"] = UNVALIDATED
+        with self._storage.transaction():
+            self._storage.increment(
+                rec.id,
+                self._user,
+                {
+                    "validation_prediction_correct": new_correct - old_correct,
+                    "validation_prediction_total": new_total - old_total,
+                },
+                **fields,
+            )
+            reopened = self._reopen_dependents(rec.id) if corrected else set()
+        rec.verdict, rec.outcome = verdict, outcome
+        rec.event_time, rec.report_time = event_time, report_time
+        return ClaimResult(verdict=verdict, reopened=len(reopened))
+
+    def _is_cloud(self) -> bool:
+        from pdm_memory.storage.cloud_driver import CloudDriver
+
+        return isinstance(self._storage, CloudDriver)
 
     def reinforce(self, memory_id: str, coupling_score: float = 0.5) -> set[str]:
         """

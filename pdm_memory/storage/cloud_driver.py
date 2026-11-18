@@ -625,6 +625,15 @@ class CloudDriver(BaseStorage):
         )
         return int(resp.json().get("amended", 0) or 0)
 
+    def observe_claim(
+        self, memory_id: str, outcome: str, event_time: datetime | None
+    ) -> dict:
+        """POST /api/v1/pdm/claims/<id>/observe: the server grades it; the report time is its own."""
+        payload: dict[str, Any] = {"outcome": outcome}
+        if event_time is not None:
+            payload["event_time"] = event_time.isoformat()
+        return self._post(f"/api/v1/pdm/claims/{memory_id}/observe", payload).json()
+
     def count_silent(self, user: str, theta: float, as_of: datetime) -> int:
         """GET /api/v1/pdm/count-silent: counted by the server, from its own index."""
         resp = self._get(

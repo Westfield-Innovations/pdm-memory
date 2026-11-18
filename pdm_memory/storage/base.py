@@ -169,6 +169,16 @@ class BaseStorage(ABC):
         """Record that *source* did not report from *gap_from* to *gap_to*; returns verdicts amended."""
         raise NotImplementedError(f"{type(self).__name__} keeps no coverage gaps")
 
+    def claims(
+        self, user: str, *, verdict: str, source: str | None = None
+    ) -> builtins.list[SignatureRecord]:
+        """Live claims of *user* holding *verdict* ("" while open), on *source* when given."""
+        raise NotImplementedError(f"{type(self).__name__} keeps no claims")
+
+    def coverage_gaps(self, user: str, source: str) -> builtins.list[tuple[datetime, datetime]]:
+        """The gaps reported for *source*, as (from, to)."""
+        raise NotImplementedError(f"{type(self).__name__} keeps no coverage gaps")
+
     def count_below_carried(self, user: str, theta: float) -> int:
         """Live rows whose carried number is under *theta*: silent without weighing.
 

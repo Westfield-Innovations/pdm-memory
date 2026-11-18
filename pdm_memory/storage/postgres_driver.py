@@ -32,6 +32,7 @@ from pdm_memory.storage.schema import (
     link_insert_row,
     mapping_to_link,
     mapping_to_record,
+    parse_dt,
     prepare_update_fields,
     signature_insert_row,
     tag_words,
@@ -558,6 +559,26 @@ class PostgresDriver(BaseStorage):
         )
         self._commit_if_idle(self._conn())
         return 0  # no settlement here yet, so no verdict to amend
+
+    def claims(
+        self, user: str, *, verdict: str, source: str | None = None
+    ) -> builtins.list[SignatureRecord]:
+        sql = (
+            'SELECT * FROM pdm_signatures WHERE "user" = %s AND is_deleted = 0 '
+            "AND direction != '' AND verdict = %s"
+        )
+        params: list[Any] = [user, verdict]
+        if source is not None:
+            sql += " AND outcome_source = %s"
+            params.append(source)
+        return [mapping_to_record(r) for r in self._conn().execute(sql, params)]
+
+    def coverage_gaps(self, user: str, source: str) -> builtins.list[tuple[datetime, datetime]]:
+        rows = self._conn().execute(
+            'SELECT gap_from, gap_to FROM pdm_coverage_gaps WHERE "user" = %s AND source = %s',
+            (user, source),
+        )
+        return [(parse_dt(r["gap_from"]), parse_dt(r["gap_to"])) for r in rows]
 
     def count_below_carried(self, user: str, theta: float) -> int:
         row = self._conn().execute(

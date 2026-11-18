@@ -107,6 +107,34 @@ def test_cloud_gap_and_silent_count(mem, router):
     assert silent.calls.last.request.url.params["theta"] == "30"
 
 
+def test_cloud_observation_posts_to_the_claim(mem, router):
+    route = router.post(f"{API}/claims/c1/observe").mock(
+        return_value=httpx.Response(
+            200, json={"id": "c1", "verdict": "late", "changed": True, "reopened": 2}
+        )
+    )
+    result = mem.validate_claim("c1", "occurred", event_time=NOW)
+    assert (result.verdict, result.reopened) == ("late", 2)
+    assert json.loads(route.calls.last.request.content) == {
+        "outcome": "occurred",
+        "event_time": NOW.isoformat(),
+    }
+
+
+def test_cloud_observation_that_changes_nothing_is_none(mem, router):
+    router.post(f"{API}/claims/c1/observe").mock(
+        return_value=httpx.Response(
+            200, json={"id": "c1", "verdict": "on_time", "changed": False, "reopened": 0}
+        )
+    )
+    assert mem.validate_claim("c1", "occurred") is None
+
+
+def test_the_cloud_runs_its_own_settlement_pass(mem):
+    with pytest.raises(RuntimeError, match="own cycle"):
+        mem.settle_due_claims(NOW)
+
+
 def test_a_cloud_row_reads_its_status_and_claim_back():
     rec = SignatureRecord(
         id="c1",
