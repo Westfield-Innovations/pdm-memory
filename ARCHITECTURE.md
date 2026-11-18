@@ -284,14 +284,30 @@ $$\text{temporal\_weight}_{\text{new}} = \text{temporal\_weight} \times (1 - \te
 *   `penalize` на `VALIDATED` — це корекція: усе, що спирається на рядок по support, стає `REOPENED`, хоч як далеко. Цикли обходяться один раз.
 *   Coaccess корекцію не переносить.
 
-**Claim (зміни 4, 6).**
+**Claim (зміни 4–6).**
 *   `save(claim=Claim(direction, due, outcome_source, watch_window_days))`.
 *   Owl — claim `occurs` після due, без зафіксованої події.
 *   Duck — claim `absent`, яку не перевірило жодне спостереження.
 
+**Settlement (зміна 5).** Одна claim — один вердикт, який змінюється на місці:
+
+| Вердикт | `occurs` | `absent` |
+|---|---|---|
+| `on_time` | правильна | неправильна |
+| `late` | неправильна | правильна |
+| `observed_absent` | неправильна | правильна |
+| `not_by_due` | неправильна | правильна |
+| `expired_unobserved` | — | — |
+
+*   `settle_due_claims()` — прохід раз на цикл. Він бере лише відкриті claim, чий due настав (індекс `idx_pdm_open_claims`). Прив'язана до джерела claim без звіту → `not_by_due`. Неприв'язана, або проміжок (`report_coverage_gap`) торкається її інтервалу → `expired_unobserved`, V не змінюється. Сам прохід нічого не запускає: його викликає викликач. На cloud store прохід робить сервер, і метод кидає `RuntimeError`.
+*   `validate_claim(id, outcome, event_time=, report_time=)` — спостереження `occurred` / `observed_absent` / `unknown`. `occurred` до due — `on_time`, у межах watch window — `late`, пізніше — поза claim. Прив'язану вже вирішену claim можна змінити лише поки watch window відкрите; неприв'язану — будь-коли.
+*   Claim додає до V щонайбільше один лічильник. Зміна вердикту переносить його, а не додає другий. Запис проходить лише тоді, коли рядок ще має вердикт, з якого його рахували; інакше вердикт перечитується.
+*   Неправильний вердикт на `VALIDATED` claim — корекція: усе, що спирається на неї по support, стає `REOPENED`.
+*   Проміжок, про який повідомили після due, змінює `not_by_due` на `expired_unobserved` і повертає лічильник, поки watch window відкрите. Повторно відкриті залежні лишаються відкритими.
+
 **Тиша замість видалення.** `decay()` нічого не видаляє, `count_silent()` рахує тихих. Апгрейд повертає рядки, які міг видалити старий `decay()` (вага < 37.5); решта видалень лишається.
 
-**Ще не зроблено.** Settlement (зміна 5) і curve sweep (зміна 13) чекають рішення. Sill S, I2, cross-drawer resonance і `require_tri` у SDK відсутні. На cloud store `context` і `support_in_doubt` не рахуються (None), тож хіт там завжди `UNVALIDATED` для дії.
+**Ще не зроблено.** Curve sweep (зміна 13) чекає рішення. Sill S, I2, cross-drawer resonance і `require_tri` у SDK відсутні. На cloud store `context` і `support_in_doubt` не рахуються (None), тож хіт там завжди `UNVALIDATED` для дії.
 
 ---
 

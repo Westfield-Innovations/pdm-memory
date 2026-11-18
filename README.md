@@ -143,6 +143,32 @@ mem.report_coverage_gap("failure-feed", now - timedelta(hours=6), now)  # a feed
 something it rests on is in doubt, or when it is a safety claim nobody has
 checked (a duck). The memory returns qualified hits; the caller decides.
 
+### Settle claims (PDM v1.9)
+
+A claim holds one verdict: `on_time`, `late`, `observed_absent`, `not_by_due`
+or `expired_unobserved`. Amending it moves its one count in V; it never adds a
+second. Run the settlement pass once per cycle; nothing runs it for you.
+
+```python
+# Each cycle: every open claim whose due has come gets its verdict.
+# Bound to a source with nothing reported: not_by_due (graded).
+# Unbound, or a reported gap touches its interval: expired_unobserved (V unchanged).
+report = mem.settle_due_claims()
+print(report.settled, report.reopened, report.failed)
+
+# An observation arrives: settle the claim, or amend its verdict while the
+# watch window is open. "occurred", "observed_absent" or "unknown".
+result = mem.validate_claim(claim, "occurred", event_time=now)
+if result:  # None when the observation changes nothing
+    print(result.verdict, result.reopened)  # on_time 0
+```
+
+A wrong verdict on a `VALIDATED` claim is a correction: it re-opens what rests
+on it. A gap reported after the due turns `not_by_due` into
+`expired_unobserved` and restores the count while the watch window is open.
+On a cloud store the server runs the pass, so `settle_due_claims()` raises;
+`validate_claim()` and `report_coverage_gap()` go to the server.
+
 `recall(reinforce=True)` and `decay()` still work but are deprecated: the first
 only touches the hits, the second only counts the silent set.
 
