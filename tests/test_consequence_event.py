@@ -28,6 +28,7 @@ from tests.consequence_fixtures import (
     TEMP,
     VALVE,
 )
+from tests.ledger_target import ledger_target
 
 MOVED_EVENT = EventCondition("valve_position", "state", ("categorical", "1"), ["moved"], grade_for_s=1800)
 WAIT = replace(HORIZON, event=MOVED_EVENT)
@@ -45,7 +46,7 @@ def _pos(id_, at, value="moved", **changes):
 
 @pytest.fixture
 def ledger(tmp_path):
-    with ConsequenceLedger(tmp_path / "c.db", owner="owner-1", policy=POLICY,
+    with ConsequenceLedger(ledger_target(tmp_path, "c.db"), owner="owner-1", policy=POLICY,
                            clock=lambda: COMMIT) as led:
         led.prepare(EXP)
         yield led
@@ -196,7 +197,7 @@ def test_a_silence_that_misses_part_of_the_span_is_excluded(ledger):
 
 def test_an_event_before_commit_grades_retrospectively(tmp_path):
     early = replace(EXP, horizon=replace(WAIT, window_start=COMMIT - 10 * MINUTE))
-    with ConsequenceLedger(tmp_path / "c.db", owner="o", policy=POLICY, clock=lambda: COMMIT) as led:
+    with ConsequenceLedger(ledger_target(tmp_path, "c.db"), owner="o", policy=POLICY, clock=lambda: COMMIT) as led:
         led.prepare(early)
         led.observe(_pos("p-1", COMMIT - 5 * MINUTE))
         led.observe(_temp("t-1", COMMIT - 2 * MINUTE))
@@ -205,7 +206,7 @@ def test_an_event_before_commit_grades_retrospectively(tmp_path):
 
 
 def test_prepare_checks_the_event_rule(tmp_path):
-    with ConsequenceLedger(tmp_path / "c.db", owner="o", policy=POLICY) as led:
+    with ConsequenceLedger(ledger_target(tmp_path, "c.db"), owner="o", policy=POLICY) as led:
         fuzzy = replace(MOVED_EVENT, comparator=("fuzzy", "1"))
         with pytest.raises(ValueError, match="comparator"):
             led.prepare(replace(EXP, horizon=replace(WAIT, event=fuzzy)))
@@ -231,9 +232,9 @@ def test_an_event_must_be_an_event_condition():
 def test_an_event_horizon_round_trips_and_a_plain_one_keeps_its_old_form(tmp_path):
     assert "event" not in VALVE.to_dict()["horizon"]
     assert Expectation.from_dict(EXP.to_dict()) == EXP
-    with ConsequenceLedger(tmp_path / "c.db", owner="o", policy=POLICY) as a:
+    with ConsequenceLedger(ledger_target(tmp_path, "c.db"), owner="o", policy=POLICY) as a:
         a.prepare(EXP)
-    with ConsequenceLedger(tmp_path / "c.db", owner="o", policy=POLICY) as b:
+    with ConsequenceLedger(ledger_target(tmp_path, "c.db"), owner="o", policy=POLICY) as b:
         assert b.expectation("exp-valve-1")[0] == EXP
         assert b.prepare(EXP) == "exp-valve-1"
 

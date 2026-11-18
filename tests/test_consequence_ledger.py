@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sqlite3
 from dataclasses import replace
 
 import pytest
@@ -18,11 +17,12 @@ from tests.consequence_fixtures import (
     _policy,
     _request,
 )
+from tests.ledger_target import ledger_target
 
 
 @pytest.fixture
 def ledger(tmp_path):
-    with ConsequenceLedger(tmp_path / "c.db", owner="owner-1", policy=POLICY) as led:
+    with ConsequenceLedger(ledger_target(tmp_path, "c.db"), owner="owner-1", policy=POLICY) as led:
         yield led
 
 
@@ -68,7 +68,7 @@ def test_a_memory_path_is_refused():
 def test_payloads_are_bounded(tmp_path):
     small = _policy(limits=replace(POLICY.limits, max_payload_bytes=256))
     with (
-        ConsequenceLedger(tmp_path / "s.db", owner="o", policy=small) as led,
+        ConsequenceLedger(ledger_target(tmp_path, "s.db"), owner="o", policy=small) as led,
         pytest.raises(ResourceLimitError),
     ):
         led.prepare(VALVE)
@@ -124,9 +124,9 @@ def test_release_waits_for_a_retained_expectation(ledger, tmp_path):
 def test_history_is_append_only_and_chained(ledger):
     ledger.prepare(VALVE)
     ledger.observe(TEMP)
-    with pytest.raises(sqlite3.DatabaseError):
+    with pytest.raises(ledger._conn.Error):
         ledger._conn.execute("DELETE FROM cl_events")
-    with pytest.raises(sqlite3.DatabaseError):
+    with pytest.raises(ledger._conn.Error):
         ledger._conn.execute("UPDATE cl_events SET kind='X'")
     assert ledger.verify_history()
     first, second = ledger.history()
@@ -135,10 +135,10 @@ def test_history_is_append_only_and_chained(ledger):
 
 
 def test_records_survive_a_reopen(tmp_path):
-    with ConsequenceLedger(tmp_path / "c.db", owner="o", policy=POLICY) as a:
+    with ConsequenceLedger(ledger_target(tmp_path, "c.db"), owner="o", policy=POLICY) as a:
         a.prepare(VALVE)
         a.observe(TEMP)
-    with ConsequenceLedger(tmp_path / "c.db", owner="o", policy=POLICY) as b:
+    with ConsequenceLedger(ledger_target(tmp_path, "c.db"), owner="o", policy=POLICY) as b:
         assert b.expectation("exp-valve-1")[0] == VALVE
         assert b.observations() == [TEMP]
         assert b.prepare(VALVE) == "exp-valve-1"

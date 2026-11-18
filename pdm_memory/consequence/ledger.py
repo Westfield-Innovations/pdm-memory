@@ -10,7 +10,6 @@ whether an expectation was committed first.
 from __future__ import annotations
 
 import json
-import sqlite3
 import threading
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -19,6 +18,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from pdm_memory._sqldb import Database, Row
 from pdm_memory.consequence.compare import COMPARATORS, NOT_OBSERVED
 from pdm_memory.consequence.records import (
     PROTECTED_TARGETS,
@@ -130,11 +130,9 @@ CREATE TABLE IF NOT EXISTS cl_events (
   kind TEXT NOT NULL, payload_json TEXT NOT NULL, previous_hash TEXT NOT NULL,
   event_hash TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS cl_events_owner ON cl_events(owner, sequence);
-CREATE TRIGGER IF NOT EXISTS cl_events_no_update BEFORE UPDATE ON cl_events
-  BEGIN SELECT RAISE(ABORT, 'consequence history is append-only'); END;
-CREATE TRIGGER IF NOT EXISTS cl_events_no_delete BEFORE DELETE ON cl_events
-  BEGIN SELECT RAISE(ABORT, 'consequence history is append-only'); END;
 """
+# Tables read back ORDER BY rowid; Postgres gives them that column explicitly.
+_ORDERED = ("cl_evaluations", "cl_updates", "cl_consequences", "cl_revocations")
 
 
 class ConsequenceLedger:
@@ -162,18 +160,17 @@ class ConsequenceLedger:
         self._clock = clock
         self._limit = policy.limits.max_payload_bytes
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(
-            str(path), timeout=30, isolation_level=None, check_same_thread=False
+        self._conn = Database.open(path, lock_key="pdm:cl")
+        self._conn.create_schema(
+            _SCHEMA,
+            append_only={"cl_events": "consequence history is append-only"},
+            ordered=_ORDERED,
         )
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=FULL")
-        self._conn.executescript(_SCHEMA)
 
     @contextmanager
     def _transaction(self):
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.begin()
             try:
                 yield
                 self._conn.commit()
@@ -616,14 +613,14 @@ class ConsequenceLedger:
             raise KeyError(f"no evaluation {evaluation_id}")
         return self._evaluation_from(row)
 
-    def _evaluation_row(self, evaluation_id: str) -> sqlite3.Row | None:
+    def _evaluation_row(self, evaluation_id: str) -> Row | None:
         return self._conn.execute(
             "SELECT * FROM cl_evaluations WHERE owner=? AND evaluation_id=?",
             (self.owner, evaluation_id),
         ).fetchone()
 
     @staticmethod
-    def _evaluation_from(row: sqlite3.Row) -> Evaluation:
+    def _evaluation_from(row: Row) -> Evaluation:
         return Evaluation.from_dict(json.loads(row["record_json"]), row["superseded_by"])
 
     # --- learning ------------------------------------------------------------
@@ -748,7 +745,7 @@ class ConsequenceLedger:
         with self._lock:
             return UpdateState(self._update_row(update_id)["state"])
 
-    def _update_row(self, update_id: str) -> sqlite3.Row:
+    def _update_row(self, update_id: str) -> Row:
         row = self._conn.execute(
             "SELECT * FROM cl_updates WHERE owner=? AND update_id=?",
             (self.owner, _name(update_id, "update_id")),

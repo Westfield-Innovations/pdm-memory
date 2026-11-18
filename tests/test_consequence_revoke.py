@@ -34,6 +34,7 @@ from tests.consequence_fixtures import (
     _guard,
     _request,
 )
+from tests.ledger_target import ledger_target, sqlite_only
 
 SUPPLY = replace(TEMP, observation_id="obs-supply", source="supply-gauge", observable="supply_bar",
                  unit="bar", value=0.4)
@@ -46,7 +47,7 @@ def _open(path, owner="owner-1"):
 
 @pytest.fixture
 def ledger(tmp_path):
-    with _open(tmp_path / "c.db") as led:
+    with _open(ledger_target(tmp_path, "c.db")) as led:
         led.prepare(VALVE)
         yield led
 
@@ -134,7 +135,7 @@ def test_receipts_and_consequences_still_append(ledger, tmp_path):
 
 def test_significance_shows_the_revocation_and_permits_no_interruption(tmp_path):
     policy = replace(POLICY, priorities={TASK.task_id: 9}, interruption_priority=1)
-    with ConsequenceLedger(tmp_path / "c.db", owner="o", policy=policy, clock=lambda: COMMIT) as led:
+    with ConsequenceLedger(ledger_target(tmp_path, "c.db"), owner="o", policy=policy, clock=lambda: COMMIT) as led:
         led.prepare(VALVE)
         led.evaluate("exp-valve-1", task=TASK)
         assert led.significance("exp-valve-1").interruption is True
@@ -176,7 +177,7 @@ def test_an_unknown_expectation_cannot_be_revoked(ledger):
 
 
 def test_another_owners_revocation_does_not_reach_this_one(tmp_path):
-    with _open(tmp_path / "c.db", "owner-a") as a, _open(tmp_path / "c.db", "owner-b") as b:
+    with _open(ledger_target(tmp_path, "c.db"), "owner-a") as a, _open(ledger_target(tmp_path, "c.db"), "owner-b") as b:
         a.prepare(VALVE)
         b.prepare(VALVE)
         a.revoke_expectation("exp-valve-1", controller_ref="ctl", reason="x")
@@ -184,13 +185,14 @@ def test_another_owners_revocation_does_not_reach_this_one(tmp_path):
         assert b.revocations() == []
 
 
+@sqlite_only
 def test_revocations_survive_a_reopen_and_an_older_file_gains_the_table(tmp_path):
-    with _open(tmp_path / "c.db") as led:
+    with _open(ledger_target(tmp_path, "c.db")) as led:
         led.prepare(VALVE)
         led._conn.execute("DROP TABLE cl_revocations")  # a file from before revocations
-    with _open(tmp_path / "c.db") as led:
+    with _open(ledger_target(tmp_path, "c.db")) as led:
         _revoke(led)
-    with _open(tmp_path / "c.db") as led:
+    with _open(ledger_target(tmp_path, "c.db")) as led:
         with pytest.raises(Revoked):
             led.evaluate("exp-valve-1", task=TASK)
         assert len(led.revocations("exp-valve-1")) == 1 and led.revocations("exp-other") == []

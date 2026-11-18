@@ -34,6 +34,7 @@ from tests.consequence_fixtures import (
     _guard,
     _request,
 )
+from tests.ledger_target import ledger_target
 
 # A window that opened before the commitment, so a reading can land in it
 # either side of the commit.
@@ -45,7 +46,7 @@ def ledger_at(tmp_path):
     made = []
 
     def make(now=COMMIT, policy=POLICY):
-        led = ConsequenceLedger(tmp_path / f"c{len(made)}.db", owner="owner-1", policy=policy,
+        led = ConsequenceLedger(ledger_target(tmp_path, f"c{len(made)}.db"), owner="owner-1", policy=policy,
                                 clock=lambda: now)
         made.append(led)
         return led

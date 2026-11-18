@@ -30,12 +30,13 @@ from tests.consequence_fixtures import (
     VALVE,
     _policy,
 )
+from tests.ledger_target import ledger_target
 
 IN_BAND = replace(TEMP, value=21.0)
 
 
 def _open(tmp_path, name="c.db", **policy_changes):
-    led = ConsequenceLedger(tmp_path / name, owner="owner-1", policy=_policy(**policy_changes),
+    led = ConsequenceLedger(ledger_target(tmp_path, name), owner="owner-1", policy=_policy(**policy_changes),
                             clock=lambda: COMMIT)
     led.prepare(VALVE)
     return led

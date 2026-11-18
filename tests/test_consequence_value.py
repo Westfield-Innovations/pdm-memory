@@ -20,6 +20,7 @@ from tests.consequence_fixtures import (
     _policy,
     _source,
 )
+from tests.ledger_target import ledger_target
 
 RULES = {"EUR": Decimal(1), "call": Decimal(2), "min": Decimal("0.5"), "s": Decimal("0.01")}
 WORTH_5 = replace(ROOM_TEMP, avoided=Decimal(5), avoided_unit="EUR")
@@ -32,7 +33,7 @@ def _room(ledger, expectation=None, now=COMMIT):
 
 
 def _open(tmp_path, policy):
-    return ConsequenceLedger(tmp_path / "c.db", owner="o", policy=policy, clock=lambda: COMMIT)
+    return ConsequenceLedger(ledger_target(tmp_path, "c.db"), owner="o", policy=policy, clock=lambda: COMMIT)
 
 
 def test_without_an_avoided_consequence_the_order_stays_qualitative(tmp_path):

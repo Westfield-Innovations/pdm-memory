@@ -29,6 +29,7 @@ from tests.consequence_fixtures import (
     VALVE,
     _source,
 )
+from tests.ledger_target import ledger_target
 
 
 @pytest.fixture
@@ -37,7 +38,7 @@ def make(tmp_path):
 
     def build(**policy_changes):
         policy = replace(POLICY, **policy_changes)
-        led = ConsequenceLedger(tmp_path / f"c{len(made)}.db", owner="owner-1", policy=policy,
+        led = ConsequenceLedger(ledger_target(tmp_path, f"c{len(made)}.db"), owner="owner-1", policy=policy,
                                 clock=lambda: COMMIT)
         made.append(led)
         led.prepare(VALVE)

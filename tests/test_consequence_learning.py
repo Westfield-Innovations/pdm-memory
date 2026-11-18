@@ -29,6 +29,7 @@ from tests.consequence_fixtures import (
     TEMP,
     VALVE,
 )
+from tests.ledger_target import ledger_target
 
 SUPPLY = replace(TEMP, observation_id="obs-supply", source="supply-gauge", observable="supply_bar",
                  unit="bar", value=0.4)
@@ -37,7 +38,7 @@ SUPPORTED = (CauseHypothesis(Cause.EXECUTION, ("obs-supply",)),)
 
 @pytest.fixture
 def ledger(tmp_path):
-    with ConsequenceLedger(tmp_path / "c.db", owner="owner-1", policy=POLICY,
+    with ConsequenceLedger(ledger_target(tmp_path, "c.db"), owner="owner-1", policy=POLICY,
                            clock=lambda: COMMIT) as led:
         yield led
 

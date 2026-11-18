@@ -24,6 +24,7 @@ from pdm_memory.guarded_effects import (
     GuardedEffects,
     Opening,
 )
+from tests.ledger_target import ledger_target
 
 SECOND = timedelta(seconds=1)
 MINUTE = timedelta(minutes=1)
@@ -129,7 +130,7 @@ def _request(action_id="act-valve-1"):
 
 def _guard(tmp_path, *, check=None, handler=lambda r: {"accepted": True}):
     g = GuardedEffects(
-        tmp_path / "guard.db",
+        ledger_target(tmp_path, "guard.db"),
         owner="owner-1",
         program_version="worker-1",
         policy_version="policy-1",

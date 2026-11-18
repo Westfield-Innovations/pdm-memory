@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sqlite3
 import threading
 from dataclasses import replace
 
@@ -37,6 +36,7 @@ from tests.consequence_fixtures import (
     TEMP,
     VALVE,
 )
+from tests.ledger_target import ledger_target
 
 SUPPLY = replace(TEMP, observation_id="obs-supply", source="supply-gauge", observable="supply_bar",
                  unit="bar", value=0.4)
@@ -48,7 +48,7 @@ def make(tmp_path):
     made = []
 
     def build(policy=POLICY, name=None):
-        led = ConsequenceLedger(tmp_path / (name or f"c{len(made)}.db"), owner="owner-1",
+        led = ConsequenceLedger(ledger_target(tmp_path, name or f"c{len(made)}.db"), owner="owner-1",
                                 policy=policy, clock=lambda: COMMIT)
         made.append(led)
         return led
@@ -100,12 +100,12 @@ def test_a_silence_is_timed_by_the_window_it_covers(ledger):
     assert (f.ordering, f.comparison) == (Ordering.PROSPECTIVE, Comparison.CONFIRMED_MISS)
 
 
-def test_an_expected_absence_is_confirmed_by_a_covered_silence(ledger):
+def test_an_expected_absence_is_confirmed_by_a_covered_silence(ledger, tmp_path):
     absent = Criterion("no_leak", "leak_alarm", Stage.TASK_EFFECT, ("categorical", "1"), "state",
                        ["absent"])
     policy = replace(POLICY, sources=(*POLICY.sources, replace(POLICY.sources[0], name="alarm-panel",
                                                                observables=frozenset({"leak_alarm"}))))
-    led = ConsequenceLedger(ledger._conn.execute("PRAGMA database_list").fetchone()[2] + "-abs",
+    led = ConsequenceLedger(ledger_target(tmp_path, "abs.db"),
                             owner="o", policy=policy, clock=lambda: COMMIT)
     led.prepare(replace(VALVE, criteria=(absent,)))
     led.observe(replace(POSITION_MOVED, observation_id="obs-alarm", source="alarm-panel",
@@ -224,8 +224,8 @@ def test_an_unrelated_reading_changes_nothing(ledger):
 
 
 def test_owners_sharing_a_file_are_isolated(tmp_path):
-    with ConsequenceLedger(tmp_path / "s.db", owner="a", policy=POLICY) as a, \
-            ConsequenceLedger(tmp_path / "s.db", owner="b", policy=POLICY) as b:
+    with ConsequenceLedger(ledger_target(tmp_path, "s.db"), owner="a", policy=POLICY) as a, \
+            ConsequenceLedger(ledger_target(tmp_path, "s.db"), owner="b", policy=POLICY) as b:
         a.prepare(VALVE)
         with pytest.raises(KeyError):
             b.expectation("exp-valve-1")
@@ -239,7 +239,7 @@ def test_a_tampered_event_is_detected(ledger):
     ledger.prepare(VALVE)
     ledger.observe(replace(TEMP, value=21.0))
     conn = ledger._conn
-    conn.execute("DROP TRIGGER cl_events_no_update")
+    conn.execute("DROP TRIGGER cl_events_no_update" + (" ON cl_events" if conn.dialect == "postgres" else ""))
     conn.execute("UPDATE cl_events SET payload_json = replace(payload_json, '21.0', '25.0')")
     with pytest.raises(LedgerIntegrityError):
         ledger.verify_history()
@@ -248,7 +248,7 @@ def test_a_tampered_event_is_detected(ledger):
 def test_triggers_refuse_edits(ledger):
     ledger.prepare(VALVE)
     for sql in ("UPDATE cl_events SET kind='X'", "DELETE FROM cl_events"):
-        with pytest.raises(sqlite3.IntegrityError):
+        with pytest.raises(ledger._conn.Error):
             ledger._conn.execute(sql)
 
 
@@ -260,7 +260,7 @@ def test_threads_evaluating_together_write_one_revision(ledger):
     def run():
         try:
             results.append(ledger.evaluate("exp-valve-1", task=TASK).evaluation_id)
-        except (sqlite3.Error, ValueError) as exc:  # pragma: no cover - reported below
+        except (ledger._conn.Error, ValueError) as exc:  # pragma: no cover - reported below
             errors.append(exc)
 
     threads = [threading.Thread(target=run) for _ in range(8)]

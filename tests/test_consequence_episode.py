@@ -26,6 +26,7 @@ from tests.consequence_fixtures import (
     _guard,
     _request,
 )
+from tests.ledger_target import ledger_target
 
 SUPPLY = replace(TEMP, observation_id="obs-supply", source="supply-gauge", observable="supply_bar",
                  unit="bar", value=0.4)
@@ -50,7 +51,7 @@ def _steps_1_to_3(ledger, guard):
 
 def test_the_valve_episode_confirms_and_continues(tmp_path):
     calls = []
-    with _open(tmp_path / "c.db") as ledger, _guard(
+    with _open(ledger_target(tmp_path, "c.db")) as ledger, _guard(
         tmp_path, check=ledger.prepared_check, handler=calls.append
     ) as guard:
         receipt, ev, proposals = _steps_1_to_3(ledger, guard)
@@ -68,7 +69,7 @@ def test_the_valve_episode_confirms_and_continues(tmp_path):
 
 
 def test_the_valve_episode_learns_from_a_supported_miss_once(tmp_path):
-    with _open(tmp_path / "c.db") as ledger, _guard(tmp_path, check=ledger.prepared_check) as guard:
+    with _open(ledger_target(tmp_path, "c.db")) as ledger, _guard(tmp_path, check=ledger.prepared_check) as guard:
         _steps_1_to_3(ledger, guard)
         # 4b. A valid reading misses; a cause backed by its own reading is supported.
         ledger.observe(SUPPLY)
@@ -122,10 +123,10 @@ def test_the_valve_episode_learns_from_a_supported_miss_once(tmp_path):
 
 
 def test_worker_recovery_mid_episode(tmp_path):
-    with _open(tmp_path / "c.db") as ledger, _guard(tmp_path, check=ledger.prepared_check) as guard:
+    with _open(ledger_target(tmp_path, "c.db")) as ledger, _guard(tmp_path, check=ledger.prepared_check) as guard:
         _, ev, proposals = _steps_1_to_3(ledger, guard)
         events = ledger.history(limit=1000)
-    with _open(tmp_path / "c.db") as ledger, _guard(tmp_path, check=ledger.prepared_check) as guard:
+    with _open(ledger_target(tmp_path, "c.db")) as ledger, _guard(tmp_path, check=ledger.prepared_check) as guard:
         _, again, replayed = _steps_1_to_3(ledger, guard)
         assert (again, replayed) == (ev, proposals)
         assert ledger.history(limit=1000) == events
