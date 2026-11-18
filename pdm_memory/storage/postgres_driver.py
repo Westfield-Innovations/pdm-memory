@@ -599,11 +599,11 @@ class PostgresDriver(BaseStorage):
 
     def count_below_carried(self, user: str, theta: float) -> int:
         row = self._conn().execute(
-            'SELECT COUNT(*) FROM pdm_signatures WHERE "user" = %s AND is_deleted = 0 '
+            'SELECT COUNT(*) AS n FROM pdm_signatures WHERE "user" = %s AND is_deleted = 0 '
             f"AND {CARRIED_SQL} < %s",
             (user, theta),
         ).fetchone()
-        return int(row[0]) if row else 0
+        return int(row["n"]) if row else 0
 
     def list_drawers(self, user: str = "default") -> builtins.list[DrawerInfo]:
         rows = self._conn().execute(
