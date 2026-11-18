@@ -117,6 +117,11 @@ class Database:
                     "the Postgres server runs with fsync=off; ledger writes would not be durable"
                 )
             conn.execute("SET synchronous_commit TO on")
+            # A SQLite file has its own writer lock and waits 30 s for it; here the
+            # schema plays the file, and a wait past 30 s raises instead of hanging.
+            conn.execute("SET lock_timeout TO '30s'")
+            schema = conn.execute("SELECT current_schema()").fetchone()[0]
+            db._lock_id = _lock_id(f"{lock_key}:{schema}")
         except BaseException:
             conn.close()
             raise
@@ -137,7 +142,7 @@ class Database:
         if self.dialect == "sqlite":
             self._conn.execute("BEGIN IMMEDIATE")
             return
-        # shortcut: one lock per ledger kind, as SQLite has one writer per file; key it by owner if owners start waiting on each other.
+        # shortcut: one writer per ledger kind and schema, as SQLite has one per file; key it by owner if owners start waiting on each other.
         self._conn.execute("BEGIN")
         self._conn.execute("SELECT pg_advisory_xact_lock(%s)", (self._lock_id,))
 

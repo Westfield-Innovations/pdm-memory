@@ -204,3 +204,38 @@ def test_sqlite_never_needs_psycopg(tmp_path, monkeypatch):
     d.create_schema(SCHEMA)
     assert d.dialect == "sqlite"
     d.close()
+
+
+def test_ledgers_in_different_schemas_do_not_share_a_writer_lock(pg_target, tmp_path):
+    import threading
+
+    other = postgres_target(f"{tmp_path}-other-{uuid.uuid4().hex}")
+    a = Database.open(pg_target, lock_key="test")
+    b = Database.open(other, lock_key="test")
+    a.begin()
+    done = []
+    thread = threading.Thread(target=lambda: (b.begin(), b.commit(), done.append(True)), daemon=True)
+    thread.start()
+    thread.join(5)
+    blocked = not done
+    a.commit()
+    thread.join(5)
+    assert not blocked, "a ledger in another schema waited on this one's lock"
+    a.close()
+    b.close()
+
+
+def test_a_wait_for_the_writer_lock_is_bounded_like_sqlites(pg_target):
+    import psycopg
+
+    holder = Database.open(pg_target, lock_key="test")
+    waiter = Database.open(pg_target, lock_key="test")
+    assert waiter.execute("SHOW lock_timeout").fetchone()[0] == "30s"
+    waiter.execute("SET lock_timeout TO '1s'")  # the same bound, shortened for the test
+    holder.begin()
+    with pytest.raises(psycopg.errors.LockNotAvailable):
+        waiter.begin()
+    waiter.rollback()
+    holder.commit()
+    holder.close()
+    waiter.close()
