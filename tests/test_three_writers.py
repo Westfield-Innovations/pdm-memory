@@ -110,3 +110,38 @@ def test_concurrent_reinforce_loses_no_count(tmp_path):
     assert not errors
     with Memory(store=path, user=USER) as check:
         assert _row(check, mid)[3:] == (200, 200)
+
+
+def test_update_refuses_p(mem):
+    mid = _save(mem)
+    before = _row(mem, mid)
+    with pytest.raises(ValueError, match="ingest"):
+        mem.update(mid, p_magnitude=90)
+    assert _row(mem, mid) == before
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("p_magnitude", 90.0),
+        ("effective_spike", 90.0),
+        ("validation_prediction_correct", 5),
+        ("validation_prediction_total", 5),
+        ("retrieval_count", 5),
+        ("last_retrieved", "2026-01-01T00:00:00+00:00"),
+    ],
+)
+def test_a_batch_update_writes_none_of_the_three_numbers(mem, field, value):
+    mid = _save(mem)
+    before = _row(mem, mid)
+    counts = mem.update_many([{"id": mid, field: value}])
+    assert counts == {"updated": 0, "skipped": 0, "errors": 1}
+    assert _row(mem, mid) == before
+
+
+def test_a_batch_update_still_writes_other_fields(mem):
+    mid = _save(mem)
+    before = _row(mem, mid)
+    assert mem.update_many([{"id": mid, "text": "North flare igniter replaced"}])["updated"] == 1
+    assert mem._storage.get(mid, user=USER).compressed_fact == "North flare igniter replaced"
+    assert _row(mem, mid) == before

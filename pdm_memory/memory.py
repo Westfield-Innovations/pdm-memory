@@ -124,6 +124,16 @@ COACCESS_PER_TOUCH = 5
 DEFAULT_BUDGET = 200
 # Under this many tagged candidates over the gate, the listing route joins.
 LISTING_MIN = 50
+# Columns only their own writer sets (PDM v1.9 change 3): P (and the spike derived
+# from it) at ingest, the verdict counts at validate, the use clock at touch.
+_WRITER_OWNED_FIELDS = frozenset({
+    "p_magnitude",
+    "effective_spike",
+    "validation_prediction_correct",
+    "validation_prediction_total",
+    "last_retrieved",
+    "retrieval_count",
+})
 ROUTE_TAGS = "tags"
 ROUTE_AREA = "area"
 ROUTE_LISTING = "listing"
@@ -614,7 +624,8 @@ class Memory:
             memory_id:   Target signature UUID.
             text:        New fact text (max 500 chars).
             tags:        Replacement intent tags (recomputes domain).
-            p_magnitude: New stored pressure (0–100).
+            p_magnitude: Refused: P is written only at ingest (PDM v1.9 change 3).
+                         Kept so an old call fails with that reason.
             t_persistence: New persistence half-life in days.
             drawer:      New drawer / category name.
             regime:      New question regime.
@@ -628,7 +639,7 @@ class Memory:
             Updated MemoryHit with live P_effective.
 
         Raises:
-            ValueError: Memory not found or no fields to update.
+            ValueError: Memory not found, no fields to update, or *p_magnitude* given.
         """
         rec = self._storage.get(memory_id, user=self._user)
         if rec is None:
@@ -2457,6 +2468,15 @@ class Memory:
         event_at: datetime | None = None,
         extra_fields: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        refused = sorted(_WRITER_OWNED_FIELDS & set(extra_fields or {}))
+        if p_magnitude is not None:
+            refused.insert(0, "p_magnitude")
+        if refused:
+            raise ValueError(
+                f"update() cannot set {', '.join(refused)}: P is written only at ingest, "
+                "verdict counts only at validate, the use clock only at touch "
+                "(PDM v1.9 change 3). Save a new memory to state a new pressure."
+            )
         fields: dict[str, Any] = dict(extra_fields or {})
         if text is not None:
             if not text.strip():
@@ -2471,10 +2491,6 @@ class Memory:
         if tags is not None:
             fields["intent_tags"] = tags
             fields["domain"] = infer_domain(tags)
-        if p_magnitude is not None:
-            if not 0.0 <= p_magnitude <= 100.0:
-                raise ValueError("p_magnitude must be between 0 and 100")
-            fields["p_magnitude"] = p_magnitude
         if t_persistence is not None:
             fields["t_persistence"] = t_persistence
         if drawer is not None:
@@ -2507,8 +2523,8 @@ class Memory:
             # Same backfill rule as save(): deadline implies event when unset.
             fields["t_event_at"] = deadline
 
-        if any(key in fields for key in ("p_magnitude", "t_persistence", "phase_privilege")):
-            new_p = fields.get("p_magnitude", rec.p_magnitude)
+        if any(key in fields for key in ("t_persistence", "phase_privilege")):
+            new_p = rec.p_magnitude
             new_t = fields.get("t_persistence", rec.t_persistence)
             new_phase = fields.get("phase_privilege", rec.phase_privilege)
             fields["effective_spike"] = calculate_effective_spike(new_p, new_t, new_phase)

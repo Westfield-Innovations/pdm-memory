@@ -650,13 +650,13 @@ class TestMemoryGetUpdate:
         stored = mem._storage.get(mid, user="test_user")
         assert stored.compressed_fact == "New fact"
 
-    def test_update_pressure_recalculates_spike(self, mem):
+    def test_update_persistence_recalculates_spike_and_keeps_p(self, mem):
         mid = mem.save("Fact", tags=["a", "b", "c"], p_magnitude=40, t_persistence=30)
-        mem.update(mid, p_magnitude=90)
+        before = mem._storage.get(mid, user="test_user").effective_spike
+        mem.update(mid, t_persistence=60)
         stored = mem._storage.get(mid, user="test_user")
-        assert stored.p_magnitude == pytest.approx(90.0)
-        assert stored.effective_spike is not None
-        assert stored.effective_spike > 0
+        assert stored.p_magnitude == pytest.approx(40.0)
+        assert stored.effective_spike > before
 
     def test_update_missing_raises(self, mem):
         with pytest.raises(ValueError, match="not found"):
