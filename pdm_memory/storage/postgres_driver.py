@@ -574,11 +574,14 @@ class PostgresDriver(BaseStorage):
         source: str | None = None,
         due_by: datetime | None = None,
     ) -> builtins.list[SignatureRecord]:
-        sql = (
-            'SELECT * FROM pdm_signatures WHERE "user" = %s AND is_deleted = 0 '
-            "AND direction != '' AND verdict = %s"
-        )
-        params: list[Any] = [user, verdict]
+        sql = 'SELECT * FROM pdm_signatures WHERE "user" = %s AND is_deleted = 0 AND direction != \'\''
+        params: list[Any] = [user]
+        if verdict == "":
+            # A literal, so a prepared (generic) plan still matches the open-claims partial index.
+            sql += " AND verdict = ''"
+        else:
+            sql += " AND verdict = %s"
+            params.append(verdict)
         if source is not None:
             sql += " AND outcome_source = %s"
             params.append(source)
