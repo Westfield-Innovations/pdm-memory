@@ -564,7 +564,7 @@ class PostgresDriver(BaseStorage):
             (user, source, gap_from.isoformat(), gap_to.isoformat()),
         )
         self._commit_if_idle(self._conn())
-        return 0  # no settlement here yet, so no verdict to amend
+        return 0  # Memory.report_coverage_gap amends local verdicts itself
 
     def claims(
         self,

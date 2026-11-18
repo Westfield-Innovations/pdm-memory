@@ -170,7 +170,12 @@ class BaseStorage(ABC):
     def save_coverage_gap(
         self, user: str, source: str, gap_from: datetime, gap_to: datetime
     ) -> int:
-        """Record that *source* did not report from *gap_from* to *gap_to*; returns verdicts amended."""
+        """Record that *source* did not report from *gap_from* to *gap_to*.
+
+        Returns the verdicts the store amended itself: a server that settles its
+        own claims counts them; a local store returns 0 and leaves the amending
+        to :meth:`Memory.report_coverage_gap`.
+        """
         raise NotImplementedError(f"{type(self).__name__} keeps no coverage gaps")
 
     def claims(
