@@ -44,6 +44,7 @@ from pdm_memory.goal_loop.store import (
     JobExistsError,
     JobNotFoundError,
     JobStore,
+    PostgresJobStore,
     SqliteJobStore,
     StaleJobError,
 )
@@ -78,6 +79,7 @@ __all__ = [
     "Notify",
     "Observation",
     "OwnerApproval",
+    "PostgresJobStore",
     "PromiseChangeError",
     "Proof",
     "ProofReceipt",

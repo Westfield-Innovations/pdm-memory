@@ -10,22 +10,34 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from pdm_memory.goal_loop import InMemoryJobStore, JobState, SqliteJobStore, StaleJobError
+from pdm_memory.goal_loop import (
+    InMemoryJobStore,
+    JobState,
+    PostgresJobStore,
+    SqliteJobStore,
+    StaleJobError,
+)
 from pdm_memory.goal_loop.testing import (
     _next,
     _start,
     run_job_store_contract,
     store_contract_checks,
 )
+from tests.ledger_target import PG_URL, postgres_target
 
+needs_pg = pytest.mark.skipif(not PG_URL, reason="PDM_TEST_POSTGRES_URL is not set")
 T0 = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
 
 
-@pytest.fixture(params=["memory", "sqlite"])
+@pytest.fixture(
+    params=["memory", "sqlite", pytest.param("postgres", marks=needs_pg)]
+)
 def factory(request, tmp_path):
     counter = itertools.count()
     if request.param == "memory":
         return InMemoryJobStore
+    if request.param == "postgres":
+        return lambda: PostgresJobStore(postgres_target(f"{tmp_path}/jobs{next(counter)}"))
     return lambda: SqliteJobStore(tmp_path / f"jobs{next(counter)}.db")
 
 
@@ -138,3 +150,24 @@ def test_stores_use_only_the_standard_library():
         "typing",
         "pdm_memory",
     }
+
+
+def test_each_store_takes_only_its_own_target(tmp_path):
+    with pytest.raises(ValueError, match="PostgresJobStore"):
+        SqliteJobStore("postgresql://h/db")
+    with pytest.raises(ValueError, match="postgresql://"):
+        PostgresJobStore(str(tmp_path / "jobs.db"))
+
+
+@needs_pg
+def test_postgres_store_keeps_everything_across_reopen(tmp_path):
+    target = postgres_target(f"{tmp_path}/reopen")
+    store = PostgresJobStore(target)
+    job, first = _start(store)
+    moved, receipt = _next(job, first, JobState.APPROVED)
+    store.commit(moved, [receipt], expected_revision=job.revision)
+    store.close()
+    reopened = PostgresJobStore(target)
+    assert reopened.load("job-1") == moved
+    assert reopened.receipts("job-1") == [first, receipt]
+    reopened.close()

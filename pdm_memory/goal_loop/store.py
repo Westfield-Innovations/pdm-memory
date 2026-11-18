@@ -1,10 +1,10 @@
 """Where jobs live between calls.
 
 ``JobStore`` is the whole contract a storage backend implements, so the AZUS
-app and outside developers can each plug in their own. Two ship here:
-``InMemoryJobStore`` (tests, and the default when no store is configured) and
+app and outside developers can each plug in their own. Three ship here:
+``InMemoryJobStore`` (tests, and the default when no store is configured),
 ``SqliteJobStore`` (stdlib only; a job survives the end of the conversation and
-the end of the process).
+the end of the process) and ``PostgresJobStore`` (the same, shared by hosts).
 
 ``commit`` is the one write. It stores the new job state, its receipts and, when
 given, a new contract history together or not at all, and only if the stored
@@ -15,7 +15,6 @@ against this contract.
 
 from __future__ import annotations
 
-import sqlite3
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Sequence
@@ -24,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from pdm_memory._sqldb import Database, is_postgres
 from pdm_memory.goal_loop import _json
 from pdm_memory.goal_loop.job import Job
 from pdm_memory.goal_loop.receipts import StepReceipt
@@ -34,6 +34,7 @@ __all__ = [
     "JobExistsError",
     "JobNotFoundError",
     "JobStore",
+    "PostgresJobStore",
     "SqliteJobStore",
     "StaleJobError",
 ]
@@ -220,20 +221,13 @@ def _utc_key(value: datetime | None) -> str | None:
     return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")
 
 
-class SqliteJobStore(JobStore):
-    """Durable, stdlib only. WAL with full synchronization, like the Boundary Lock ledger."""
+class _SqlJobStore(JobStore):
+    """The SQL both durable stores share; see ``pdm_memory._sqldb``."""
 
-    def __init__(self, path: str | Path) -> None:
-        if not str(path):
-            raise ValueError("a database path is required")
+    def __init__(self, target: str | Path) -> None:
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(
-            str(path), timeout=30, isolation_level=None, check_same_thread=False
-        )
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=FULL")
-        self._conn.executescript(
+        self._conn = Database.open(target, lock_key="pdm:gl")
+        self._conn.create_schema(
             """
             CREATE TABLE IF NOT EXISTS gl_jobs (
               job_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, active INTEGER NOT NULL,
@@ -250,14 +244,14 @@ class SqliteJobStore(JobStore):
     @contextmanager
     def _transaction(self) -> Iterator[None]:
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.begin()
             try:
                 yield
             except BaseException:
-                self._conn.execute("ROLLBACK")
+                self._conn.rollback()
                 raise
             else:
-                self._conn.execute("COMMIT")
+                self._conn.commit()
 
     def _write_job(self, job: Job, insert: bool) -> None:
         row = (
@@ -365,3 +359,23 @@ class SqliteJobStore(JobStore):
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+
+class SqliteJobStore(_SqlJobStore):
+    """Durable, stdlib only. WAL with full synchronization, like the Boundary Lock ledger."""
+
+    def __init__(self, path: str | Path) -> None:
+        if not str(path):
+            raise ValueError("a database path is required")
+        if is_postgres(path):
+            raise ValueError("a postgresql:// URL belongs to PostgresJobStore")
+        super().__init__(path)
+
+
+class PostgresJobStore(_SqlJobStore):
+    """The same store in Postgres, for jobs shared by several hosts. Needs ``pdm-memory[postgres]``."""
+
+    def __init__(self, dsn: str) -> None:
+        if not is_postgres(dsn):
+            raise ValueError("PostgresJobStore needs a postgresql:// URL")
+        super().__init__(dsn)
