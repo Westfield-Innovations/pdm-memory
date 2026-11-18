@@ -1166,8 +1166,9 @@ class Memory:
         against the due; *report_time* is when the memory learned of it
         (default: now). ``occurred`` at or before the due is on time, inside the
         watch window late, past it outside the claim. ``unknown`` grades
-        nothing. The same observation twice changes nothing. Returns None when
-        the observation changes nothing.
+        nothing. An observation that gives the verdict and outcome the claim
+        already holds changes nothing, its stored times included. Returns None
+        when the observation changes nothing.
 
         Raises:
             ValueError: No such claim, or an observation the claim cannot take.
@@ -1255,8 +1256,8 @@ class Memory:
         The counts move from ``rec.verdict``, so the write lands only while the
         row still holds it. None when another writer changed it first.
         """
-        if (rec.verdict, rec.outcome, rec.event_time) == (verdict, outcome, event_time):
-            return ClaimResult(verdict=verdict, changed=False)
+        if (rec.verdict, rec.outcome) == (verdict, outcome):
+            return ClaimResult(verdict=verdict, changed=False)  # the first report's times stand
         old_correct, old_total = counts_for(rec.direction, rec.verdict)
         new_correct, new_total = counts_for(rec.direction, verdict)
         grade = graded(rec.direction, verdict)

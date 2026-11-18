@@ -141,6 +141,14 @@ def test_the_same_observation_twice_changes_nothing(mem):
     assert _counts(mem, mid) == (1, 1)
 
 
+def test_the_same_observation_at_default_times_changes_nothing(mem):
+    mid = _claim(mem, "absent", PAST_DUE, source="feed")
+    assert mem.validate_claim(mid, "observed_absent") is not None
+    first = _rec(mem, mid).report_time
+    assert mem.validate_claim(mid, "observed_absent") is None
+    assert _rec(mem, mid).report_time == first
+
+
 def test_unknown_grades_nothing(mem):
     mid = _claim(mem, "occurs", LATER, source="feed")
     assert mem.validate_claim(mid, "unknown") is None
