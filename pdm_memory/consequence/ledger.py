@@ -18,6 +18,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from pdm_memory._chain import append_event, verify_events
 from pdm_memory._sqldb import Database, Row
 from pdm_memory.consequence.compare import COMPARATORS, NOT_OBSERVED
 from pdm_memory.consequence.records import (
@@ -62,7 +63,6 @@ from pdm_memory.guarded_effects import (
     ConditionVerdict,
     EffectRequest,
     IdReuseError,
-    LedgerIntegrityError,
     ResourceLimitError,
     _hash,
     _name,
@@ -197,28 +197,9 @@ class ConsequenceLedger:
     def _now(self) -> datetime:
         return require_aware(self._clock(), "clock()")
 
-    # Same chain as GuardedEffects._append.
-    # shortcut: copied hash-chain from GuardedEffects, extract a shared helper when a third ledger appears.
     def _append(self, kind: str, payload: dict[str, Any], expectation_id: str | None = None) -> int:
-        sequence = self._conn.execute(
-            "SELECT COALESCE(MAX(sequence), 0)+1 FROM cl_events"
-        ).fetchone()[0]
-        prev = self._conn.execute(
-            "SELECT event_hash FROM cl_events WHERE owner=? ORDER BY sequence DESC LIMIT 1",
-            (self.owner,),
-        ).fetchone()
-        previous_hash = prev[0] if prev else ""
         payload_json = dumps({**payload, "recorded_at": self._now().isoformat()})
-        body = json.dumps(
-            [sequence, self.owner, expectation_id, kind, payload_json, previous_hash],
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        self._conn.execute(
-            "INSERT INTO cl_events VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (sequence, self.owner, expectation_id, kind, payload_json, previous_hash, _hash(body)),
-        )
-        return sequence
+        return append_event(self._conn, "cl_events", self.owner, expectation_id, kind, payload_json)
 
     # --- expectations -----------------------------------------------------
 
@@ -1156,27 +1137,7 @@ class ConsequenceLedger:
     def verify_history(self) -> bool:
         """Check the retained chain; this cannot detect privileged tail removal."""
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM cl_events WHERE owner=? ORDER BY sequence", (self.owner,)
-            )
-            previous = ""
-            for row in rows:
-                body = json.dumps(
-                    [
-                        row["sequence"],
-                        self.owner,
-                        row["expectation_id"],
-                        row["kind"],
-                        row["payload_json"],
-                        row["previous_hash"],
-                    ],
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-                if row["previous_hash"] != previous or _hash(body) != row["event_hash"]:
-                    raise LedgerIntegrityError("retained consequence history chain is inconsistent")
-                previous = row["event_hash"]
-        return True
+            return verify_events(self._conn, "cl_events", self.owner, "consequence")
 
 
 # --- grading ---------------------------------------------------------------

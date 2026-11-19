@@ -18,7 +18,6 @@ retention; they are never silently decayed like ordinary memories.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import threading
@@ -30,6 +29,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from pdm_memory._chain import _hash, append_event, verify_events
 from pdm_memory._errors import ConfigurationError, LedgerIntegrityError
 from pdm_memory._sqldb import Database, Row
 
@@ -177,10 +177,6 @@ def _json(value: Any, limit: int) -> str:
     if len(encoded.encode("utf-8")) > limit:
         raise ResourceLimitError(f"JSON exceeds the {limit}-byte bound")
     return encoded
-
-
-def _hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _openings_hash(openings: Mapping[tuple[str, str], Opening]) -> str:
@@ -422,29 +418,12 @@ class GuardedEffects:
         self.close()
 
     def _append(self, kind: str, payload: dict[str, Any], action_id: str | None = None) -> int:
-        sequence = self._conn.execute(
-            "SELECT COALESCE(MAX(sequence), 0)+1 FROM ge_events"
-        ).fetchone()[0]
-        prev = self._conn.execute(
-            "SELECT event_hash FROM ge_events WHERE owner=? ORDER BY sequence DESC LIMIT 1",
-            (self.owner,),
-        ).fetchone()
-        previous_hash = prev[0] if prev else ""
         # Payload sizes are bounded at their individual input boundaries.
         payload = {**payload, "recorded_at": datetime.now(timezone.utc).isoformat()}
         payload_json = json.dumps(
             payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
         )
-        body = json.dumps(
-            [sequence, self.owner, action_id, kind, payload_json, previous_hash],
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        self._conn.execute(
-            "INSERT INTO ge_events VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (sequence, self.owner, action_id, kind, payload_json, previous_hash, _hash(body)),
-        )
-        return sequence
+        return append_event(self._conn, "ge_events", self.owner, action_id, kind, payload_json)
 
     def start_branch(self, branch_id: str) -> None:
         """Start the initial branch; a retired name can never be reactivated."""
@@ -1067,24 +1046,4 @@ class GuardedEffects:
     def verify_history(self) -> bool:
         """Check the retained chain; this cannot detect privileged tail removal."""
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM ge_events WHERE owner=? ORDER BY sequence", (self.owner,)
-            )
-            previous = ""
-            for row in rows:
-                body = json.dumps(
-                    [
-                        row["sequence"],
-                        self.owner,
-                        row["action_id"],
-                        row["kind"],
-                        row["payload_json"],
-                        row["previous_hash"],
-                    ],
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-                if row["previous_hash"] != previous or _hash(body) != row["event_hash"]:
-                    raise LedgerIntegrityError("retained guard history chain is inconsistent")
-                previous = row["event_hash"]
-            return True
+            return verify_events(self._conn, "ge_events", self.owner, "guard")
