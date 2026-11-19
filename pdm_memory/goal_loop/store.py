@@ -226,7 +226,7 @@ class _SqlJobStore(JobStore):
 
     def __init__(self, target: str | Path) -> None:
         self._lock = threading.RLock()
-        self._conn = Database.open(target, lock_key="pdm:gl")
+        self._conn = Database(target, lock_key="pdm:gl")
         self._conn.create_schema(
             """
             CREATE TABLE IF NOT EXISTS gl_jobs (

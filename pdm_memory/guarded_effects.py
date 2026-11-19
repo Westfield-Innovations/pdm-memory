@@ -30,6 +30,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from pdm_memory._errors import ConfigurationError, LedgerIntegrityError
 from pdm_memory._sqldb import Database, Row
 
 __all__ = [
@@ -63,16 +64,8 @@ class BranchError(ValueError):
     """A branch is absent, retired, or would replace current work implicitly."""
 
 
-class ConfigurationError(ValueError):
-    """An owner configuration needs explicit replacement or was superseded."""
-
-
 class ResourceLimitError(ValueError):
     """A declared input, queue or state bound was exceeded."""
-
-
-class LedgerIntegrityError(RuntimeError):
-    """Stored data does not match its captured content or history chain."""
 
 
 @dataclass(frozen=True)
@@ -278,7 +271,7 @@ class GuardedEffects:
         self._openings_hash = _openings_hash(self._openings)
         self._lock = threading.RLock()
         self._in_flight: set[str] = set()
-        self._conn = Database.open(path, lock_key="pdm:ge")
+        self._conn = Database(path, lock_key="pdm:ge")
         self._conn.create_schema(
             """
         CREATE TABLE IF NOT EXISTS ge_owners (

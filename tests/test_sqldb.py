@@ -27,7 +27,7 @@ def target(request, tmp_path):
 
 @pytest.fixture
 def db(target):
-    d = Database.open(target, lock_key="test")
+    d = Database(target, lock_key="test")
     d.create_schema(SCHEMA)
     yield d
     d.close()
@@ -110,7 +110,7 @@ def test_columns_lists_a_tables_columns(db):
 
 
 def _writer(target, worker, rounds):
-    d = Database.open(target, lock_key="test")
+    d = Database(target, lock_key="test")
     out = []
     for _ in range(rounds):
         d.begin()
@@ -124,7 +124,7 @@ def _writer(target, worker, rounds):
 
 
 def _opener(target):
-    d = Database.open(target, lock_key="test")
+    d = Database(target, lock_key="test")
     d.create_schema(SCHEMA + EVENTS, append_only={"events": "append-only"}, ordered=("t",))
     d.close()
     return True
@@ -143,7 +143,7 @@ def test_writers_are_serialized(db, target):
 def test_two_processes_create_the_schema_at_once(target):
     with _pool() as pool:
         assert pool.map(_opener, [target] * 4) == [True] * 4
-    d = Database.open(target, lock_key="test")
+    d = Database(target, lock_key="test")
     assert d.columns("events") == {"n", "kind"}
     d.close()
 
@@ -154,7 +154,7 @@ def test_two_processes_create_the_schema_at_once(target):
 def test_a_dropped_connection_loses_no_committed_record(pg_target):
     import psycopg
 
-    d = Database.open(pg_target, lock_key="test")
+    d = Database(pg_target, lock_key="test")
     d.create_schema(SCHEMA)
     d.execute("INSERT INTO t VALUES ('kept', 1)")
     d.begin()
@@ -164,7 +164,7 @@ def test_a_dropped_connection_loses_no_committed_record(pg_target):
         admin.execute("SELECT pg_terminate_backend(%s)", (pid,))
     with pytest.raises(psycopg.OperationalError):
         d.commit()
-    again = Database.open(pg_target, lock_key="test")
+    again = Database(pg_target, lock_key="test")
     assert [r[0] for r in again.execute("SELECT a FROM t")] == ["kept"]
     again.close()
 
@@ -181,7 +181,7 @@ def test_a_server_without_fsync_is_refused(pg_target, monkeypatch):
 
     monkeypatch.setattr(psycopg.Connection, "execute", fake)
     with pytest.raises(ConfigurationError, match="fsync=off"):
-        Database.open(pg_target, lock_key="test")
+        Database(pg_target, lock_key="test")
 
 
 @needs_pg
@@ -189,18 +189,18 @@ def test_an_unreachable_server_fails_at_open():
     import psycopg
 
     with pytest.raises(psycopg.OperationalError):
-        Database.open("postgresql://nobody@127.0.0.1:1/x?connect_timeout=2", lock_key="t")
+        Database("postgresql://nobody@127.0.0.1:1/x?connect_timeout=2", lock_key="t")
 
 
 def test_postgres_without_psycopg_names_the_extra(monkeypatch):
     monkeypatch.setitem(sys.modules, "psycopg", None)
     with pytest.raises(ImportError, match=r"pdm-memory\[postgres\]"):
-        Database.open("postgresql://h/db", lock_key="t")
+        Database("postgresql://h/db", lock_key="t")
 
 
 def test_sqlite_never_needs_psycopg(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "psycopg", None)
-    d = Database.open(tmp_path / "a.db", lock_key="t")
+    d = Database(tmp_path / "a.db", lock_key="t")
     d.create_schema(SCHEMA)
     assert d.dialect == "sqlite"
     d.close()
@@ -210,8 +210,8 @@ def test_ledgers_in_different_schemas_do_not_share_a_writer_lock(pg_target, tmp_
     import threading
 
     other = postgres_target(f"{tmp_path}-other-{uuid.uuid4().hex}")
-    a = Database.open(pg_target, lock_key="test")
-    b = Database.open(other, lock_key="test")
+    a = Database(pg_target, lock_key="test")
+    b = Database(other, lock_key="test")
     a.begin()
     done = []
     thread = threading.Thread(target=lambda: (b.begin(), b.commit(), done.append(True)), daemon=True)
@@ -228,8 +228,8 @@ def test_ledgers_in_different_schemas_do_not_share_a_writer_lock(pg_target, tmp_
 def test_a_wait_for_the_writer_lock_is_bounded_like_sqlites(pg_target):
     import psycopg
 
-    holder = Database.open(pg_target, lock_key="test")
-    waiter = Database.open(pg_target, lock_key="test")
+    holder = Database(pg_target, lock_key="test")
+    waiter = Database(pg_target, lock_key="test")
     assert waiter.execute("SHOW lock_timeout").fetchone()[0] == "30s"
     waiter.execute("SET lock_timeout TO '1s'")  # the same bound, shortened for the test
     holder.begin()
@@ -239,3 +239,28 @@ def test_a_wait_for_the_writer_lock_is_bounded_like_sqlites(pg_target):
     holder.commit()
     holder.close()
     waiter.close()
+
+
+def test_a_question_mark_inside_a_sql_literal_is_refused(db):
+    with pytest.raises(ValueError, match="quoted SQL literal"):
+        db.execute("SELECT a FROM t WHERE a='why?'")
+    with pytest.raises(ValueError, match="quoted SQL literal"):
+        db.execute("SELECT a FROM t WHERE a='it''s ?'")
+    # Outside quotes it is a parameter; quotes and percent signs alone are fine.
+    assert db.execute("SELECT 'it''s 100%' FROM t WHERE a=?", ("x",)).fetchall() == []
+
+
+@pytest.mark.parametrize("name", ["t; DROP TABLE t", "T", "1t", "", "t-x", None])
+def test_only_plain_identifiers_reach_ddl(db, name):
+    with pytest.raises(ValueError, match="identifier"):
+        db.columns(name)
+    with pytest.raises(ValueError, match="identifier"):
+        db.create_schema(SCHEMA, ordered=(name,))
+    with pytest.raises(ValueError, match="identifier"):
+        db.create_schema(SCHEMA, append_only={name: "append-only"})
+
+
+@pytest.mark.parametrize("message", ["it's", "", "line\nbreak", None])
+def test_a_trigger_message_cannot_break_out_of_its_quotes(db, message):
+    with pytest.raises(ValueError, match="trigger message"):
+        db.create_schema(EVENTS, append_only={"events": message})

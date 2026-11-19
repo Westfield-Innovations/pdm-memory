@@ -13,8 +13,11 @@ import re
 import sqlite3
 import time
 from collections.abc import Mapping, Sequence
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
+
+from pdm_memory._errors import ConfigurationError
 
 __all__ = ["Database", "Row", "is_postgres"]
 
@@ -74,6 +77,36 @@ def _wal(conn: sqlite3.Connection) -> None:
             time.sleep(0.05)
 
 
+_IDENT = re.compile(r"[a-z_][a-z0-9_]*\Z")
+_LITERAL = re.compile(r"'(?:[^']|'')*'")
+
+
+def _ident(name: str) -> str:
+    """A table or trigger name written into SQL: plain lowercase identifiers only."""
+    if not isinstance(name, str) or not _IDENT.match(name):
+        raise ValueError(f"{name!r} is not a plain SQL identifier")
+    return name
+
+
+def _message(text: str) -> str:
+    if not isinstance(text, str) or not text or "'" in text or not text.isprintable():
+        raise ValueError(f"{text!r} cannot be a trigger message")
+    return text
+
+
+@lru_cache(maxsize=1024)
+def _checked(sql: str) -> str:
+    """Refuse SQL the Postgres translation would misread, on both backends alike."""
+    if any("?" in literal for literal in _LITERAL.findall(sql)):
+        raise ValueError("a ? inside a quoted SQL literal reads as a parameter; pass it as one")
+    return sql
+
+
+@lru_cache(maxsize=1024)
+def _to_postgres(sql: str) -> str:
+    return _checked(sql).replace("%", "%%").replace("?", "%s")
+
+
 _APPEND_ONLY_FN = """
 CREATE OR REPLACE FUNCTION pdm_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN RAISE EXCEPTION '%', TG_ARGV[0]; END $$;
@@ -86,33 +119,26 @@ class Database:
     dialect: Literal["sqlite", "postgres"]
     Error: type[Exception]
 
-    def __init__(self) -> None:
-        raise TypeError("use Database.open")
-
-    @classmethod
-    def open(cls, target: str | Path, *, lock_key: str) -> Database:
-        db = object.__new__(cls)
-        db._lock_id = _lock_id(lock_key)
+    def __init__(self, target: str | Path, *, lock_key: str) -> None:
+        self._lock_id = _lock_id(lock_key)
         if not is_postgres(target):
-            db.dialect, db.Error = "sqlite", sqlite3.DatabaseError
+            self.dialect, self.Error = "sqlite", sqlite3.DatabaseError
             conn = sqlite3.connect(
                 str(target), timeout=30, isolation_level=None, check_same_thread=False
             )
             conn.row_factory = _sqlite_row
             _wal(conn)
             conn.execute("PRAGMA synchronous=FULL")
-            db._conn = conn
-            return db
+            self._conn: Any = conn
+            return
         try:
             import psycopg
         except ImportError:
             raise ImportError("install pdm-memory[postgres] for a postgresql:// target") from None
-        db.dialect, db.Error = "postgres", psycopg.Error
+        self.dialect, self.Error = "postgres", psycopg.Error
         conn = psycopg.connect(target, autocommit=True, row_factory=_pg_row)
         try:
             if conn.execute("SHOW fsync").fetchone()[0] == "off":
-                from pdm_memory.guarded_effects import ConfigurationError
-
                 raise ConfigurationError(
                     "the Postgres server runs with fsync=off; ledger writes would not be durable"
                 )
@@ -121,22 +147,18 @@ class Database:
             # schema plays the file, and a wait past 30 s raises instead of hanging.
             conn.execute("SET lock_timeout TO '30s'")
             schema = conn.execute("SELECT current_schema()").fetchone()[0]
-            db._lock_id = _lock_id(f"{lock_key}:{schema}")
+            self._lock_id = _lock_id(f"{lock_key}:{schema}")
         except BaseException:
             conn.close()
             raise
-        db._conn = conn
-        return db
-
-    def _sql(self, sql: str) -> str:
-        return sql if self.dialect == "sqlite" else sql.replace("%", "%%").replace("?", "%s")
+        self._conn = conn
 
     def execute(self, sql: str, params: Sequence[Any] = ()) -> Any:
         if self.dialect == "sqlite":
-            return self._conn.execute(sql, params)
+            return self._conn.execute(_checked(sql), params)
         # Postgres keeps bool and integer apart; SQLite stores a bool as 0 or 1.
         values = [int(p) if type(p) is bool else p for p in params]
-        return self._conn.execute(self._sql(sql), values)
+        return self._conn.execute(_to_postgres(sql), values)
 
     def begin(self) -> None:
         if self.dialect == "sqlite":
@@ -169,7 +191,8 @@ class Database:
 
         *ordered* tables are read back ``ORDER BY rowid``; Postgres gets that column last.
         """
-        append_only = append_only or {}
+        append_only = {_ident(t): _message(m) for t, m in (append_only or {}).items()}
+        ordered = [_ident(t) for t in ordered]
         if self.dialect == "sqlite":
             triggers = "".join(
                 f"CREATE TRIGGER IF NOT EXISTS {t}_no_{op} BEFORE {op.upper()} ON {t}"
@@ -207,6 +230,7 @@ class Database:
             raise
 
     def columns(self, table: str) -> set[str]:
+        _ident(table)
         if self.dialect == "sqlite":
             return {r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})")}
         rows = self._conn.execute(

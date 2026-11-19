@@ -160,7 +160,7 @@ class ConsequenceLedger:
         self._clock = clock
         self._limit = policy.limits.max_payload_bytes
         self._lock = threading.RLock()
-        self._conn = Database.open(path, lock_key="pdm:cl")
+        self._conn = Database(path, lock_key="pdm:cl")
         self._conn.create_schema(
             _SCHEMA,
             append_only={"cl_events": "consequence history is append-only"},
