@@ -9,7 +9,7 @@ import uuid
 
 import pytest
 
-from pdm_memory._sqldb import Database, Row, is_postgres
+from pdm_memory._ledger.db import Database, Row, is_postgres
 from pdm_memory.guarded_effects import ConfigurationError
 from tests.ledger_target import PG_URL, postgres_target
 

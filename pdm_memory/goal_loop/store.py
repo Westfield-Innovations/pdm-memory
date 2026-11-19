@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from pdm_memory._sqldb import Database, is_postgres
+from pdm_memory._ledger.db import Database, is_postgres
 from pdm_memory.goal_loop import _json
 from pdm_memory.goal_loop.job import Job
 from pdm_memory.goal_loop.receipts import StepReceipt
@@ -237,7 +237,7 @@ _GL_MIGRATIONS = (lambda db: db.create_tables(_GL_SCHEMA),)
 
 
 class _SqlJobStore(JobStore):
-    """The SQL both durable stores share; see ``pdm_memory._sqldb``."""
+    """The SQL both durable stores share; see ``pdm_memory._ledger.db``."""
 
     def __init__(self, target: str | Path) -> None:
         self._lock = threading.RLock()

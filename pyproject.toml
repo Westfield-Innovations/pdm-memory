@@ -86,9 +86,7 @@ addopts = "-v --tb=short"
 [tool.mypy]
 # Type-checked in CI: the ledgers' storage layer and the consequence module.
 files = [
-    "pdm_memory/_sqldb.py",
-    "pdm_memory/_chain.py",
-    "pdm_memory/_errors.py",
+    "pdm_memory/_ledger",
     "pdm_memory/consequence",
 ]
 python_version = "3.10"

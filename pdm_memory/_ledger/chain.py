@@ -11,8 +11,8 @@ from __future__ import annotations
 import hashlib
 import json
 
-from pdm_memory._errors import LedgerIntegrityError
-from pdm_memory._sqldb import Database, _ident
+from pdm_memory._ledger.db import Database, _ident
+from pdm_memory._ledger.errors import LedgerIntegrityError
 
 __all__ = ["append_event", "verify_events"]
 

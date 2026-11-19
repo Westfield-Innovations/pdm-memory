@@ -17,7 +17,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
 
-from pdm_memory._errors import ConfigurationError
+from pdm_memory._ledger.errors import ConfigurationError
 
 __all__ = ["Database", "Row", "is_postgres"]
 
