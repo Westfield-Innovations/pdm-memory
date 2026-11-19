@@ -36,8 +36,12 @@ IN_BAND = replace(TEMP, value=21.0)
 
 
 def _open(tmp_path, name="c.db", **policy_changes):
-    led = ConsequenceLedger(ledger_target(tmp_path, name), owner="owner-1", policy=_policy(**policy_changes),
-                            clock=lambda: COMMIT)
+    led = ConsequenceLedger(
+        ledger_target(tmp_path, name),
+        owner="owner-1",
+        policy=_policy(**policy_changes),
+        clock=lambda: COMMIT,
+    )
     led.prepare(VALVE)
     return led
 
@@ -47,13 +51,25 @@ def _ev(ledger):
 
 
 def _entry(n, account, path=None, unit="s"):
-    return ConsequenceEntry(f"e-{n}", "exp-valve-1", account, "room 4", Decimal(1), unit, END,
-                            "controller-log", QuantityStatus.MEASURED, path)
+    return ConsequenceEntry(
+        f"e-{n}",
+        "exp-valve-1",
+        account,
+        "room 4",
+        Decimal(1),
+        unit,
+        END,
+        "controller-log",
+        QuantityStatus.MEASURED,
+        path,
+    )
 
 
 def test_before_any_evaluation(tmp_path):
     with _open(tmp_path) as led:
-        assert led.significance("exp-valve-1") == Significance("exp-valve-1", 0, None, 0, (), False)
+        assert led.significance("exp-valve-1") == Significance(
+            "exp-valve-1", 0, None, 0, (), False
+        )
         with pytest.raises(KeyError):
             led.significance("exp-unknown")
 
@@ -89,9 +105,17 @@ def test_reach_lists_the_recorded_influence_paths(tmp_path):
             path = InfluencePath("observed", scope, (f"obs-{n}",))
             led.record_consequence(_entry(n, Account.COUPLED_EFFECT, path))
         led.record_consequence(
-            _entry(9, Account.TASK_RESULT, InfluencePath("declared", "tenant", ("contract",)))
+            _entry(
+                9,
+                Account.TASK_RESULT,
+                InfluencePath("declared", "tenant", ("contract",)),
+            )
         )
-        assert led.significance("exp-valve-1").reach == ("boiler loop", "tenant", "zone B")
+        assert led.significance("exp-valve-1").reach == (
+            "boiler loop",
+            "tenant",
+            "zone B",
+        )
 
 
 @pytest.mark.parametrize(
@@ -107,7 +131,9 @@ def test_reach_lists_the_recorded_influence_paths(tmp_path):
 def test_interruption_needs_the_owners_threshold_and_an_open_result(
     tmp_path, priority, threshold, settle, expected
 ):
-    with _open(tmp_path, priorities={TASK.task_id: priority}, interruption_priority=threshold) as led:
+    with _open(
+        tmp_path, priorities={TASK.task_id: priority}, interruption_priority=threshold
+    ) as led:
         if settle:
             led.observe(POSITION_MOVED)
             led.observe(IN_BAND)
@@ -124,8 +150,13 @@ def test_priority_never_changes_a_response_or_the_review_limits(tmp_path):
     limits = replace(LIMITS, max_repeats=1)
     runs = []
     for name, rank in (("low.db", 0), ("high.db", 99)):
-        with _open(tmp_path, name, limits=limits, priorities={TASK.task_id: rank},
-                   interruption_priority=1) as led:
+        with _open(
+            tmp_path,
+            name,
+            limits=limits,
+            priorities={TASK.task_id: rank},
+            interruption_priority=1,
+        ) as led:
             first = _ev(led)
             statuses = [p.status for p in led.suggest_observation("exp-valve-1")]
             led.observe(POSITION_MOVED)
@@ -156,13 +187,19 @@ def test_without_an_ordering_accounts_keep_recording_order(tmp_path):
         led.record_consequence(_entry(1, Account.AGENT_OPERATION))
         led.record_consequence(_entry(2, Account.PRINCIPAL_BURDEN, unit="interruption"))
         s = led.accounts("exp-valve-1")
-    assert [a for a, _, _ in s.totals] == [Account.AGENT_OPERATION, Account.PRINCIPAL_BURDEN]
+    assert [a for a, _, _ in s.totals] == [
+        Account.AGENT_OPERATION,
+        Account.PRINCIPAL_BURDEN,
+    ]
     assert s.priority_ordering == ()
 
 
 def test_an_ordering_does_not_replace_an_exchange_rule(tmp_path):
-    with _open(tmp_path, priority_ordering=(Account.AGENT_OPERATION,),
-               exchange_rules={"s": Decimal(2)}) as led:
+    with _open(
+        tmp_path,
+        priority_ordering=(Account.AGENT_OPERATION,),
+        exchange_rules={"s": Decimal(2)},
+    ) as led:
         led.record_consequence(_entry(1, Account.AGENT_OPERATION))
         assert led.accounts("exp-valve-1").combined == Decimal(2)
 
@@ -196,7 +233,9 @@ def test_the_owners_priorities_cannot_be_edited_in_place():
     assert policy.priority(TASK.task_id) == 1
     with pytest.raises(TypeError):
         policy.priorities[TASK.task_id] = 50
-    assert _policy(priority_ordering=["TASK_RESULT"]).priority_ordering == (Account.TASK_RESULT,)
+    assert _policy(priority_ordering=["TASK_RESULT"]).priority_ordering == (
+        Account.TASK_RESULT,
+    )
 
 
 def test_significance_reads_only_its_own_expectation(tmp_path):
@@ -205,7 +244,9 @@ def test_significance_reads_only_its_own_expectation(tmp_path):
         led.prepare(other)
         led.evaluate("exp-2", task=TASK)
         path = InfluencePath("observed", "zone B", ("obs-1",))
-        led.record_consequence(replace(_entry(1, Account.COUPLED_EFFECT, path), expectation_id="exp-2"))
+        led.record_consequence(
+            replace(_entry(1, Account.COUPLED_EFFECT, path), expectation_id="exp-2")
+        )
         sig = led.significance("exp-valve-1")
     assert (sig.response, sig.persistence, sig.reach) == (None, 0, ())
 

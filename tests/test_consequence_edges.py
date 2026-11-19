@@ -38,8 +38,14 @@ from tests.consequence_fixtures import (
 )
 from tests.ledger_target import ledger_target
 
-SUPPLY = replace(TEMP, observation_id="obs-supply", source="supply-gauge", observable="supply_bar",
-                 unit="bar", value=0.4)
+SUPPLY = replace(
+    TEMP,
+    observation_id="obs-supply",
+    source="supply-gauge",
+    observable="supply_bar",
+    unit="bar",
+    value=0.4,
+)
 CITED = (CauseHypothesis(Cause.EXECUTION, ("obs-supply",)),)
 
 
@@ -48,8 +54,12 @@ def make(tmp_path):
     made = []
 
     def build(policy=POLICY, name=None):
-        led = ConsequenceLedger(ledger_target(tmp_path, name or f"c{len(made)}.db"), owner="owner-1",
-                                policy=policy, clock=lambda: COMMIT)
+        led = ConsequenceLedger(
+            ledger_target(tmp_path, name or f"c{len(made)}.db"),
+            owner="owner-1",
+            policy=policy,
+            clock=lambda: COMMIT,
+        )
         made.append(led)
         return led
 
@@ -95,22 +105,57 @@ def test_an_unknown_criterion_is_a_key_error(ledger):
 
 def test_a_silence_is_timed_by_the_window_it_covers(ledger):
     ledger.prepare(VALVE)
-    ledger.observe(replace(POSITION_MOVED, value=None, coverage=(COMMIT - DAY, END + HOUR)))
+    ledger.observe(
+        replace(POSITION_MOVED, value=None, coverage=(COMMIT - DAY, END + HOUR))
+    )
     f = ledger.evaluate("exp-valve-1", task=TASK).finding("moved")
-    assert (f.ordering, f.comparison) == (Ordering.PROSPECTIVE, Comparison.CONFIRMED_MISS)
+    assert (f.ordering, f.comparison) == (
+        Ordering.PROSPECTIVE,
+        Comparison.CONFIRMED_MISS,
+    )
 
 
 def test_an_expected_absence_is_confirmed_by_a_covered_silence(ledger, tmp_path):
-    absent = Criterion("no_leak", "leak_alarm", Stage.TASK_EFFECT, ("categorical", "1"), "state",
-                       ["absent"])
-    policy = replace(POLICY, sources=(*POLICY.sources, replace(POLICY.sources[0], name="alarm-panel",
-                                                               observables=frozenset({"leak_alarm"}))))
-    led = ConsequenceLedger(ledger_target(tmp_path, "abs.db"),
-                            owner="o", policy=policy, clock=lambda: COMMIT)
+    absent = Criterion(
+        "no_leak",
+        "leak_alarm",
+        Stage.TASK_EFFECT,
+        ("categorical", "1"),
+        "state",
+        ["absent"],
+    )
+    policy = replace(
+        POLICY,
+        sources=(
+            *POLICY.sources,
+            replace(
+                POLICY.sources[0],
+                name="alarm-panel",
+                observables=frozenset({"leak_alarm"}),
+            ),
+        ),
+    )
+    led = ConsequenceLedger(
+        ledger_target(tmp_path, "abs.db"),
+        owner="o",
+        policy=policy,
+        clock=lambda: COMMIT,
+    )
     led.prepare(replace(VALVE, criteria=(absent,)))
-    led.observe(replace(POSITION_MOVED, observation_id="obs-alarm", source="alarm-panel",
-                        observable="leak_alarm", value=None, coverage=(START, END)))
-    assert led.evaluate("exp-valve-1", task=TASK).finding("no_leak").comparison is Comparison.CONFIRMED_MATCH
+    led.observe(
+        replace(
+            POSITION_MOVED,
+            observation_id="obs-alarm",
+            source="alarm-panel",
+            observable="leak_alarm",
+            value=None,
+            coverage=(START, END),
+        )
+    )
+    assert (
+        led.evaluate("exp-valve-1", task=TASK).finding("no_leak").comparison
+        is Comparison.CONFIRMED_MATCH
+    )
     led.close()
 
 
@@ -128,7 +173,9 @@ def test_a_cause_needs_admissible_independent_support(ledger, change):
     ledger.prepare(VALVE)
     ledger.observe(replace(TEMP, value=25.0))
     ledger.observe(replace(SUPPLY, **change))
-    assert not ledger.evaluate("exp-valve-1", task=TASK, causes=CITED).attribution_supported
+    assert not ledger.evaluate(
+        "exp-valve-1", task=TASK, causes=CITED
+    ).attribution_supported
 
 
 def test_admissible_support_is_supported(ledger):
@@ -141,7 +188,9 @@ def test_past_the_deadline_an_open_request_reads_too_late(ledger):
     ledger.evaluate("exp-valve-1", task=TASK)
     (p,) = ledger.suggest_observation("exp-valve-1", now=COMMIT)
     assert p.status == "OPEN"
-    (late,) = ledger.suggest_observation("exp-valve-1", now=HORIZON.latest_decision_point + DAY)
+    (late,) = ledger.suggest_observation(
+        "exp-valve-1", now=HORIZON.latest_decision_point + DAY
+    )
     assert (late.proposal_id, late.status) == (p.proposal_id, "TOO_LATE")
     kinds = [e["kind"] for e in ledger.history("exp-valve-1")]
     assert kinds[-1] == "OBSERVATION_PROPOSAL_CLOSED"
@@ -151,10 +200,21 @@ def test_a_dead_request_does_not_block_a_live_one(make):
     ledger = make(replace(POLICY, limits=replace(LIMITS, max_outstanding=1)))
     ledger.prepare(replace(VALVE, criteria=(ROOM_TEMP,)))
     ledger.suggest_observation("exp-valve-1", now=COMMIT)
-    later = replace(HORIZON, window_start=COMMIT + DAY, window_end=COMMIT + DAY + HOUR,
-                    latest_decision_point=COMMIT + 2 * DAY)
-    ledger.prepare(replace(VALVE, expectation_id="exp-2", action_id=None, criteria=(ROOM_TEMP,),
-                           horizon=later))
+    later = replace(
+        HORIZON,
+        window_start=COMMIT + DAY,
+        window_end=COMMIT + DAY + HOUR,
+        latest_decision_point=COMMIT + 2 * DAY,
+    )
+    ledger.prepare(
+        replace(
+            VALVE,
+            expectation_id="exp-2",
+            action_id=None,
+            criteria=(ROOM_TEMP,),
+            horizon=later,
+        )
+    )
     (p,) = ledger.suggest_observation("exp-2", now=COMMIT + DAY)
     assert p.status == "OPEN"
 
@@ -163,8 +223,12 @@ def test_an_older_uncertain_update_still_blocks(ledger):
     ev = _supported_miss(ledger)
     first = _propose(ledger, ev, change={"bias_c": -1.0})
     second = _propose(ledger, ev, change={"bias_c": -2.0})
-    ledger.record_update_receipt(first.update_id, admission=Admission.ACCEPTED, controller_ref="c")
-    ledger.record_update_receipt(second.update_id, admission=Admission.REJECTED, controller_ref="c")
+    ledger.record_update_receipt(
+        first.update_id, admission=Admission.ACCEPTED, controller_ref="c"
+    )
+    ledger.record_update_receipt(
+        second.update_id, admission=Admission.REJECTED, controller_ref="c"
+    )
     with pytest.raises(ReconcileFirst, match=first.update_id):
         _propose(ledger, ev, change={"bias_c": -3.0})
 
@@ -200,7 +264,11 @@ def test_evidence_is_read_under_the_write_lock(ledger):
 def test_empty_accounts_say_so(ledger):
     ledger.prepare(VALVE)
     s = ledger.accounts("exp-valve-1")
-    assert (s.totals, s.combined, s.combined_reason) == ({}, None, "no consequences recorded")
+    assert (s.totals, s.combined, s.combined_reason) == (
+        {},
+        None,
+        "no consequences recorded",
+    )
 
 
 def test_a_new_policy_version_makes_a_new_revision(make, tmp_path):
@@ -218,14 +286,30 @@ def test_an_unrelated_reading_changes_nothing(ledger):
     ledger.prepare(VALVE)
     ledger.observe(replace(TEMP, value=21.0))
     a = ledger.evaluate("exp-valve-1", task=TASK)
-    ledger.observe(replace(TEMP, observation_id="obs-other", observable="humidity", unit="pct", value=40))
-    ledger.observe(replace(TEMP, observation_id="obs-late", value=21.0, event_time=END + DAY))
+    ledger.observe(
+        replace(
+            TEMP,
+            observation_id="obs-other",
+            observable="humidity",
+            unit="pct",
+            value=40,
+        )
+    )
+    ledger.observe(
+        replace(TEMP, observation_id="obs-late", value=21.0, event_time=END + DAY)
+    )
     assert ledger.evaluate("exp-valve-1", task=TASK) == a
 
 
 def test_owners_sharing_a_file_are_isolated(tmp_path):
-    with ConsequenceLedger(ledger_target(tmp_path, "s.db"), owner="a", policy=POLICY) as a, \
-            ConsequenceLedger(ledger_target(tmp_path, "s.db"), owner="b", policy=POLICY) as b:
+    with (
+        ConsequenceLedger(
+            ledger_target(tmp_path, "s.db"), owner="a", policy=POLICY
+        ) as a,
+        ConsequenceLedger(
+            ledger_target(tmp_path, "s.db"), owner="b", policy=POLICY
+        ) as b,
+    ):
         a.prepare(VALVE)
         with pytest.raises(KeyError):
             b.expectation("exp-valve-1")
@@ -239,8 +323,13 @@ def test_a_tampered_event_is_detected(ledger):
     ledger.prepare(VALVE)
     ledger.observe(replace(TEMP, value=21.0))
     conn = ledger._conn
-    conn.execute("DROP TRIGGER cl_events_no_update" + (" ON cl_events" if conn.dialect == "postgres" else ""))
-    conn.execute("UPDATE cl_events SET payload_json = replace(payload_json, '21.0', '25.0')")
+    conn.execute(
+        "DROP TRIGGER cl_events_no_update"
+        + (" ON cl_events" if conn.dialect == "postgres" else "")
+    )
+    conn.execute(
+        "UPDATE cl_events SET payload_json = replace(payload_json, '21.0', '25.0')"
+    )
     with pytest.raises(LedgerIntegrityError):
         ledger.verify_history()
 
@@ -260,7 +349,10 @@ def test_threads_evaluating_together_write_one_revision(ledger):
     def run():
         try:
             results.append(ledger.evaluate("exp-valve-1", task=TASK).evaluation_id)
-        except (ledger._conn.Error, ValueError) as exc:  # pragma: no cover - reported below
+        except (
+            ledger._conn.Error,
+            ValueError,
+        ) as exc:  # pragma: no cover - reported below
             errors.append(exc)
 
     threads = [threading.Thread(target=run) for _ in range(8)]
@@ -279,8 +371,17 @@ def test_unicode_ids_round_trip(ledger):
 
 
 def test_an_exact_comparator(ledger):
-    exact = Criterion("mode", "valve_position", Stage.ACTUATOR_CONFIRMATION, ("exact", "1"),
-                      "state", "moved")
+    exact = Criterion(
+        "mode",
+        "valve_position",
+        Stage.ACTUATOR_CONFIRMATION,
+        ("exact", "1"),
+        "state",
+        "moved",
+    )
     ledger.prepare(replace(VALVE, criteria=(exact,)))
     ledger.observe(POSITION_MOVED)
-    assert ledger.evaluate("exp-valve-1", task=TASK).finding("mode").comparison is Comparison.CONFIRMED_MATCH
+    assert (
+        ledger.evaluate("exp-valve-1", task=TASK).finding("mode").comparison
+        is Comparison.CONFIRMED_MATCH
+    )

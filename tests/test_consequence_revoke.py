@@ -36,8 +36,14 @@ from tests.consequence_fixtures import (
 )
 from tests.ledger_target import ledger_target, sqlite_only
 
-SUPPLY = replace(TEMP, observation_id="obs-supply", source="supply-gauge", observable="supply_bar",
-                 unit="bar", value=0.4)
+SUPPLY = replace(
+    TEMP,
+    observation_id="obs-supply",
+    source="supply-gauge",
+    observable="supply_bar",
+    unit="bar",
+    value=0.4,
+)
 CAUSES = (CauseHypothesis(Cause.EXECUTION, ("obs-supply",)),)
 
 
@@ -61,9 +67,16 @@ def _miss(ledger):
 
 def _propose(ledger, evaluation_id, version="1"):
     return ledger.propose_learning(
-        evaluation_id, task=TASK, criterion="room_temp", target_kind="belief",
-        target_id="supply-pressure-ok", target_version=version, change={"reopen": True},
-        scope="boiler loop B", confidence=0.7, route=Route.OWN_ACTION,
+        evaluation_id,
+        task=TASK,
+        criterion="room_temp",
+        target_kind="belief",
+        target_id="supply-pressure-ok",
+        target_version=version,
+        change={"reopen": True},
+        scope="boiler loop B",
+        confidence=0.7,
+        route=Route.OWN_ACTION,
         evidence_kind=EvidenceKind.MEASURED,
     )
 
@@ -95,17 +108,27 @@ def test_revoking_closes_open_requests_and_stops_new_ones(ledger):
     assert {p.status for p in ledger.suggest_observation("exp-valve-1")} == {"OPEN"}
     _revoke(ledger)
     assert ledger.suggest_observation("exp-valve-1") == ()
-    closed = [e["payload"] for e in ledger.history(limit=1000)
-              if e["kind"] == "OBSERVATION_PROPOSAL_CLOSED"]
+    closed = [
+        e["payload"]
+        for e in ledger.history(limit=1000)
+        if e["kind"] == "OBSERVATION_PROPOSAL_CLOSED"
+    ]
     assert [p["by"] for p in closed] == ["revoked", "revoked"]
-    assert ledger._conn.execute("SELECT COUNT(*) FROM cl_proposals WHERE status='OPEN'").fetchone()[0] == 0
+    assert (
+        ledger._conn.execute(
+            "SELECT COUNT(*) FROM cl_proposals WHERE status='OPEN'"
+        ).fetchone()[0]
+        == 0
+    )
 
 
 def test_a_revoked_expectation_takes_no_new_learning_but_replays_old(ledger):
     ev = _miss(ledger)
     proposal = _propose(ledger, ev.evaluation_id)
     _revoke(ledger)
-    assert _propose(ledger, ev.evaluation_id) == proposal  # a replay, not a new proposal
+    assert (
+        _propose(ledger, ev.evaluation_id) == proposal
+    )  # a replay, not a new proposal
     with pytest.raises(Revoked):
         _propose(ledger, ev.evaluation_id, version="2")
 
@@ -113,7 +136,9 @@ def test_a_revoked_expectation_takes_no_new_learning_but_replays_old(ledger):
 def test_the_guard_holds_an_action_whose_expectation_was_revoked(ledger, tmp_path):
     calls = []
     (tmp_path / "g").mkdir()
-    with _guard(tmp_path / "g", check=ledger.prepared_check, handler=calls.append) as guard:
+    with _guard(
+        tmp_path / "g", check=ledger.prepared_check, handler=calls.append
+    ) as guard:
         _revoke(ledger)
         guard.stage(_request())
         assert guard.release("act-valve-1").status == "HELD"
@@ -127,19 +152,32 @@ def test_receipts_and_consequences_still_append(ledger, tmp_path):
     with _guard(tmp_path / "g") as guard:
         _revoke(ledger)
         ledger.attach_action("exp-valve-1", guard.stage(_request()))
-    entry = ConsequenceEntry("e-1", "exp-valve-1", Account.AGENT_OPERATION, "room 4", Decimal(1), "s",
-                             END, "log", QuantityStatus.MEASURED)
+    entry = ConsequenceEntry(
+        "e-1",
+        "exp-valve-1",
+        Account.AGENT_OPERATION,
+        "room 4",
+        Decimal(1),
+        "s",
+        END,
+        "log",
+        QuantityStatus.MEASURED,
+    )
     ledger.record_consequence(entry)
     assert ledger.accounts("exp-valve-1").totals
 
 
 def test_significance_shows_the_revocation_and_permits_no_interruption(tmp_path):
     policy = replace(POLICY, priorities={TASK.task_id: 9}, interruption_priority=1)
-    with ConsequenceLedger(ledger_target(tmp_path, "c.db"), owner="o", policy=policy, clock=lambda: COMMIT) as led:
+    with ConsequenceLedger(
+        ledger_target(tmp_path, "c.db"), owner="o", policy=policy, clock=lambda: COMMIT
+    ) as led:
         led.prepare(VALVE)
         led.evaluate("exp-valve-1", task=TASK)
         assert led.significance("exp-valve-1").interruption is True
-        led.revoke_expectation("exp-valve-1", controller_ref="ctl-7", reason="cancelled")
+        led.revoke_expectation(
+            "exp-valve-1", controller_ref="ctl-7", reason="cancelled"
+        )
         sig = led.significance("exp-valve-1")
     assert (sig.revoked, sig.interruption) == (True, False)
 
@@ -151,8 +189,13 @@ def test_a_repeated_revocation_is_recorded_once(ledger):
     with pytest.raises(IdReuseError):
         _revoke(ledger, reason="a different reason")
     assert ledger.revocations() == [
-        {"kind": "expectation", "record_id": "exp-valve-1", "expectation_id": "exp-valve-1",
-         "controller_ref": "ctl-7", "reason": "decision cancelled"}
+        {
+            "kind": "expectation",
+            "record_id": "exp-valve-1",
+            "expectation_id": "exp-valve-1",
+            "controller_ref": "ctl-7",
+            "reason": "decision cancelled",
+        }
     ]
     assert ledger.verify_history()
 
@@ -177,7 +220,10 @@ def test_an_unknown_expectation_cannot_be_revoked(ledger):
 
 
 def test_another_owners_revocation_does_not_reach_this_one(tmp_path):
-    with _open(ledger_target(tmp_path, "c.db"), "owner-a") as a, _open(ledger_target(tmp_path, "c.db"), "owner-b") as b:
+    with (
+        _open(ledger_target(tmp_path, "c.db"), "owner-a") as a,
+        _open(ledger_target(tmp_path, "c.db"), "owner-b") as b,
+    ):
         a.prepare(VALVE)
         b.prepare(VALVE)
         a.revoke_expectation("exp-valve-1", controller_ref="ctl", reason="x")
@@ -197,7 +243,10 @@ def test_revocations_survive_a_reopen_and_an_older_file_gains_the_table(tmp_path
     with _open(ledger_target(tmp_path, "c.db")) as led:
         with pytest.raises(Revoked):
             led.evaluate("exp-valve-1", task=TASK)
-        assert len(led.revocations("exp-valve-1")) == 1 and led.revocations("exp-other") == []
+        assert (
+            len(led.revocations("exp-valve-1")) == 1
+            and led.revocations("exp-other") == []
+        )
         assert led.verify_history()
 
 
@@ -206,8 +255,12 @@ def test_revocations_survive_a_reopen_and_an_older_file_gains_the_table(tmp_path
 
 def _applied(ledger):
     proposal = _propose(ledger, _miss(ledger).evaluation_id)
-    ledger.record_update_receipt(proposal.update_id, admission=Admission.ACCEPTED,
-                                 application=Application.APPLIED, controller_ref="ctl-7")
+    ledger.record_update_receipt(
+        proposal.update_id,
+        admission=Admission.ACCEPTED,
+        application=Application.APPLIED,
+        controller_ref="ctl-7",
+    )
     return proposal
 
 
@@ -219,27 +272,40 @@ def test_an_applied_update_can_be_revoked_once(ledger):
     assert ledger.update_state(proposal.update_id) is UpdateState.REVOKED
     assert _kinds(ledger).count("UPDATE_REVOKED") == 1
     with pytest.raises(IdReuseError):
-        ledger.revoke_update(proposal.update_id, controller_ref="ctl-8", reason="rolled back")
+        ledger.revoke_update(
+            proposal.update_id, controller_ref="ctl-8", reason="rolled back"
+        )
     with pytest.raises(ValueError, match="cannot follow"):
-        ledger.record_update_receipt(proposal.update_id, admission=Admission.ACCEPTED,
-                                     application=Application.APPLIED, controller_ref="ctl-7")
+        ledger.record_update_receipt(
+            proposal.update_id,
+            admission=Admission.ACCEPTED,
+            application=Application.APPLIED,
+            controller_ref="ctl-7",
+        )
 
 
 def test_a_new_proposal_after_a_revocation_reconciles_nothing(ledger):
     proposal = _applied(ledger)
-    ledger.revoke_update(proposal.update_id, controller_ref="ctl-7", reason="rolled back")
+    ledger.revoke_update(
+        proposal.update_id, controller_ref="ctl-7", reason="rolled back"
+    )
     again = _propose(ledger, proposal.evaluation_id, version="2")
     assert again.reconciles is None
 
 
 def test_without_a_revocation_the_new_proposal_reconciles_the_applied_one(ledger):
     proposal = _applied(ledger)
-    assert _propose(ledger, proposal.evaluation_id, version="2").reconciles == proposal.update_id
+    assert (
+        _propose(ledger, proposal.evaluation_id, version="2").reconciles
+        == proposal.update_id
+    )
 
 
 def test_an_uncertain_update_is_reconciled_before_revocation(ledger):
     proposal = _propose(ledger, _miss(ledger).evaluation_id)
-    ledger.record_update_receipt(proposal.update_id, admission=Admission.ACCEPTED, controller_ref="c")
+    ledger.record_update_receipt(
+        proposal.update_id, admission=Admission.ACCEPTED, controller_ref="c"
+    )
     with pytest.raises(ReconcileFirst):
         ledger.revoke_update(proposal.update_id, controller_ref="c", reason="x")
     assert ledger.update_state(proposal.update_id) is UpdateState.UNCERTAIN
@@ -272,7 +338,9 @@ def test_an_unknown_update_cannot_be_revoked(ledger):
 
 def test_revoking_an_update_leaves_its_expectation_live(ledger):
     proposal = _applied(ledger)
-    ledger.revoke_update(proposal.update_id, controller_ref="ctl-7", reason="rolled back")
+    ledger.revoke_update(
+        proposal.update_id, controller_ref="ctl-7", reason="rolled back"
+    )
     ledger.observe(replace(TEMP, revision=2, supersedes=1, value=21.0))
     assert ledger.evaluate("exp-valve-1", task=TASK).revision == 2
     assert ledger.revocations("exp-valve-1")[0]["kind"] == "update"

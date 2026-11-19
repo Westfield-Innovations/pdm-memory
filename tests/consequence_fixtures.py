@@ -36,13 +36,25 @@ START = COMMIT + MINUTE
 END = COMMIT + HOUR
 HORIZON = Horizon(START, END, COMMIT + 2 * HOUR)
 
-TASK = TaskRef("task-heat-room-4", "owner-1", contract_id="contract-heat", contract_version=1)
+TASK = TaskRef(
+    "task-heat-room-4", "owner-1", contract_id="contract-heat", contract_version=1
+)
 
 MOVED = Criterion(
-    "moved", "valve_position", Stage.ACTUATOR_CONFIRMATION, ("categorical", "1"), "state", ["moved"]
+    "moved",
+    "valve_position",
+    Stage.ACTUATOR_CONFIRMATION,
+    ("categorical", "1"),
+    "state",
+    ["moved"],
 )
 ROOM_TEMP = Criterion(
-    "room_temp", "room_temp_c", Stage.TASK_EFFECT, ("range", "1"), "degC", {"low": 20.0, "high": 22.0}
+    "room_temp",
+    "room_temp_c",
+    Stage.TASK_EFFECT,
+    ("range", "1"),
+    "degC",
+    {"low": 20.0, "high": 22.0},
 )
 
 VALVE = Expectation(
@@ -58,11 +70,21 @@ VALVE = Expectation(
     decision_ref="decision-open-valve-3",
 )
 
-LIMITS = ReviewLimits(max_outstanding=8, max_repeats=3, max_payload_bytes=65_536, max_revisions=8)
+LIMITS = ReviewLimits(
+    max_outstanding=8, max_repeats=3, max_payload_bytes=65_536, max_revisions=8
+)
 
 
 def _source(name, observable, cost="1", burden="0"):
-    return SourceDecl(name, frozenset({observable}), 30.0, Decimal(cost), "call", Decimal(burden), "min")
+    return SourceDecl(
+        name,
+        frozenset({observable}),
+        30.0,
+        Decimal(cost),
+        "call",
+        Decimal(burden),
+        "min",
+    )
 
 
 POLICY = OwnerPolicy(
@@ -134,7 +156,9 @@ def _guard(tmp_path, *, check=None, handler=lambda r: {"accepted": True}):
         owner="owner-1",
         program_version="worker-1",
         policy_version="policy-1",
-        openings=[Opening("open", "valve-3", handler, lambda r: CheckResult.SATISFIED, check)],
+        openings=[
+            Opening("open", "valve-3", handler, lambda r: CheckResult.SATISFIED, check)
+        ],
     )
     g.start_branch("b1")
     return g

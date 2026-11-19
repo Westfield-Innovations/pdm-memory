@@ -46,8 +46,12 @@ def ledger_at(tmp_path):
     made = []
 
     def make(now=COMMIT, policy=POLICY):
-        led = ConsequenceLedger(ledger_target(tmp_path, f"c{len(made)}.db"), owner="owner-1", policy=policy,
-                                clock=lambda: now)
+        led = ConsequenceLedger(
+            ledger_target(tmp_path, f"c{len(made)}.db"),
+            owner="owner-1",
+            policy=policy,
+            clock=lambda: now,
+        )
         made.append(led)
         return led
 
@@ -103,7 +107,13 @@ def test_a_full_coverage_silence_is_a_miss_but_a_gap_is_not(ledger):
     _with(ledger, replace(POSITION_MOVED, value=None, coverage=(START, END)))
     assert _finding(ledger, "moved").comparison is Comparison.CONFIRMED_MISS
     ledger.observe(
-        replace(POSITION_MOVED, revision=2, supersedes=1, value=None, coverage=(START, END - HOUR / 2))
+        replace(
+            POSITION_MOVED,
+            revision=2,
+            supersedes=1,
+            value=None,
+            coverage=(START, END - HOUR / 2),
+        )
     )
     f = _finding(ledger, "moved")
     assert f.comparison is Comparison.UNRESOLVED
@@ -127,15 +137,23 @@ def test_a_miss_opens_a_review(ledger):
 
 
 def test_an_event_before_commitment_is_retrospective(ledger):
-    late_arrival = replace(TEMP, event_time=COMMIT - MINUTE, arrival_time=COMMIT + HOUR, value=21.0)
+    late_arrival = replace(
+        TEMP, event_time=COMMIT - MINUTE, arrival_time=COMMIT + HOUR, value=21.0
+    )
     _with(ledger, late_arrival, expectation=EARLY)
     f = _finding(ledger, "room_temp")
-    assert (f.ordering, f.comparison) == (Ordering.RETROSPECTIVE, Comparison.CONFIRMED_MATCH)
+    assert (f.ordering, f.comparison) == (
+        Ordering.RETROSPECTIVE,
+        Comparison.CONFIRMED_MATCH,
+    )
 
 
 def test_a_clock_overlap_is_uncertain_and_does_not_grade(ledger):
-    _with(ledger, replace(TEMP, event_time=COMMIT + SECOND, clock_uncertainty_s=5.0, value=21.0),
-          expectation=EARLY)
+    _with(
+        ledger,
+        replace(TEMP, event_time=COMMIT + SECOND, clock_uncertainty_s=5.0, value=21.0),
+        expectation=EARLY,
+    )
     f = _finding(ledger, "room_temp")
     assert f.comparison is Comparison.UNRESOLVED
     assert ("obs-temp", "ordering") in f.excluded
@@ -143,8 +161,11 @@ def test_a_clock_overlap_is_uncertain_and_does_not_grade(ledger):
 
 def test_a_source_sequence_beats_the_clock(ledger):
     sequenced = replace(EARLY, source_sequences={"room-sensor": 40})
-    _with(ledger, replace(TEMP, event_time=COMMIT - MINUTE, source_sequence=41, value=21.0),
-          expectation=sequenced)
+    _with(
+        ledger,
+        replace(TEMP, event_time=COMMIT - MINUTE, source_sequence=41, value=21.0),
+        expectation=sequenced,
+    )
     assert _finding(ledger, "room_temp").ordering is Ordering.PROSPECTIVE
 
 
@@ -175,33 +196,58 @@ def test_a_reading_outside_the_window_is_not_evidence(ledger):
 
 def test_a_changed_condition_is_out_of_scope(ledger):
     guarded = replace(
-        VALVE, conditions={"door": "closed"}, horizon=replace(HORIZON, invalidated_by=("door",))
+        VALVE,
+        conditions={"door": "closed"},
+        horizon=replace(HORIZON, invalidated_by=("door",)),
     )
-    _with(ledger, replace(TEMP, value=25.0, conditions={"door": "open"}), expectation=guarded)
+    _with(
+        ledger,
+        replace(TEMP, value=25.0, conditions={"door": "open"}),
+        expectation=guarded,
+    )
     f = _finding(ledger, "room_temp")
-    assert (f.applicability, f.comparison) == (Applicability.OUT_OF_SCOPE, Comparison.CONFIRMED_MISS)
+    assert (f.applicability, f.comparison) == (
+        Applicability.OUT_OF_SCOPE,
+        Comparison.CONFIRMED_MISS,
+    )
 
 
 def test_an_unreported_condition_leaves_applicability_unresolved(ledger):
     guarded = replace(
-        VALVE, conditions={"door": "closed"}, horizon=replace(HORIZON, invalidated_by=("door",))
+        VALVE,
+        conditions={"door": "closed"},
+        horizon=replace(HORIZON, invalidated_by=("door",)),
     )
     _with(ledger, replace(TEMP, value=21.0), expectation=guarded)
     assert _finding(ledger, "room_temp").applicability is Applicability.UNRESOLVED
 
 
 def test_another_environment_version_is_out_of_scope(ledger):
-    versioned = replace(VALVE, horizon=replace(HORIZON, environment_versions={"firmware": "4.2"}))
-    _with(ledger, replace(TEMP, value=21.0, configuration={"firmware": "5.0"}), expectation=versioned)
+    versioned = replace(
+        VALVE, horizon=replace(HORIZON, environment_versions={"firmware": "4.2"})
+    )
+    _with(
+        ledger,
+        replace(TEMP, value=21.0, configuration={"firmware": "5.0"}),
+        expectation=versioned,
+    )
     assert _finding(ledger, "room_temp").applicability is Applicability.OUT_OF_SCOPE
 
 
 def test_a_probabilistic_miss_can_be_allowed_by_the_model(ledger):
     banded = Criterion(
-        "room_temp", "room_temp_c", Stage.TASK_EFFECT, ("probabilistic", "1"), "degC",
+        "room_temp",
+        "room_temp_c",
+        Stage.TASK_EFFECT,
+        ("probabilistic", "1"),
+        "degC",
         {"low": 20.0, "high": 22.0, "probability": 0.9},
     )
-    _with(ledger, replace(TEMP, value=23.0), expectation=replace(VALVE, criteria=(banded,)))
+    _with(
+        ledger,
+        replace(TEMP, value=23.0),
+        expectation=replace(VALVE, criteria=(banded,)),
+    )
     f = _finding(ledger, "room_temp")
     assert (f.comparison, f.allowed_by_model) == (Comparison.CONFIRMED_MISS, True)
 
@@ -222,11 +268,19 @@ def test_an_unsupported_cause_leaves_attribution_unresolved(ledger):
 
 
 def test_a_cause_is_supported_only_by_recorded_independent_evidence(ledger):
-    pressure = replace(TEMP, observation_id="obs-supply", source="supply-gauge", observable="supply_bar",
-                       unit="bar", value=0.4)
+    pressure = replace(
+        TEMP,
+        observation_id="obs-supply",
+        source="supply-gauge",
+        observable="supply_bar",
+        unit="bar",
+        value=0.4,
+    )
     _with(ledger, POSITION_MOVED, replace(TEMP, value=25.0), pressure)
     unknown = (CauseHypothesis(Cause.EXECUTION, ("obs-nowhere",)),)
-    assert not ledger.evaluate("exp-valve-1", task=TASK, causes=unknown).attribution_supported
+    assert not ledger.evaluate(
+        "exp-valve-1", task=TASK, causes=unknown
+    ).attribution_supported
     ledger.observe(replace(pressure, revision=2, supersedes=1, value=0.3))
     cited = (CauseHypothesis(Cause.EXECUTION, ("obs-supply",)),)
     ev = ledger.evaluate("exp-valve-1", task=TASK, causes=cited)
@@ -284,13 +338,18 @@ def test_a_corrected_observation_supersedes_without_deleting(ledger):
 def test_a_late_reading_grades_the_past_window(ledger):
     _with(ledger, replace(TEMP, value=21.0, arrival_time=END + 24 * HOUR))
     f = _finding(ledger, "room_temp")
-    assert (f.comparison, f.ordering) == (Comparison.CONFIRMED_MATCH, Ordering.PROSPECTIVE)
+    assert (f.comparison, f.ordering) == (
+        Comparison.CONFIRMED_MATCH,
+        Ordering.PROSPECTIVE,
+    )
 
 
 def test_revisions_are_bounded(ledger_at):
     from pdm_memory.guarded_effects import ResourceLimitError
 
-    ledger = ledger_at(policy=replace(POLICY, limits=replace(POLICY.limits, max_revisions=2)))
+    ledger = ledger_at(
+        policy=replace(POLICY, limits=replace(POLICY.limits, max_revisions=2))
+    )
     _with(ledger, replace(TEMP, value=25.0))
     ledger.evaluate("exp-valve-1", task=TASK)
     ledger.observe(replace(TEMP, revision=2, supersedes=1, value=24.0))
@@ -303,12 +362,23 @@ def test_revisions_are_bounded(ledger_at):
 
 def _episode(ledger, n, *, start, value=None, event_time=None):
     window = replace(HORIZON, window_start=start, window_end=start + HOUR)
-    exp = replace(VALVE, expectation_id=f"exp-{n}", action_id=None, criteria=(VALVE.criteria[1],),
-                  horizon=window)
+    exp = replace(
+        VALVE,
+        expectation_id=f"exp-{n}",
+        action_id=None,
+        criteria=(VALVE.criteria[1],),
+        horizon=window,
+    )
     ledger.prepare(exp)
     if value is not None:
-        ledger.observe(replace(TEMP, observation_id=f"obs-{n}", value=value,
-                               event_time=event_time or start + MINUTE))
+        ledger.observe(
+            replace(
+                TEMP,
+                observation_id=f"obs-{n}",
+                value=value,
+                event_time=event_time or start + MINUTE,
+            )
+        )
     return exp.expectation_id
 
 
@@ -322,8 +392,16 @@ def test_the_forecast_record_counts_current_prospective_findings_only(ledger):
     ]
     for i in ids:
         ledger.evaluate(i, task=TASK)
-    ledger.observe(replace(TEMP, observation_id="obs-5", revision=2, supersedes=1, value=21.5,
-                           event_time=COMMIT + 6 * HOUR + MINUTE))
+    ledger.observe(
+        replace(
+            TEMP,
+            observation_id="obs-5",
+            revision=2,
+            supersedes=1,
+            value=21.5,
+            event_time=COMMIT + 6 * HOUR + MINUTE,
+        )
+    )
     ledger.evaluate("exp-5", task=TASK)
     rows = {r.evidence_kind: r for r in ledger.forecast_record("valve-model")}
     graded, unresolved = rows[EvidenceKind.MEASURED], rows[None]
@@ -335,8 +413,14 @@ def test_the_forecast_record_counts_current_prospective_findings_only(ledger):
 
 
 def test_standing_causes_carry_forward_until_dropped(ledger):
-    pressure = replace(TEMP, observation_id="obs-supply", source="supply-gauge", observable="supply_bar",
-                       unit="bar", value=0.4)
+    pressure = replace(
+        TEMP,
+        observation_id="obs-supply",
+        source="supply-gauge",
+        observable="supply_bar",
+        unit="bar",
+        value=0.4,
+    )
     _with(ledger, POSITION_MOVED, replace(TEMP, value=25.0), pressure)
     cited = (CauseHypothesis(Cause.EXECUTION, ("obs-supply",)),)
     supported = ledger.evaluate("exp-valve-1", task=TASK, causes=cited)

@@ -28,7 +28,9 @@ NOT_OBSERVED = _NotObserved()
 
 @dataclass(frozen=True)
 class Comparator:
-    check_expected: Callable[[Any], None]
+    check_expected: Callable[
+        [Any], object
+    ]  # raises on a bad value; any return is ignored
     compare: Callable[[Any, Any], tuple[bool, bool]]
 
 

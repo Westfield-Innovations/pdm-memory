@@ -39,7 +39,9 @@ def ledger_target(tmp_path: Path, name: str) -> str | Path:
     if not ON_POSTGRES:
         return tmp_path / name
     if not PG_URL:
-        raise RuntimeError("PDM_TEST_LEDGER_BACKEND=postgres needs PDM_TEST_POSTGRES_URL")
+        raise RuntimeError(
+            "PDM_TEST_LEDGER_BACKEND=postgres needs PDM_TEST_POSTGRES_URL"
+        )
     return postgres_target(str(tmp_path / name))
 
 

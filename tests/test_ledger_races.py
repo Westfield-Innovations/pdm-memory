@@ -45,8 +45,14 @@ from tests.ledger_target import PG_URL, postgres_target
 WORKERS = 4
 needs_pg = pytest.mark.skipif(not PG_URL, reason="PDM_TEST_POSTGRES_URL is not set")
 ROOMY = replace(POLICY, limits=replace(LIMITS, max_revisions=1000))
-SUPPLY = replace(TEMP, observation_id="obs-supply", source="supply-gauge", observable="supply_bar",
-                 unit="bar", value=0.4)
+SUPPLY = replace(
+    TEMP,
+    observation_id="obs-supply",
+    source="supply-gauge",
+    observable="supply_bar",
+    unit="bar",
+    value=0.4,
+)
 
 
 @pytest.fixture(params=["sqlite", pytest.param("postgres", marks=needs_pg)])
@@ -72,14 +78,18 @@ def _race(manager, fn, args_list):
 
 
 def _ledger(target):
-    return ConsequenceLedger(target, owner="owner-1", policy=ROOMY, clock=lambda: COMMIT)
+    return ConsequenceLedger(
+        target, owner="owner-1", policy=ROOMY, clock=lambda: COMMIT
+    )
 
 
 # --- goal loop ---------------------------------------------------------------
 
 
 def _job_store(target):
-    return PostgresJobStore(target) if isinstance(target, str) else SqliteJobStore(target)
+    return (
+        PostgresJobStore(target) if isinstance(target, str) else SqliteJobStore(target)
+    )
 
 
 def _commit_job(go, target, state):
@@ -175,9 +185,17 @@ def _propose(go, target, evaluation_id):
     with _ledger(target) as led:
         go.wait()
         return led.propose_learning(
-            evaluation_id, task=TASK, criterion="room_temp", target_kind="belief", target_id="b",
-            target_version="1", change={"x": 1}, scope="s", confidence=0.5,
-            route=Route.OWN_ACTION, evidence_kind=EvidenceKind.MEASURED,
+            evaluation_id,
+            task=TASK,
+            criterion="room_temp",
+            target_kind="belief",
+            target_id="b",
+            target_version="1",
+            change={"x": 1},
+            scope="s",
+            confidence=0.5,
+            route=Route.OWN_ACTION,
+            evidence_kind=EvidenceKind.MEASURED,
         ).update_id
 
 
@@ -187,7 +205,9 @@ def _supported_miss(led):
     led.observe(SUPPLY)
     led.observe(replace(TEMP, value=18.0))
     return led.evaluate(
-        "exp-valve-1", task=TASK, causes=(CauseHypothesis(Cause.EXECUTION, ("obs-supply",)),)
+        "exp-valve-1",
+        task=TASK,
+        causes=(CauseHypothesis(Cause.EXECUTION, ("obs-supply",)),),
     )
 
 
@@ -198,13 +218,17 @@ def test_consequence_propose_race_makes_one_proposal(manager, target):
     ids = _race(manager, _propose, [(t, ev.evaluation_id)] * WORKERS)
     assert len(set(ids)) == 1
     with _ledger(t) as led:
-        assert [e["kind"] for e in led.history(limit=1000)].count("LEARNING_PROPOSED") == 1
+        assert [e["kind"] for e in led.history(limit=1000)].count(
+            "LEARNING_PROPOSED"
+        ) == 1
 
 
 def _revoke_update(go, target, update_id):
     with _ledger(target) as led:
         go.wait()
-        return led.revoke_update(update_id, controller_ref="ctl", reason="rolled back").value
+        return led.revoke_update(
+            update_id, controller_ref="ctl", reason="rolled back"
+        ).value
 
 
 def test_consequence_update_revocation_race_records_one(manager, target):
@@ -213,8 +237,12 @@ def test_consequence_update_revocation_race_records_one(manager, target):
         ev = _supported_miss(led)
     (update_id,) = set(_race(manager, _propose, [(t, ev.evaluation_id)]))
     with _ledger(t) as led:
-        led.record_update_receipt(update_id, admission=Admission.ACCEPTED,
-                                  application=Application.APPLIED, controller_ref="c")
+        led.record_update_receipt(
+            update_id,
+            admission=Admission.ACCEPTED,
+            application=Application.APPLIED,
+            controller_ref="c",
+        )
     states = _race(manager, _revoke_update, [(t, update_id)] * WORKERS)
     assert states == ["REVOKED"] * WORKERS
     with _ledger(t) as led:
@@ -254,7 +282,9 @@ def test_no_evaluation_lands_after_a_revocation(manager, target):
     _race(manager, _either, [(t, w) for w in range(WORKERS)])
     with _ledger(t) as led:
         history = led.history(limit=1000)
-        (revoked,) = [e["sequence"] for e in history if e["kind"] == "EXPECTATION_REVOKED"]
+        (revoked,) = [
+            e["sequence"] for e in history if e["kind"] == "EXPECTATION_REVOKED"
+        ]
         assert all(e["sequence"] < revoked for e in history if e["kind"] == "EVALUATED")
         revisions = [
             r[0]

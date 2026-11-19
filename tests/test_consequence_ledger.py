@@ -22,7 +22,9 @@ from tests.ledger_target import ledger_target
 
 @pytest.fixture
 def ledger(tmp_path):
-    with ConsequenceLedger(ledger_target(tmp_path, "c.db"), owner="owner-1", policy=POLICY) as led:
+    with ConsequenceLedger(
+        ledger_target(tmp_path, "c.db"), owner="owner-1", policy=POLICY
+    ) as led:
         yield led
 
 
@@ -68,7 +70,9 @@ def test_a_memory_path_is_refused():
 def test_payloads_are_bounded(tmp_path):
     small = _policy(limits=replace(POLICY.limits, max_payload_bytes=256))
     with (
-        ConsequenceLedger(ledger_target(tmp_path, "s.db"), owner="o", policy=small) as led,
+        ConsequenceLedger(
+            ledger_target(tmp_path, "s.db"), owner="o", policy=small
+        ) as led,
         pytest.raises(ResourceLimitError),
     ):
         led.prepare(VALVE)
@@ -81,7 +85,10 @@ def test_an_observation_revision_names_what_it_supersedes(ledger):
         ledger.observe(replace(TEMP, revision=2))
     with pytest.raises(ValueError, match="supersedes"):
         ledger.observe(replace(TEMP, revision=3, supersedes=2))
-    assert ledger.observe(replace(TEMP, revision=2, supersedes=1, value=21.5)) == ("obs-temp", 2)
+    assert ledger.observe(replace(TEMP, revision=2, supersedes=1, value=21.5)) == (
+        "obs-temp",
+        2,
+    )
     with pytest.raises(IdReuseError):
         ledger.observe(replace(TEMP, value=99.0))
     (latest,) = ledger.observations("room_temp_c")
@@ -112,7 +119,9 @@ def test_a_repeated_receipt_is_recorded_once(ledger, guard):
 def test_release_waits_for_a_retained_expectation(ledger, tmp_path):
     calls = []
     (tmp_path / "g").mkdir()
-    with _guard(tmp_path / "g", check=ledger.prepared_check, handler=calls.append) as guard:
+    with _guard(
+        tmp_path / "g", check=ledger.prepared_check, handler=calls.append
+    ) as guard:
         guard.stage(_request("act-valve-1"))
         assert guard.release("act-valve-1").status == "HELD"
         assert calls == []
@@ -135,10 +144,14 @@ def test_history_is_append_only_and_chained(ledger):
 
 
 def test_records_survive_a_reopen(tmp_path):
-    with ConsequenceLedger(ledger_target(tmp_path, "c.db"), owner="o", policy=POLICY) as a:
+    with ConsequenceLedger(
+        ledger_target(tmp_path, "c.db"), owner="o", policy=POLICY
+    ) as a:
         a.prepare(VALVE)
         a.observe(TEMP)
-    with ConsequenceLedger(ledger_target(tmp_path, "c.db"), owner="o", policy=POLICY) as b:
+    with ConsequenceLedger(
+        ledger_target(tmp_path, "c.db"), owner="o", policy=POLICY
+    ) as b:
         assert b.expectation("exp-valve-1")[0] == VALVE
         assert b.observations() == [TEMP]
         assert b.prepare(VALVE) == "exp-valve-1"

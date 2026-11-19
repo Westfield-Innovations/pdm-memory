@@ -22,7 +22,12 @@ from tests.consequence_fixtures import (
 )
 from tests.ledger_target import ledger_target
 
-RULES = {"EUR": Decimal(1), "call": Decimal(2), "min": Decimal("0.5"), "s": Decimal("0.01")}
+RULES = {
+    "EUR": Decimal(1),
+    "call": Decimal(2),
+    "min": Decimal("0.5"),
+    "s": Decimal("0.01"),
+}
 WORTH_5 = replace(ROOM_TEMP, avoided=Decimal(5), avoided_unit="EUR")
 
 
@@ -33,7 +38,9 @@ def _room(ledger, expectation=None, now=COMMIT):
 
 
 def _open(tmp_path, policy):
-    return ConsequenceLedger(ledger_target(tmp_path, "c.db"), owner="o", policy=policy, clock=lambda: COMMIT)
+    return ConsequenceLedger(
+        ledger_target(tmp_path, "c.db"), owner="o", policy=policy, clock=lambda: COMMIT
+    )
 
 
 def test_without_an_avoided_consequence_the_order_stays_qualitative(tmp_path):
@@ -51,13 +58,22 @@ def test_on_one_basis_each_source_gets_its_net_value(tmp_path):
     # room-sensor: 5 - (1 call*2 + 30 s*0.01) = 2.7; wall-probe: 5 - (3*2 + 0.3) = -1.3
     assert p.values == (
         SourceValue("room-sensor", "WORTH", Decimal("2.70"), ""),
-        SourceValue("wall-probe", "NOT_WORTH", Decimal("-1.30"), "costs at least what it could avoid"),
+        SourceValue(
+            "wall-probe",
+            "NOT_WORTH",
+            Decimal("-1.30"),
+            "costs at least what it could avoid",
+        ),
     )
     assert p.status == "OPEN"  # the value informs the owner; it is not a release rule
 
 
 def test_a_perturbation_counts_and_reorders_by_net_value(tmp_path):
-    shaky = replace(_source("room-sensor", "room_temp_c"), perturbation=Decimal(10), perturbation_unit="EUR")
+    shaky = replace(
+        _source("room-sensor", "room_temp_c"),
+        perturbation=Decimal(10),
+        perturbation_unit="EUR",
+    )
     policy = _policy(exchange_rules=RULES, sources=(shaky, *POLICY.sources[2:]))
     with _open(tmp_path, policy) as led:
         p = _room(led)
@@ -78,13 +94,17 @@ def test_a_unit_without_an_exchange_rule_leaves_the_comparison_unresolved(tmp_pa
 def test_no_exchange_rules_at_all(tmp_path):
     with _open(tmp_path, POLICY) as led:
         p = _room(led)
-    assert {v.reason for v in p.values} == {"no owner exchange rule for ['EUR', 'call', 's']"}
+    assert {v.reason for v in p.values} == {
+        "no owner exchange rule for ['EUR', 'call', 's']"
+    }
 
 
 def test_delay_needs_a_rule_unless_it_is_zero(tmp_path):
     rules = {k: v for k, v in RULES.items() if k != "s"}
     instant = replace(_source("room-sensor", "room_temp_c"), latency_s=0.0)
-    with _open(tmp_path, _policy(exchange_rules=rules, sources=(instant, POLICY.sources[2]))) as led:
+    with _open(
+        tmp_path, _policy(exchange_rules=rules, sources=(instant, POLICY.sources[2]))
+    ) as led:
         p = _room(led)
     assert [(v.source, v.verdict) for v in p.values] == [
         ("room-sensor", "WORTH"),
@@ -105,7 +125,10 @@ def test_breaking_even_is_not_worth_it(tmp_path):
     with _open(tmp_path, _policy(exchange_rules=RULES)) as led:
         p = _room(led, replace(VALVE, criteria=(even,)))
     assert p.values[0] == SourceValue(
-        "room-sensor", "NOT_WORTH", Decimal("0.00"), "costs at least what it could avoid"
+        "room-sensor",
+        "NOT_WORTH",
+        Decimal("0.00"),
+        "costs at least what it could avoid",
     )
 
 
@@ -120,7 +143,10 @@ def test_a_source_arriving_after_the_decision_point_is_too_late(tmp_path):
         ("wall-probe", "TOO_LATE"),
     ]
     assert p.values[1].reason == "arrives after the latest decision point"
-    assert [s.name for s in p.sources] == ["room-sensor", "wall-probe"]  # qualitative order kept
+    assert [s.name for s in p.sources] == [
+        "room-sensor",
+        "wall-probe",
+    ]  # qualitative order kept
 
 
 def test_values_survive_a_reopen_and_replay(tmp_path):
@@ -129,7 +155,9 @@ def test_values_survive_a_reopen_and_replay(tmp_path):
         first = _room(led)
     with _open(tmp_path, policy) as led:
         assert led.suggest_observation("exp-valve-1", now=COMMIT + SECOND) == (first,)
-        assert isinstance(led.suggest_observation("exp-valve-1")[0].values[0].net, Decimal)
+        assert isinstance(
+            led.suggest_observation("exp-valve-1")[0].values[0].net, Decimal
+        )
 
 
 def test_old_records_keep_their_form():
@@ -158,5 +186,7 @@ def test_an_avoided_quantity_is_a_number():
         replace(ROOM_TEMP, avoided=True, avoided_unit="EUR")
     with pytest.raises(ValueError):
         replace(ROOM_TEMP, avoided="lots", avoided_unit="EUR")
-    assert isinstance(SourceDecl("s", frozenset({"o"}), 1.0, 1, "c", 0, "m", 2.5, "EUR").perturbation,
-                      Decimal)
+    assert isinstance(
+        SourceDecl("s", frozenset({"o"}), 1.0, 1, "c", 0, "m", 2.5, "EUR").perturbation,
+        Decimal,
+    )

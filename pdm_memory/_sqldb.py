@@ -77,6 +77,13 @@ def _wal(conn: sqlite3.Connection) -> None:
             time.sleep(0.05)
 
 
+def _scalar(cursor: Any) -> Any:
+    row = cursor.fetchone()
+    if row is None:
+        raise RuntimeError("the database returned no row for a single-value query")
+    return row[0]
+
+
 _IDENT = re.compile(r"[a-z_][a-z0-9_]*\Z")
 _LITERAL = re.compile(r"'(?:[^']|'')*'")
 
@@ -98,7 +105,9 @@ def _message(text: str) -> str:
 def _checked(sql: str) -> str:
     """Refuse SQL the Postgres translation would misread, on both backends alike."""
     if any("?" in literal for literal in _LITERAL.findall(sql)):
-        raise ValueError("a ? inside a quoted SQL literal reads as a parameter; pass it as one")
+        raise ValueError(
+            "a ? inside a quoted SQL literal reads as a parameter; pass it as one"
+        )
     return sql
 
 
@@ -134,7 +143,9 @@ class Database:
         try:
             import psycopg
         except ImportError:
-            raise ImportError("install pdm-memory[postgres] for a postgresql:// target") from None
+            raise ImportError(
+                "install pdm-memory[postgres] for a postgresql:// target"
+            ) from None
         self.dialect, self.Error = "postgres", psycopg.Error
         self._target, self._lock_key = str(target), lock_key
         self._txn = self._closed = False
@@ -145,7 +156,7 @@ class Database:
 
         conn = psycopg.connect(self._target, autocommit=True, row_factory=_pg_row)
         try:
-            if conn.execute("SHOW fsync").fetchone()[0] == "off":
+            if _scalar(conn.execute("SHOW fsync")) == "off":
                 raise ConfigurationError(
                     "the Postgres server runs with fsync=off; ledger writes would not be durable"
                 )
@@ -153,7 +164,7 @@ class Database:
             # A SQLite file has its own writer lock and waits 30 s for it; here the
             # schema plays the file, and a wait past 30 s raises instead of hanging.
             conn.execute("SET lock_timeout TO '30s'")
-            schema = conn.execute("SELECT current_schema()").fetchone()[0]
+            schema = _scalar(conn.execute("SELECT current_schema()"))
             self._lock_id = _lock_id(f"{self._lock_key}:{schema}")
         except BaseException:
             conn.close()
@@ -166,7 +177,11 @@ class Database:
         Inside a transaction a drop is an error for the caller: reconnecting there
         would carry on outside the transaction it began.
         """
-        if not self._txn and not self._closed and (self._conn.broken or self._conn.closed):
+        if (
+            not self._txn
+            and not self._closed
+            and (self._conn.broken or self._conn.closed)
+        ):
             self._conn = self._connect()
         return self._conn
 
@@ -293,7 +308,9 @@ class Database:
         ordered = [_ident(t) for t in ordered]
         postgres = self.dialect == "postgres"
         for statement in filter(str.strip, sql.split(";")):
-            self._conn.execute(re.sub(r"\bINTEGER\b", "BIGINT", statement) if postgres else statement)
+            self._conn.execute(
+                re.sub(r"\bINTEGER\b", "BIGINT", statement) if postgres else statement
+            )
         if not postgres:
             for table, msg in append_only.items():
                 for op in ("update", "delete"):
@@ -310,7 +327,11 @@ class Database:
         if append_only:
             self._conn.execute(_APPEND_ONLY_FN)
         for table, msg in append_only.items():
-            for op, scope in (("update", "ROW"), ("delete", "ROW"), ("truncate", "STATEMENT")):
+            for op, scope in (
+                ("update", "ROW"),
+                ("delete", "ROW"),
+                ("truncate", "STATEMENT"),
+            ):
                 name = f"{table}_no_{op}"
                 exists = self._conn.execute(
                     "SELECT 1 FROM pg_trigger WHERE tgname=%s AND tgrelid=to_regclass(%s)",
@@ -325,7 +346,9 @@ class Database:
     def columns(self, table: str) -> set[str]:
         _ident(table)
         if self.dialect == "sqlite":
-            return {r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})")}
+            return {
+                r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})")
+            }
         rows = self._conn.execute(
             "SELECT column_name FROM information_schema.columns"
             " WHERE table_schema=current_schema() AND table_name=%s",

@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from pdm_memory._chain import append_event, verify_events
 from pdm_memory._sqldb import Database, Row
@@ -32,7 +32,9 @@ from pdm_memory.consequence.records import (
     CauseHypothesis,
     Comparison,
     ConsequenceEntry,
+    Criterion,
     Evaluation,
+    EventCondition,
     EvidenceKind,
     Expectation,
     ForecastRow,
@@ -42,6 +44,7 @@ from pdm_memory.consequence.records import (
     ObservationProposal,
     Ordering,
     OwnerPolicy,
+    ProposalStatus,
     QuantityStatus,
     ReconcileFirst,
     Response,
@@ -73,12 +76,25 @@ _COUNT = {
     Comparison.CONFLICT: "conflict",
 }
 _GRADED = (Comparison.CONFIRMED_MATCH, Comparison.CONFIRMED_MISS)
-_OPEN_OR_APPLIED = {UpdateState.PROPOSED.value, UpdateState.DEFERRED.value, UpdateState.APPLIED.value}
+_OPEN_OR_APPLIED = {
+    UpdateState.PROPOSED.value,
+    UpdateState.DEFERRED.value,
+    UpdateState.APPLIED.value,
+}
 _NEXT = {
-    UpdateState.PROPOSED: {UpdateState.DEFERRED, UpdateState.REJECTED, UpdateState.UNCERTAIN,
-                           UpdateState.APPLIED, UpdateState.NOT_APPLIED},
-    UpdateState.DEFERRED: {UpdateState.REJECTED, UpdateState.UNCERTAIN, UpdateState.APPLIED,
-                           UpdateState.NOT_APPLIED},
+    UpdateState.PROPOSED: {
+        UpdateState.DEFERRED,
+        UpdateState.REJECTED,
+        UpdateState.UNCERTAIN,
+        UpdateState.APPLIED,
+        UpdateState.NOT_APPLIED,
+    },
+    UpdateState.DEFERRED: {
+        UpdateState.REJECTED,
+        UpdateState.UNCERTAIN,
+        UpdateState.APPLIED,
+        UpdateState.NOT_APPLIED,
+    },
     UpdateState.UNCERTAIN: {UpdateState.APPLIED, UpdateState.NOT_APPLIED},
     UpdateState.REJECTED: set(),
     UpdateState.APPLIED: {UpdateState.REVOKED},
@@ -132,7 +148,9 @@ _ORDERED = ("cl_evaluations", "cl_updates", "cl_consequences", "cl_revocations")
 # Append a step to change the schema; never edit a step that has shipped.
 _MIGRATIONS = (
     lambda db: db.create_tables(
-        _SCHEMA, append_only={"cl_events": "consequence history is append-only"}, ordered=_ORDERED
+        _SCHEMA,
+        append_only={"cl_events": "consequence history is append-only"},
+        ordered=_ORDERED,
     ),
 )
 
@@ -184,7 +202,7 @@ class ConsequenceLedger:
         with self._lock:
             self._conn.close()
 
-    def __enter__(self) -> ConsequenceLedger:
+    def __enter__(self) -> ConsequenceLedger:  # noqa: PYI034 - typing.Self needs 3.11
         return self
 
     def __exit__(self, *args: object) -> None:
@@ -193,9 +211,13 @@ class ConsequenceLedger:
     def _now(self) -> datetime:
         return require_aware(self._clock(), "clock()")
 
-    def _append(self, kind: str, payload: dict[str, Any], expectation_id: str | None = None) -> int:
+    def _append(
+        self, kind: str, payload: dict[str, Any], expectation_id: str | None = None
+    ) -> int:
         payload_json = dumps({**payload, "recorded_at": self._now().isoformat()})
-        return append_event(self._conn, "cl_events", self.owner, expectation_id, kind, payload_json)
+        return append_event(
+            self._conn, "cl_events", self.owner, expectation_id, kind, payload_json
+        )
 
     # --- expectations -----------------------------------------------------
 
@@ -203,12 +225,14 @@ class ConsequenceLedger:
         """Retain *expectation* and return its id, before the action is released."""
         if not isinstance(expectation, Expectation):
             raise TypeError("prepare takes an Expectation")
-        rules = list(expectation.criteria)
+        rules: list[Criterion | EventCondition] = list(expectation.criteria)
         if expectation.horizon.event is not None:
             rules.append(expectation.horizon.event)
         for c in rules:
             if c.comparator not in self.policy.comparators:
-                raise ValueError(f"comparator {c.comparator} is not registered by the owner")
+                raise ValueError(
+                    f"comparator {c.comparator} is not registered by the owner"
+                )
             COMPARATORS[c.comparator].check_expected(c.expected)
         record = expectation.to_dict()
         encoded = dumps(record, limit=self._limit)
@@ -219,9 +243,13 @@ class ConsequenceLedger:
             ).fetchone()
             if old:
                 if old["record_json"] != encoded:
-                    raise IdReuseError("expectation_id already binds a different expectation")
+                    raise IdReuseError(
+                        "expectation_id already binds a different expectation"
+                    )
                 return expectation.expectation_id
-            if expectation.action_id is not None and self._expectation_for(expectation.action_id):
+            if expectation.action_id is not None and self._expectation_for(
+                expectation.action_id
+            ):
                 raise IdReuseError("this action already has a retained expectation")
             committed_at = self._now()
             seq = self._append(
@@ -272,13 +300,19 @@ class ConsequenceLedger:
             expectation_id = self._expectation_for(request.action_id)
             revoked = expectation_id is not None and self._is_revoked(expectation_id)
         if expectation_id is None:
-            return ConditionVerdict(CheckResult.UNKNOWN, "no retained expectation for this action")
+            return ConditionVerdict(
+                CheckResult.UNKNOWN, "no retained expectation for this action"
+            )
         if revoked:
             return ConditionVerdict(
-                CheckResult.UNKNOWN, "the expectation was revoked", {"expectation_id": expectation_id}
+                CheckResult.UNKNOWN,
+                "the expectation was revoked",
+                {"expectation_id": expectation_id},
             )
         return ConditionVerdict(
-            CheckResult.SATISFIED, "expectation retained", {"expectation_id": expectation_id}
+            CheckResult.SATISFIED,
+            "expectation retained",
+            {"expectation_id": expectation_id},
         )
 
     # --- actions and observations -------------------------------------------
@@ -297,8 +331,13 @@ class ConsequenceLedger:
                 (self.owner, receipt.action_id, receipt.sequence),
             ).fetchone()
             if old:
-                if (old["status"], old["request_hash"]) != (receipt.status, receipt.request_hash):
-                    raise IdReuseError("this receipt sequence already binds a different receipt")
+                if (old["status"], old["request_hash"]) != (
+                    receipt.status,
+                    receipt.request_hash,
+                ):
+                    raise IdReuseError(
+                        "this receipt sequence already binds a different receipt"
+                    )
                 return
             self._append(
                 "ACTION_ATTACHED",
@@ -348,13 +387,18 @@ class ConsequenceLedger:
             ).fetchone()
             if old:
                 if old["record_json"] != encoded:
-                    raise IdReuseError("this observation revision already binds different evidence")
+                    raise IdReuseError(
+                        "this observation revision already binds different evidence"
+                    )
                 return key
             latest = self._conn.execute(
                 "SELECT MAX(revision) FROM cl_observations WHERE owner=? AND observation_id=?",
                 (self.owner, observation.observation_id),
             ).fetchone()[0]
-            if observation.revision != (latest or 0) + 1 or observation.supersedes != latest:
+            if (
+                observation.revision != (latest or 0) + 1
+                or observation.supersedes != latest
+            ):
                 raise ValueError(
                     f"revision {observation.revision} must follow revision {latest or 0}"
                     f" and name supersedes={latest}"
@@ -424,12 +468,17 @@ class ConsequenceLedger:
         relevant = [
             o
             for o in latest
-            if o.observable in observables and window is not None and grading.in_window(o, window)
+            if o.observable in observables
+            and window is not None
+            and grading.in_window(o, window)
         ]
         cited = {ref for h in causes for ref in h.support if ref in by_id}
         inputs = sorted(
             {(o.observation_id, o.revision) for o in relevant}
-            | {(o.observation_id, o.revision) for o in grading.event_readings(expectation, latest)}
+            | {
+                (o.observation_id, o.revision)
+                for o in grading.event_readings(expectation, latest)
+            }
             | {(ref, by_id[ref].revision) for ref in cited}
         )
         evaluation_id = _hash(
@@ -459,7 +508,9 @@ class ConsequenceLedger:
                 f" revisions; escalate: {self.policy.escalation}"
             )
         findings = tuple(
-            grading.grade_criterion(expectation, committed_at, c, relevant, self.policy, window)
+            grading.grade_criterion(
+                expectation, committed_at, c, relevant, self.policy, window
+            )
             for c in expectation.criteria
         )
         evaluation = Evaluation(
@@ -472,7 +523,8 @@ class ConsequenceLedger:
             attribution_supported=any(
                 h.support
                 and all(
-                    r in by_id and grading.admissible_support(by_id[r], expectation, self.policy)
+                    r in by_id
+                    and grading.admissible_support(by_id[r], expectation, self.policy)
                     for r in h.support
                 )
                 for h in causes
@@ -515,7 +567,9 @@ class ConsequenceLedger:
             ).fetchone()
         return None if row is None else self._evaluation_from(row)
 
-    def forecast_record(self, predictor: str, *, version: str | None = None) -> list[ForecastRow]:
+    def forecast_record(
+        self, predictor: str, *, version: str | None = None
+    ) -> list[ForecastRow]:
         """Confirmation and error counts of current evaluations, per comparable case.
 
         Retrospective findings are counted apart: they grade, but they were not forecasts.
@@ -529,7 +583,9 @@ class ConsequenceLedger:
                 (self.owner,),
             ).fetchall()
             kinds = {
-                (r["observation_id"], r["revision"]): json.loads(r["record_json"])["kind"]
+                (r["observation_id"], r["revision"]): json.loads(r["record_json"])[
+                    "kind"
+                ]
                 for r in self._conn.execute(
                     "SELECT observation_id, revision, record_json FROM cl_observations WHERE owner=?",
                     (self.owner,),
@@ -557,8 +613,15 @@ class ConsequenceLedger:
                 )
                 counts = rows.setdefault(
                     key,
-                    {"n": 0, "match": 0, "miss": 0, "unresolved": 0, "conflict": 0,
-                     "retrospective": 0, "probabilities": []},
+                    {
+                        "n": 0,
+                        "match": 0,
+                        "miss": 0,
+                        "unresolved": 0,
+                        "conflict": 0,
+                        "retrospective": 0,
+                        "probabilities": [],
+                    },
                 )
                 if f.ordering is Ordering.RETROSPECTIVE:
                     counts["retrospective"] += 1
@@ -583,7 +646,9 @@ class ConsequenceLedger:
                 conflict=v["conflict"],
                 retrospective=v["retrospective"],
                 mean_probability=(
-                    sum(v["probabilities"]) / len(v["probabilities"]) if v["probabilities"] else None
+                    sum(v["probabilities"]) / len(v["probabilities"])
+                    if v["probabilities"]
+                    else None
                 ),
             )
             for k, v in rows.items()
@@ -604,7 +669,9 @@ class ConsequenceLedger:
 
     @staticmethod
     def _evaluation_from(row: Row) -> Evaluation:
-        return Evaluation.from_dict(json.loads(row["record_json"]), row["superseded_by"])
+        return Evaluation.from_dict(
+            json.loads(row["record_json"]), row["superseded_by"]
+        )
 
     # --- learning ------------------------------------------------------------
 
@@ -630,8 +697,13 @@ class ConsequenceLedger:
         proposal and its receipts come back through ``record_update_receipt``.
         """
         _name(target_kind, "target_kind")
-        if target_kind in PROTECTED_TARGETS or target_kind not in self.policy.learning_targets:
-            raise UnauthorizedChange(f"{target_kind} is not an owner-admitted learning target")
+        if (
+            target_kind in PROTECTED_TARGETS
+            or target_kind not in self.policy.learning_targets
+        ):
+            raise UnauthorizedChange(
+                f"{target_kind} is not an owner-admitted learning target"
+            )
         _name(target_id, "target_id")
         _name(target_version, "target_version")
         _name(scope, "scope")
@@ -646,23 +718,39 @@ class ConsequenceLedger:
         if task != expectation.task:
             raise ValueError("a proposal is bound to the expectation's own task")
         if evaluation.superseded_by is not None:
-            raise NotSupported("this evaluation was superseded; propose from the current one")
+            raise NotSupported(
+                "this evaluation was superseded; propose from the current one"
+            )
         finding = evaluation.finding(criterion)
         if finding.applicability is not Applicability.APPLICABLE:
-            raise NotSupported(f"the finding is {finding.applicability.value}, not applicable")
+            raise NotSupported(
+                f"the finding is {finding.applicability.value}, not applicable"
+            )
         if finding.comparison not in _GRADED:
             raise NotSupported(f"the finding is {finding.comparison.value}")
-        if finding.comparison is Comparison.CONFIRMED_MISS and not evaluation.attribution_supported:
+        if (
+            finding.comparison is Comparison.CONFIRMED_MISS
+            and not evaluation.attribution_supported
+        ):
             raise NotSupported("attribution unresolved; the miss is retained")
         if target_kind == "interface_calibration" and (
             route is not Route.OWN_ACTION
             or interface_id is None
             or interface_id != expectation.interface_id
         ):
-            raise NotSupported("only this interface's own action can calibrate this interface")
+            raise NotSupported(
+                "only this interface's own action can calibrate this interface"
+            )
         update_id = _hash(
             dumps(
-                [expectation.expectation_id, criterion, target_kind, target_id, target_version, change]
+                [
+                    expectation.expectation_id,
+                    criterion,
+                    target_kind,
+                    target_id,
+                    target_version,
+                    change,
+                ]
             )
         )
         with self._transaction():
@@ -673,14 +761,22 @@ class ConsequenceLedger:
             if old is not None:
                 return LearningProposal.from_dict(json.loads(old[0]))
             self._refuse_revoked(expectation.expectation_id)
-            same_target = (self.owner, expectation.expectation_id, criterion, target_kind, target_id)
+            same_target = (
+                self.owner,
+                expectation.expectation_id,
+                criterion,
+                target_kind,
+                target_id,
+            )
             uncertain = self._conn.execute(
                 "SELECT update_id FROM cl_updates WHERE owner=? AND expectation_id=?"
                 " AND criterion=? AND target_kind=? AND target_id=? AND state=? LIMIT 1",
                 (*same_target, UpdateState.UNCERTAIN.value),
             ).fetchone()
             if uncertain is not None:
-                raise ReconcileFirst(f"update {uncertain[0]} has no application receipt")
+                raise ReconcileFirst(
+                    f"update {uncertain[0]} has no application receipt"
+                )
             prior = self._conn.execute(
                 "SELECT update_id, state FROM cl_updates WHERE owner=? AND expectation_id=?"
                 " AND criterion=? AND target_kind=? AND target_id=? ORDER BY rowid DESC LIMIT 1",
@@ -721,7 +817,9 @@ class ConsequenceLedger:
                     UpdateState.PROPOSED.value,
                 ),
             )
-            self._append("LEARNING_PROPOSED", {"proposal": record}, expectation.expectation_id)
+            self._append(
+                "LEARNING_PROPOSED", {"proposal": record}, expectation.expectation_id
+            )
         return proposal
 
     def update_state(self, update_id: str) -> UpdateState:
@@ -750,9 +848,13 @@ class ConsequenceLedger:
         application = None if application is None else Application(application)
         _name(controller_ref, "controller_ref")
         if admission is not Admission.ACCEPTED and application is not None:
-            raise ValueError("only an accepted proposal can carry an application receipt")
+            raise ValueError(
+                "only an accepted proposal can carry an application receipt"
+            )
         if admission is Admission.ACCEPTED:
-            new = UpdateState(application.value) if application else UpdateState.UNCERTAIN
+            new = (
+                UpdateState(application.value) if application else UpdateState.UNCERTAIN
+            )
         else:
             new = UpdateState(admission.value)
         with self._transaction():
@@ -801,7 +903,9 @@ class ConsequenceLedger:
                 "INSERT INTO cl_consequences VALUES (?, ?, ?, ?)",
                 (self.owner, entry.entry_id, entry.expectation_id, encoded),
             )
-            self._append("CONSEQUENCE_RECORDED", {"entry": record}, entry.expectation_id)
+            self._append(
+                "CONSEQUENCE_RECORDED", {"entry": record}, entry.expectation_id
+            )
         return entry.entry_id
 
     def accounts(self, expectation_id: str) -> AccountSummary:
@@ -830,7 +934,9 @@ class ConsequenceLedger:
         ordering = self.policy.priority_ordering
         if ordering:
             rank = {a: i for i, a in enumerate(ordering)}
-            totals = dict(sorted(totals.items(), key=lambda kv: rank.get(kv[0][0], len(rank))))
+            totals = dict(
+                sorted(totals.items(), key=lambda kv: rank.get(kv[0][0], len(rank)))
+            )
 
         def summary(combined: Decimal | None, reason: str) -> AccountSummary:
             return AccountSummary(totals, unknown, combined, reason, ordering)
@@ -844,7 +950,9 @@ class ConsequenceLedger:
         missing = sorted(units - set(rules or {}))
         if rules is None or missing:
             return summary(None, f"no owner exchange rule for {missing}")
-        return summary(sum((q * rules[unit] for (_, unit, _), q in totals.items()), Decimal(0)), "")
+        return summary(
+            sum((q * rules[unit] for (_, unit, _), q in totals.items()), Decimal(0)), ""
+        )
 
     def significance(self, expectation_id: str) -> Significance:
         """Priority, persistence, reach and permitted interruption, for inspection."""
@@ -903,7 +1011,11 @@ class ConsequenceLedger:
         now = self._now() if now is None else require_aware(now, "now")
         evaluation = self.current_evaluation(expectation_id)
         names = (
-            [f.criterion for f in evaluation.findings if f.comparison is Comparison.UNRESOLVED]
+            [
+                f.criterion
+                for f in evaluation.findings
+                if f.comparison is Comparison.UNRESOLVED
+            ]
             if evaluation is not None
             else [c.name for c in expectation.criteria]
         )
@@ -916,7 +1028,13 @@ class ConsequenceLedger:
             for name in names:
                 c = expectation.criterion(name)
                 proposal_id = _hash(
-                    dumps([expectation_id, name, evaluation.evaluation_id if evaluation else ""])
+                    dumps(
+                        [
+                            expectation_id,
+                            name,
+                            evaluation.evaluation_id if evaluation else "",
+                        ]
+                    )
                 )
                 old = self._conn.execute(
                     "SELECT record_json, status FROM cl_proposals WHERE owner=? AND proposal_id=?",
@@ -924,25 +1042,39 @@ class ConsequenceLedger:
                 ).fetchone()
                 if old is not None and now > deadline:
                     self._close_proposals(expectation_id, name, "too late")
-                    out.append(ObservationProposal.from_dict(json.loads(old[0]), "TOO_LATE"))
+                    out.append(
+                        ObservationProposal.from_dict(json.loads(old[0]), "TOO_LATE")
+                    )
                     continue
                 if old is not None:
-                    out.append(ObservationProposal.from_dict(json.loads(old[0]), old[1]))
+                    out.append(
+                        ObservationProposal.from_dict(json.loads(old[0]), old[1])
+                    )
                     continue
-                sources = [s for s in self.policy.sources if c.observable in s.observables]
+                sources = [
+                    s for s in self.policy.sources if c.observable in s.observables
+                ]
                 ordered = len({(s.cost_unit, s.burden_unit) for s in sources}) == 1
                 if ordered:
                     sources.sort(key=lambda s: (s.cost, s.burden, s.latency_s))
-                values = [grading.source_value(c, s, now, deadline, self.policy) for s in sources]
+                values = [
+                    grading.source_value(c, s, now, deadline, self.policy)
+                    for s in sources
+                ]
                 if values and all(v.net is not None for v in values):
                     # On one owner basis the best net value goes first; otherwise
                     # the qualitative order above stands.
-                    pairs = sorted(zip(sources, values), key=lambda p: -p[1].net)
+                    pairs = sorted(
+                        zip(sources, values), key=lambda p: -cast(Decimal, p[1].net)
+                    )
                     sources, values = [p[0] for p in pairs], [p[1] for p in pairs]
                     ordered = True
+                status: ProposalStatus
                 if now > deadline:
                     status = "TOO_LATE"
-                elif self._count_proposals(expectation_id, name) >= limits.max_repeats or (
+                elif self._count_proposals(
+                    expectation_id, name
+                ) >= limits.max_repeats or (
                     self._count_outstanding(now) >= limits.max_outstanding
                 ):
                     status = "EXHAUSTED"
@@ -952,7 +1084,10 @@ class ConsequenceLedger:
                     proposal_id=proposal_id,
                     expectation_id=expectation_id,
                     criterion=name,
-                    distinguishes=(Comparison.CONFIRMED_MATCH, Comparison.CONFIRMED_MISS),
+                    distinguishes=(
+                        Comparison.CONFIRMED_MATCH,
+                        Comparison.CONFIRMED_MISS,
+                    ),
                     decision_ref=expectation.decision_ref,
                     sources=tuple(sources),
                     ordered=ordered,
@@ -970,10 +1105,19 @@ class ConsequenceLedger:
                 del record["status"]
                 self._conn.execute(
                     "INSERT INTO cl_proposals VALUES (?, ?, ?, ?, ?, ?)",
-                    (self.owner, proposal_id, expectation_id, name, status, dumps(record)),
+                    (
+                        self.owner,
+                        proposal_id,
+                        expectation_id,
+                        name,
+                        status,
+                        dumps(record),
+                    ),
                 )
                 self._append(
-                    "OBSERVATION_PROPOSED", {"proposal": proposal.to_dict()}, expectation_id
+                    "OBSERVATION_PROPOSED",
+                    {"proposal": proposal.to_dict()},
+                    expectation_id,
                 )
                 out.append(proposal)
         return tuple(out)
@@ -987,13 +1131,17 @@ class ConsequenceLedger:
     def _count_outstanding(self, now: datetime) -> int:
         """Open requests that can still help; one past its deadline holds no budget."""
         rows = self._conn.execute(
-            "SELECT record_json FROM cl_proposals WHERE owner=? AND status='OPEN'", (self.owner,)
+            "SELECT record_json FROM cl_proposals WHERE owner=? AND status='OPEN'",
+            (self.owner,),
         ).fetchall()
         return sum(
-            parse_datetime(json.loads(r[0])["deadline"], "deadline") >= now for r in rows
+            parse_datetime(json.loads(r[0])["deadline"], "deadline") >= now
+            for r in rows
         )
 
-    def _close_proposals(self, expectation_id: str, criterion: str, reason: str) -> None:
+    def _close_proposals(
+        self, expectation_id: str, criterion: str, reason: str
+    ) -> None:
         open_ids = [
             r[0]
             for r in self._conn.execute(
@@ -1015,21 +1163,27 @@ class ConsequenceLedger:
 
     # --- revocations ---------------------------------------------------------
 
-    def revoke_expectation(self, expectation_id: str, *, controller_ref: str, reason: str) -> None:
+    def revoke_expectation(
+        self, expectation_id: str, *, controller_ref: str, reason: str
+    ) -> None:
         """The owner withdraws an expectation: no further evaluation or proposal.
 
         Its records stay; observations, receipts and consequences still append.
         """
         self.expectation(expectation_id)
         with self._transaction():
-            if self._revoke("expectation", expectation_id, expectation_id, controller_ref, reason):
+            if self._revoke(
+                "expectation", expectation_id, expectation_id, controller_ref, reason
+            ):
                 for (criterion,) in self._conn.execute(
                     "SELECT DISTINCT criterion FROM cl_proposals WHERE owner=? AND expectation_id=?",
                     (self.owner, expectation_id),
                 ).fetchall():
                     self._close_proposals(expectation_id, criterion, "revoked")
 
-    def revoke_update(self, update_id: str, *, controller_ref: str, reason: str) -> UpdateState:
+    def revoke_update(
+        self, update_id: str, *, controller_ref: str, reason: str
+    ) -> UpdateState:
         """Record that the owner's controller withdrew an applied update.
 
         An update without an application receipt is reconciled first.
@@ -1040,8 +1194,12 @@ class ConsequenceLedger:
             if state is UpdateState.UNCERTAIN:
                 raise ReconcileFirst(f"update {update_id} has no application receipt")
             if state not in (UpdateState.APPLIED, UpdateState.REVOKED):
-                raise ValueError(f"only an applied update can be revoked, not a {state.value} one")
-            if self._revoke("update", update_id, row["expectation_id"], controller_ref, reason):
+                raise ValueError(
+                    f"only an applied update can be revoked, not a {state.value} one"
+                )
+            if self._revoke(
+                "update", update_id, row["expectation_id"], controller_ref, reason
+            ):
                 self._conn.execute(
                     "UPDATE cl_updates SET state=? WHERE owner=? AND update_id=?",
                     (UpdateState.REVOKED.value, self.owner, update_id),
@@ -1059,7 +1217,12 @@ class ConsequenceLedger:
         return [json.loads(r[0]) for r in rows]
 
     def _revoke(
-        self, kind: str, record_id: str, expectation_id: str, controller_ref: str, reason: str
+        self,
+        kind: str,
+        record_id: str,
+        expectation_id: str,
+        controller_ref: str,
+        reason: str,
     ) -> bool:
         """Append one revocation; False when the same one is already retained."""
         _name(controller_ref, "controller_ref")
@@ -1104,7 +1267,11 @@ class ConsequenceLedger:
     # --- history -------------------------------------------------------------
 
     def history(
-        self, expectation_id: str | None = None, *, after_sequence: int = 0, limit: int = 100
+        self,
+        expectation_id: str | None = None,
+        *,
+        after_sequence: int = 0,
+        limit: int = 100,
     ) -> list[dict[str, Any]]:
         """Read bounded ordered evidence. Continue with the last sequence."""
         if type(limit) is not int or not 1 <= limit <= 1000:
@@ -1117,7 +1284,9 @@ class ConsequenceLedger:
             sql += " AND expectation_id=?"
             args.append(_name(expectation_id, "expectation_id"))
         with self._lock:
-            rows = self._conn.execute(sql + " ORDER BY sequence LIMIT ?", [*args, limit]).fetchall()
+            rows = self._conn.execute(
+                sql + " ORDER BY sequence LIMIT ?", [*args, limit]
+            ).fetchall()
         return [
             {
                 "sequence": row["sequence"],

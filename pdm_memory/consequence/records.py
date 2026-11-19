@@ -46,6 +46,7 @@ __all__ = [
     "ObservationProposal",
     "Ordering",
     "OwnerPolicy",
+    "ProposalStatus",
     "QuantityStatus",
     "ReconcileFirst",
     "Response",
@@ -290,7 +291,9 @@ class EventCondition:
             raise ValueError("comparator must be a (name, version) pair")
         object.__setattr__(self, "comparator", _texts(comparator, "comparator"))
         g = self.grade_for_s
-        if g is not None and (type(g) not in (int, float) or not math.isfinite(g) or g <= 0):
+        if g is not None and (
+            type(g) not in (int, float) or not math.isfinite(g) or g <= 0
+        ):
             raise ValueError("grade_for_s must be a finite positive number")
 
     @classmethod
@@ -314,8 +317,12 @@ class Horizon:
             require_aware(getattr(self, label), label)
         if self.window_end <= self.window_start:
             raise ValueError("the observation window must close after it opens")
-        object.__setattr__(self, "environment_versions", dict(self.environment_versions))
-        object.__setattr__(self, "invalidated_by", _texts(self.invalidated_by, "condition"))
+        object.__setattr__(
+            self, "environment_versions", dict(self.environment_versions)
+        )
+        object.__setattr__(
+            self, "invalidated_by", _texts(self.invalidated_by, "condition")
+        )
         if self.event is not None and not isinstance(self.event, EventCondition):
             raise TypeError("event must be an EventCondition")
 
@@ -329,7 +336,9 @@ class Horizon:
             ),
             environment_versions=data["environment_versions"],
             invalidated_by=tuple(data["invalidated_by"]),
-            event=EventCondition.from_dict(data["event"]) if data.get("event") else None,
+            event=EventCondition.from_dict(data["event"])
+            if data.get("event")
+            else None,
         )
 
 
@@ -458,7 +467,9 @@ class Observation:
                 **data,
                 "event_time": parse_datetime(data["event_time"], "event_time"),
                 "arrival_time": parse_datetime(data["arrival_time"], "arrival_time"),
-                "coverage": None if coverage is None else tuple(_opt_dt(c) for c in coverage),
+                "coverage": None
+                if coverage is None
+                else tuple(_opt_dt(c) for c in coverage),
             }
         )
 
@@ -480,8 +491,12 @@ class SourceDecl:
 
     def __post_init__(self) -> None:
         _name(self.name, "source name")
-        object.__setattr__(self, "observables", frozenset(_texts(self.observables, "observable")))
-        if type(self.latency_s) not in (int, float) or not math.isfinite(self.latency_s):
+        object.__setattr__(
+            self, "observables", frozenset(_texts(self.observables, "observable"))
+        )
+        if type(self.latency_s) not in (int, float) or not math.isfinite(
+            self.latency_s
+        ):
             raise ValueError("latency_s must be a finite number")
         if self.latency_s < 0:
             raise ValueError("latency_s must not be negative")
@@ -542,7 +557,9 @@ class OwnerPolicy:
         comparators = frozenset(tuple(c) for c in self.comparators)
         unknown = comparators - COMPARATORS.keys()
         if unknown:
-            raise ConfigurationError(f"no implementation for comparators {sorted(unknown)}")
+            raise ConfigurationError(
+                f"no implementation for comparators {sorted(unknown)}"
+            )
         object.__setattr__(self, "comparators", comparators)
         targets = frozenset(_texts(self.learning_targets, "learning target"))
         if targets & PROTECTED_TARGETS:
@@ -555,7 +572,10 @@ class OwnerPolicy:
                 self,
                 "exchange_rules",
                 MappingProxyType(
-                    {_name(k, "unit"): to_decimal(v, "exchange rate") for k, v in self.exchange_rules.items()}
+                    {
+                        _name(k, "unit"): to_decimal(v, "exchange rate")
+                        for k, v in self.exchange_rules.items()
+                    }
                 ),
             )
         if self.priorities is not None:
@@ -563,7 +583,9 @@ class OwnerPolicy:
                 _name(task_id, "task_id")
                 if type(rank) is not int or rank < 0:
                     raise ConfigurationError("a priority is a nonnegative integer")
-            object.__setattr__(self, "priorities", MappingProxyType(dict(self.priorities)))
+            object.__setattr__(
+                self, "priorities", MappingProxyType(dict(self.priorities))
+            )
         threshold = self.interruption_priority
         if threshold is not None and (type(threshold) is not int or threshold < 0):
             raise ConfigurationError("interruption_priority is a nonnegative integer")
@@ -644,14 +666,18 @@ class Evaluation:
         return record
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any], superseded_by: str | None = None) -> Evaluation:
+    def from_dict(
+        cls, data: Mapping[str, Any], superseded_by: str | None = None
+    ) -> Evaluation:
         return cls(
             evaluation_id=data["evaluation_id"],
             expectation_id=data["expectation_id"],
             revision=data["revision"],
             findings=tuple(Finding.from_dict(f) for f in data["findings"]),
             policy_version=data["policy_version"],
-            causes=tuple(CauseHypothesis(c["cause"], tuple(c["support"])) for c in data["causes"]),
+            causes=tuple(
+                CauseHypothesis(c["cause"], tuple(c["support"])) for c in data["causes"]
+            ),
             attribution_supported=data["attribution_supported"],
             response=Response(data["response"]),
             superseded_by=superseded_by,
@@ -749,7 +775,9 @@ class ConsequenceEntry:
         object.__setattr__(self, "status", QuantityStatus(self.status))
         require_aware(self.horizon_end, "horizon_end")
         if (self.quantity is None) != (self.status is QuantityStatus.UNKNOWN):
-            raise ValueError("an UNKNOWN quantity has no value, and only an UNKNOWN one")
+            raise ValueError(
+                "an UNKNOWN quantity has no value, and only an UNKNOWN one"
+            )
         if self.quantity is not None:
             object.__setattr__(self, "quantity", to_decimal(self.quantity, "quantity"))
         if type(self.boundary_violation) is not bool:
@@ -793,12 +821,17 @@ class Significance:
 
 @dataclass(frozen=True)
 class CapacityFinding:
-    status: Literal["WITHIN", "EXCEEDS", "UNKNOWN_CAPACITY", "ZERO_CAPACITY", "INCOMPATIBLE_UNITS"]
+    status: Literal[
+        "WITHIN", "EXCEEDS", "UNKNOWN_CAPACITY", "ZERO_CAPACITY", "INCOMPATIBLE_UNITS"
+    ]
     ratio: Decimal | None = None
 
 
 def compare_to_capacity(
-    forecast: Decimal, forecast_unit: str, remaining: Decimal | None, remaining_unit: str
+    forecast: Decimal,
+    forecast_unit: str,
+    remaining: Decimal | None,
+    remaining_unit: str,
 ) -> CapacityFinding:
     """Expected burden against a declared remaining budget, in one unit or not at all."""
     forecast = to_decimal(forecast, "forecast")
@@ -829,7 +862,15 @@ class SourceValue:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> SourceValue:
         net = data["net"]
-        return cls(data["source"], data["verdict"], None if net is None else Decimal(net), data["reason"])
+        return cls(
+            data["source"],
+            data["verdict"],
+            None if net is None else Decimal(net),
+            data["reason"],
+        )
+
+
+ProposalStatus = Literal["OPEN", "EXHAUSTED", "TOO_LATE", "CLOSED"]
 
 
 @dataclass(frozen=True)
@@ -844,7 +885,7 @@ class ObservationProposal:
     sources: tuple[SourceDecl, ...]
     ordered: bool
     deadline: datetime
-    status: Literal["OPEN", "EXHAUSTED", "TOO_LATE", "CLOSED"]
+    status: ProposalStatus
     escalation: str = ""
     values: tuple[SourceValue, ...] = field(default=(), metadata=_OPTIONAL)
 
@@ -862,7 +903,9 @@ class ObservationProposal:
                     for s in data["sources"]
                 ),
                 "deadline": parse_datetime(data["deadline"], "deadline"),
-                "values": tuple(SourceValue.from_dict(v) for v in data.get("values", ())),
+                "values": tuple(
+                    SourceValue.from_dict(v) for v in data.get("values", ())
+                ),
                 "status": status,
             }
         )

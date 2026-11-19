@@ -28,8 +28,14 @@ from tests.consequence_fixtures import (
 )
 from tests.ledger_target import ledger_target
 
-SUPPLY = replace(TEMP, observation_id="obs-supply", source="supply-gauge", observable="supply_bar",
-                 unit="bar", value=0.4)
+SUPPLY = replace(
+    TEMP,
+    observation_id="obs-supply",
+    source="supply-gauge",
+    observable="supply_bar",
+    unit="bar",
+    value=0.4,
+)
 
 
 def _open(path):
@@ -51,15 +57,18 @@ def _steps_1_to_3(ledger, guard):
 
 def test_the_valve_episode_confirms_and_continues(tmp_path):
     calls = []
-    with _open(ledger_target(tmp_path, "c.db")) as ledger, _guard(
-        tmp_path, check=ledger.prepared_check, handler=calls.append
-    ) as guard:
+    with (
+        _open(ledger_target(tmp_path, "c.db")) as ledger,
+        _guard(tmp_path, check=ledger.prepared_check, handler=calls.append) as guard,
+    ):
         receipt, ev, proposals = _steps_1_to_3(ledger, guard)
         assert receipt.status == "RETURNED" and receipt.executed is None
         assert ev.finding("moved").comparison is Comparison.CONFIRMED_MATCH
         assert ev.finding("room_temp").comparison is Comparison.UNRESOLVED
         assert [p.criterion for p in proposals] == ["room_temp"]
-        assert guard.dispatch_count("open", "valve-3") == 1  # no second movement requested
+        assert (
+            guard.dispatch_count("open", "valve-3") == 1
+        )  # no second movement requested
         # 4a. A temperature in band confirms; continuing needs no adjustment.
         ledger.observe(replace(TEMP, value=21.0))
         done = ledger.evaluate("exp-valve-1", task=TASK)
@@ -69,7 +78,10 @@ def test_the_valve_episode_confirms_and_continues(tmp_path):
 
 
 def test_the_valve_episode_learns_from_a_supported_miss_once(tmp_path):
-    with _open(ledger_target(tmp_path, "c.db")) as ledger, _guard(tmp_path, check=ledger.prepared_check) as guard:
+    with (
+        _open(ledger_target(tmp_path, "c.db")) as ledger,
+        _guard(tmp_path, check=ledger.prepared_check) as guard,
+    ):
         _steps_1_to_3(ledger, guard)
         # 4b. A valid reading misses; a cause backed by its own reading is supported.
         ledger.observe(SUPPLY)
@@ -105,28 +117,37 @@ def test_the_valve_episode_learns_from_a_supported_miss_once(tmp_path):
         ledger.observe(replace(TEMP, value=18.0))
         again = ledger.evaluate("exp-valve-1", task=TASK, causes=causes)
         assert again == ev
-        assert ledger.propose_learning(
-            again.evaluation_id,
-            task=TASK,
-            criterion="room_temp",
-            target_kind="belief",
-            target_id="supply-pressure-ok",
-            target_version="1",
-            change={"reopen": True},
-            scope="boiler loop B",
-            confidence=0.7,
-            route=Route.OWN_ACTION,
-            evidence_kind=EvidenceKind.MEASURED,
-        ) == proposal
+        assert (
+            ledger.propose_learning(
+                again.evaluation_id,
+                task=TASK,
+                criterion="room_temp",
+                target_kind="belief",
+                target_id="supply-pressure-ok",
+                target_version="1",
+                change={"reopen": True},
+                scope="boiler loop B",
+                confidence=0.7,
+                route=Route.OWN_ACTION,
+                evidence_kind=EvidenceKind.MEASURED,
+            )
+            == proposal
+        )
         assert len(ledger.history(limit=1000)) == events
         assert guard.dispatch_count("open", "valve-3") == 1
 
 
 def test_worker_recovery_mid_episode(tmp_path):
-    with _open(ledger_target(tmp_path, "c.db")) as ledger, _guard(tmp_path, check=ledger.prepared_check) as guard:
+    with (
+        _open(ledger_target(tmp_path, "c.db")) as ledger,
+        _guard(tmp_path, check=ledger.prepared_check) as guard,
+    ):
         _, ev, proposals = _steps_1_to_3(ledger, guard)
         events = ledger.history(limit=1000)
-    with _open(ledger_target(tmp_path, "c.db")) as ledger, _guard(tmp_path, check=ledger.prepared_check) as guard:
+    with (
+        _open(ledger_target(tmp_path, "c.db")) as ledger,
+        _guard(tmp_path, check=ledger.prepared_check) as guard,
+    ):
         _, again, replayed = _steps_1_to_3(ledger, guard)
         assert (again, replayed) == (ev, proposals)
         assert ledger.history(limit=1000) == events

@@ -15,7 +15,9 @@ from tests.ledger_target import PG_URL, postgres_target
 
 needs_pg = pytest.mark.skipif(not PG_URL, reason="PDM_TEST_POSTGRES_URL is not set")
 SCHEMA = "CREATE TABLE IF NOT EXISTS t (a TEXT, b INTEGER);"
-EVENTS = "CREATE TABLE IF NOT EXISTS events (n INTEGER PRIMARY KEY, kind TEXT NOT NULL);"
+EVENTS = (
+    "CREATE TABLE IF NOT EXISTS events (n INTEGER PRIMARY KEY, kind TEXT NOT NULL);"
+)
 
 
 @pytest.fixture(params=["sqlite", pytest.param("postgres", marks=needs_pg)])
@@ -51,7 +53,12 @@ def test_rows_read_by_index_name_and_dict(db):
     db.execute("INSERT INTO t VALUES (?, ?)", ("x", 1))
     row = db.execute("SELECT a, b FROM t").fetchone()
     assert isinstance(row, Row)
-    assert (row[0], row["b"], dict(row), row.keys()) == ("x", 1, {"a": "x", "b": 1}, ["a", "b"])
+    assert (row[0], row["b"], dict(row), row.keys()) == (
+        "x",
+        1,
+        {"a": "x", "b": 1},
+        ["a", "b"],
+    )
     with pytest.raises(IndexError):
         row["missing"]
 
@@ -59,7 +66,9 @@ def test_rows_read_by_index_name_and_dict(db):
 def test_percent_and_question_marks_in_values_round_trip(db):
     for value in ("50%?", '{"p": "10%"}', "%s", "?"):
         db.execute("INSERT INTO t VALUES (?, ?)", (value, 0))
-        assert db.execute("SELECT a FROM t WHERE a=?", (value,)).fetchone()["a"] == value
+        assert (
+            db.execute("SELECT a FROM t WHERE a=?", (value,)).fetchone()["a"] == value
+        )
 
 
 def test_a_bool_is_stored_as_an_integer(db):
@@ -83,7 +92,9 @@ def test_a_transaction_commits_or_rolls_back_whole(db):
 
 def test_append_only_tables_refuse_update_delete_and_truncate(db):
     db.create_schema(EVENTS, append_only={"events": "history is append-only"})
-    db.create_schema(EVENTS, append_only={"events": "history is append-only"})  # idempotent
+    db.create_schema(
+        EVENTS, append_only={"events": "history is append-only"}
+    )  # idempotent
     db.execute("INSERT INTO events VALUES (1, 'x')")
     with pytest.raises(db.Error, match="append-only"):
         db.execute("DELETE FROM events")
@@ -100,8 +111,14 @@ def test_an_ordered_table_reads_back_in_insert_order(db):
     db.create_schema("CREATE TABLE IF NOT EXISTS o (k TEXT, v TEXT);", ordered=("o",))
     for k in ("c", "a", "b"):
         db.execute("INSERT INTO o VALUES (?, ?)", (k, k))
-    assert [r[0] for r in db.execute("SELECT k FROM o ORDER BY rowid")] == ["c", "a", "b"]
-    assert [r["k"] for r in db.execute("SELECT * FROM o ORDER BY rowid DESC LIMIT 1")] == ["b"]
+    assert [r[0] for r in db.execute("SELECT k FROM o ORDER BY rowid")] == [
+        "c",
+        "a",
+        "b",
+    ]
+    assert [
+        r["k"] for r in db.execute("SELECT * FROM o ORDER BY rowid DESC LIMIT 1")
+    ] == ["b"]
 
 
 def test_columns_lists_a_tables_columns(db):
@@ -125,7 +142,9 @@ def _writer(target, worker, rounds):
 
 def _opener(target):
     d = Database(target, lock_key="test")
-    d.create_schema(SCHEMA + EVENTS, append_only={"events": "append-only"}, ordered=("t",))
+    d.create_schema(
+        SCHEMA + EVENTS, append_only={"events": "append-only"}, ordered=("t",)
+    )
     d.close()
     return True
 
@@ -268,7 +287,9 @@ def test_ledgers_in_different_schemas_do_not_share_a_writer_lock(pg_target, tmp_
     b = Database(other, lock_key="test")
     a.begin()
     done = []
-    thread = threading.Thread(target=lambda: (b.begin(), b.commit(), done.append(True)), daemon=True)
+    thread = threading.Thread(
+        target=lambda: (b.begin(), b.commit(), done.append(True)), daemon=True
+    )
     thread.start()
     thread.join(5)
     blocked = not done
@@ -339,7 +360,12 @@ def test_migration_steps_run_once_in_order(target):
     again = Database(target, lock_key="test")
     again.migrate("k", [*steps, _step("m3", log)])
     assert log == ["m1", "m2", "m3"]
-    assert again.execute("SELECT version FROM pdm_schema_versions WHERE kind='k'").fetchone()[0] == 3
+    assert (
+        again.execute(
+            "SELECT version FROM pdm_schema_versions WHERE kind='k'"
+        ).fetchone()[0]
+        == 3
+    )
     assert again.columns("m3") == {"x"}
     again.close()
 
@@ -371,22 +397,34 @@ def test_a_failing_step_leaves_no_trace(db):
     with pytest.raises(RuntimeError, match="step failed"):
         db.migrate("k", [_step("m1", log), broken])
     assert db.columns("half") == set()
-    assert db.execute("SELECT version FROM pdm_schema_versions WHERE kind='k'").fetchone()[0] == 1
+    assert (
+        db.execute("SELECT version FROM pdm_schema_versions WHERE kind='k'").fetchone()[
+            0
+        ]
+        == 1
+    )
     assert not db.in_transaction
 
 
 def _migrator(target, kind):
     d = Database(target, lock_key=f"kind-{kind}")
-    d.migrate(kind, [lambda x: x.create_tables(EVENTS, append_only={"events": "append-only"})])
+    d.migrate(
+        kind, [lambda x: x.create_tables(EVENTS, append_only={"events": "append-only"})]
+    )
     d.close()
     return True
 
 
 def test_two_kinds_migrate_one_new_schema_at_once(target):
     with _pool() as pool:
-        assert pool.starmap(_migrator, [(target, k) for k in ("ka", "kb", "ka", "kb")]) == [True] * 4
+        assert (
+            pool.starmap(_migrator, [(target, k) for k in ("ka", "kb", "ka", "kb")])
+            == [True] * 4
+        )
     d = Database(target, lock_key="t")
-    assert dict(d.execute("SELECT kind, version FROM pdm_schema_versions").fetchall()) == {
+    assert dict(
+        d.execute("SELECT kind, version FROM pdm_schema_versions").fetchall()
+    ) == {
         "ka": 1,
         "kb": 1,
     }
