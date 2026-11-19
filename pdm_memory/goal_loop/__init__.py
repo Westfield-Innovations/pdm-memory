@@ -17,7 +17,12 @@ No PDM store, account or network is needed; ``InMemoryJobStore`` is the default
 and ``SqliteJobStore`` makes jobs survive the process.
 """
 
-from pdm_memory.goal_loop.checker import CallableChecker, Checker, ProofReceipt, ProofVerdict
+from pdm_memory.goal_loop.checker import (
+    CallableChecker,
+    Checker,
+    ProofReceipt,
+    ProofVerdict,
+)
 from pdm_memory.goal_loop.contract import (
     PROMISE_FIELDS,
     Autonomy,
@@ -44,6 +49,7 @@ from pdm_memory.goal_loop.store import (
     JobExistsError,
     JobNotFoundError,
     JobStore,
+    PostgresJobStore,
     SqliteJobStore,
     StaleJobError,
 )
@@ -78,6 +84,7 @@ __all__ = [
     "Notify",
     "Observation",
     "OwnerApproval",
+    "PostgresJobStore",
     "PromiseChangeError",
     "Proof",
     "ProofReceipt",

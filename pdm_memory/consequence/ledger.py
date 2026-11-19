@@ -1,0 +1,1305 @@
+"""The consequence ledger: an owner-held, append-only record of expectations.
+
+Like ``GuardedEffects``, this is a separate SQLite file outside the worker's
+write authority. Its history is a hash chain that cannot be updated or
+deleted. Retaining an expectation is never permission to act: the host's
+action guard keeps release, and ``prepared_check`` only tells that guard
+whether an expectation was committed first.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+from collections.abc import Callable
+from contextlib import contextmanager
+from datetime import datetime
+from decimal import Decimal
+from pathlib import Path
+from typing import Any, cast
+
+from pdm_memory._ledger.chain import append_event, verify_events
+from pdm_memory._ledger.db import Database, Row
+from pdm_memory.consequence import grading
+from pdm_memory.consequence.compare import COMPARATORS
+from pdm_memory.consequence.records import (
+    PROTECTED_TARGETS,
+    Account,
+    AccountSummary,
+    Admission,
+    Applicability,
+    Application,
+    CauseHypothesis,
+    Comparison,
+    ConsequenceEntry,
+    Criterion,
+    Evaluation,
+    EventCondition,
+    EvidenceKind,
+    Expectation,
+    ForecastRow,
+    LearningProposal,
+    NotSupported,
+    Observation,
+    ObservationProposal,
+    Ordering,
+    OwnerPolicy,
+    ProposalStatus,
+    QuantityStatus,
+    ReconcileFirst,
+    Response,
+    Revoked,
+    Route,
+    Significance,
+    TaskRef,
+    UnauthorizedChange,
+    UpdateState,
+)
+from pdm_memory.goal_loop._json import dumps, parse_datetime, require_aware, utc_now
+from pdm_memory.guarded_effects import (
+    ActionReceipt,
+    CheckResult,
+    ConditionVerdict,
+    EffectRequest,
+    IdReuseError,
+    ResourceLimitError,
+    _hash,
+    _name,
+)
+
+__all__ = ["ConsequenceLedger"]
+
+_COUNT = {
+    Comparison.CONFIRMED_MATCH: "match",
+    Comparison.CONFIRMED_MISS: "miss",
+    Comparison.UNRESOLVED: "unresolved",
+    Comparison.CONFLICT: "conflict",
+}
+_GRADED = (Comparison.CONFIRMED_MATCH, Comparison.CONFIRMED_MISS)
+_OPEN_OR_APPLIED = {
+    UpdateState.PROPOSED.value,
+    UpdateState.DEFERRED.value,
+    UpdateState.APPLIED.value,
+}
+_NEXT = {
+    UpdateState.PROPOSED: {
+        UpdateState.DEFERRED,
+        UpdateState.REJECTED,
+        UpdateState.UNCERTAIN,
+        UpdateState.APPLIED,
+        UpdateState.NOT_APPLIED,
+    },
+    UpdateState.DEFERRED: {
+        UpdateState.REJECTED,
+        UpdateState.UNCERTAIN,
+        UpdateState.APPLIED,
+        UpdateState.NOT_APPLIED,
+    },
+    UpdateState.UNCERTAIN: {UpdateState.APPLIED, UpdateState.NOT_APPLIED},
+    UpdateState.REJECTED: set(),
+    UpdateState.APPLIED: {UpdateState.REVOKED},
+    UpdateState.NOT_APPLIED: set(),
+    UpdateState.REVOKED: set(),
+}
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS cl_expectations (
+  owner TEXT NOT NULL, expectation_id TEXT NOT NULL, record_json TEXT NOT NULL,
+  action_id TEXT, committed_at TEXT NOT NULL, committed_seq INTEGER NOT NULL,
+  PRIMARY KEY(owner, expectation_id));
+CREATE UNIQUE INDEX IF NOT EXISTS cl_expectations_action
+  ON cl_expectations(owner, action_id) WHERE action_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS cl_actions (
+  owner TEXT NOT NULL, action_id TEXT NOT NULL, receipt_sequence INTEGER NOT NULL,
+  expectation_id TEXT NOT NULL, status TEXT NOT NULL, request_hash TEXT NOT NULL,
+  PRIMARY KEY(owner, action_id, receipt_sequence));
+CREATE TABLE IF NOT EXISTS cl_observations (
+  owner TEXT NOT NULL, observation_id TEXT NOT NULL, revision INTEGER NOT NULL,
+  record_json TEXT NOT NULL, recorded_seq INTEGER NOT NULL,
+  PRIMARY KEY(owner, observation_id, revision));
+CREATE TABLE IF NOT EXISTS cl_evaluations (
+  owner TEXT NOT NULL, evaluation_id TEXT NOT NULL, expectation_id TEXT NOT NULL,
+  revision INTEGER NOT NULL, record_json TEXT NOT NULL, superseded_by TEXT,
+  PRIMARY KEY(owner, evaluation_id), UNIQUE(owner, expectation_id, revision));
+CREATE TABLE IF NOT EXISTS cl_updates (
+  owner TEXT NOT NULL, update_id TEXT NOT NULL, expectation_id TEXT NOT NULL,
+  criterion TEXT NOT NULL, target_kind TEXT NOT NULL, target_id TEXT NOT NULL,
+  record_json TEXT NOT NULL, state TEXT NOT NULL,
+  PRIMARY KEY(owner, update_id));
+CREATE TABLE IF NOT EXISTS cl_consequences (
+  owner TEXT NOT NULL, entry_id TEXT NOT NULL, expectation_id TEXT NOT NULL,
+  record_json TEXT NOT NULL, PRIMARY KEY(owner, entry_id));
+CREATE TABLE IF NOT EXISTS cl_proposals (
+  owner TEXT NOT NULL, proposal_id TEXT NOT NULL, expectation_id TEXT NOT NULL,
+  criterion TEXT NOT NULL, status TEXT NOT NULL, record_json TEXT NOT NULL,
+  PRIMARY KEY(owner, proposal_id));
+CREATE TABLE IF NOT EXISTS cl_revocations (
+  owner TEXT NOT NULL, kind TEXT NOT NULL, record_id TEXT NOT NULL,
+  expectation_id TEXT NOT NULL, record_json TEXT NOT NULL,
+  PRIMARY KEY(owner, kind, record_id));
+CREATE TABLE IF NOT EXISTS cl_events (
+  sequence INTEGER PRIMARY KEY, owner TEXT NOT NULL, expectation_id TEXT,
+  kind TEXT NOT NULL, payload_json TEXT NOT NULL, previous_hash TEXT NOT NULL,
+  event_hash TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS cl_events_owner ON cl_events(owner, sequence);
+"""
+# Tables read back ORDER BY rowid; Postgres gives them that column explicitly.
+_ORDERED = ("cl_evaluations", "cl_updates", "cl_consequences", "cl_revocations")
+# Append a step to change the schema; never edit a step that has shipped.
+_MIGRATIONS = (
+    lambda db: db.create_tables(
+        _SCHEMA,
+        append_only={"cl_events": "consequence history is append-only"},
+        ordered=_ORDERED,
+    ),
+)
+
+
+class ConsequenceLedger:
+    """Retain expectations, action references and observations for one owner.
+
+    The policy is the owner's; nothing on this object edits it. Every record
+    is immutable once written: a correction is a new revision naming the one
+    it supersedes.
+    """
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        owner: str,
+        policy: OwnerPolicy,
+        clock: Callable[[], datetime] = utc_now,
+    ) -> None:
+        if not str(path) or str(path) == ":memory:":
+            raise ValueError("a durable on-disk ledger path is required")
+        if not isinstance(policy, OwnerPolicy):
+            raise TypeError("policy must be an OwnerPolicy")
+        self.owner = _name(owner, "owner")
+        self.policy = policy
+        self._clock = clock
+        self._limit = policy.limits.max_payload_bytes
+        self._lock = threading.RLock()
+        self._conn = Database(path, lock_key="pdm:cl")
+        try:
+            self._conn.migrate("cl", _MIGRATIONS)
+        except BaseException:
+            self._conn.close()
+            raise
+
+    @contextmanager
+    def _transaction(self):
+        with self._lock:
+            self._conn.begin()
+            try:
+                yield
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    def __enter__(self) -> ConsequenceLedger:  # noqa: PYI034 - typing.Self needs 3.11
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+    def _now(self) -> datetime:
+        return require_aware(self._clock(), "clock()")
+
+    def _append(
+        self, kind: str, payload: dict[str, Any], expectation_id: str | None = None
+    ) -> int:
+        payload_json = dumps({**payload, "recorded_at": self._now().isoformat()})
+        return append_event(
+            self._conn, "cl_events", self.owner, expectation_id, kind, payload_json
+        )
+
+    # --- expectations -----------------------------------------------------
+
+    def prepare(self, expectation: Expectation) -> str:
+        """Retain *expectation* and return its id, before the action is released."""
+        if not isinstance(expectation, Expectation):
+            raise TypeError("prepare takes an Expectation")
+        rules: list[Criterion | EventCondition] = list(expectation.criteria)
+        if expectation.horizon.event is not None:
+            rules.append(expectation.horizon.event)
+        for c in rules:
+            if c.comparator not in self.policy.comparators:
+                raise ValueError(
+                    f"comparator {c.comparator} is not registered by the owner"
+                )
+            COMPARATORS[c.comparator].check_expected(c.expected)
+        record = expectation.to_dict()
+        encoded = dumps(record, limit=self._limit)
+        with self._transaction():
+            old = self._conn.execute(
+                "SELECT record_json FROM cl_expectations WHERE owner=? AND expectation_id=?",
+                (self.owner, expectation.expectation_id),
+            ).fetchone()
+            if old:
+                if old["record_json"] != encoded:
+                    raise IdReuseError(
+                        "expectation_id already binds a different expectation"
+                    )
+                return expectation.expectation_id
+            if expectation.action_id is not None and self._expectation_for(
+                expectation.action_id
+            ):
+                raise IdReuseError("this action already has a retained expectation")
+            committed_at = self._now()
+            seq = self._append(
+                "EXPECTATION_COMMITTED",
+                {"expectation": record, "committed_at": committed_at.isoformat()},
+                expectation.expectation_id,
+            )
+            self._conn.execute(
+                "INSERT INTO cl_expectations VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    self.owner,
+                    expectation.expectation_id,
+                    encoded,
+                    expectation.action_id,
+                    committed_at.isoformat(),
+                    seq,
+                ),
+            )
+        return expectation.expectation_id
+
+    def expectation(self, expectation_id: str) -> tuple[Expectation, datetime]:
+        """The retained expectation and when it was committed."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM cl_expectations WHERE owner=? AND expectation_id=?",
+                (self.owner, _name(expectation_id, "expectation_id")),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"no retained expectation {expectation_id}")
+        return (
+            Expectation.from_dict(json.loads(row["record_json"])),
+            parse_datetime(row["committed_at"], "committed_at"),
+        )
+
+    def _expectation_for(self, action_id: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT expectation_id FROM cl_expectations WHERE owner=? AND action_id=?",
+            (self.owner, action_id),
+        ).fetchone()
+        return row[0] if row else None
+
+    def prepared_check(self, request: EffectRequest) -> ConditionVerdict:
+        """A ``GuardedEffects`` check: release only after an expectation is retained.
+
+        Missing is UNKNOWN, so the guard holds the action instead of rejecting it.
+        """
+        with self._lock:
+            expectation_id = self._expectation_for(request.action_id)
+            revoked = expectation_id is not None and self._is_revoked(expectation_id)
+        if expectation_id is None:
+            return ConditionVerdict(
+                CheckResult.UNKNOWN, "no retained expectation for this action"
+            )
+        if revoked:
+            return ConditionVerdict(
+                CheckResult.UNKNOWN,
+                "the expectation was revoked",
+                {"expectation_id": expectation_id},
+            )
+        return ConditionVerdict(
+            CheckResult.SATISFIED,
+            "expectation retained",
+            {"expectation_id": expectation_id},
+        )
+
+    # --- actions and observations -------------------------------------------
+
+    def attach_action(self, expectation_id: str, receipt: ActionReceipt) -> None:
+        """Append a guard receipt. A handler return is execution state, not an effect."""
+        if not isinstance(receipt, ActionReceipt):
+            raise TypeError("attach_action takes the guard's ActionReceipt")
+        expectation, _ = self.expectation(expectation_id)
+        if expectation.action_id != receipt.action_id:
+            raise ValueError("the receipt's action is not this expectation's action")
+        with self._transaction():
+            old = self._conn.execute(
+                "SELECT status, request_hash FROM cl_actions"
+                " WHERE owner=? AND action_id=? AND receipt_sequence=?",
+                (self.owner, receipt.action_id, receipt.sequence),
+            ).fetchone()
+            if old:
+                if (old["status"], old["request_hash"]) != (
+                    receipt.status,
+                    receipt.request_hash,
+                ):
+                    raise IdReuseError(
+                        "this receipt sequence already binds a different receipt"
+                    )
+                return
+            self._append(
+                "ACTION_ATTACHED",
+                {
+                    "action_id": receipt.action_id,
+                    "receipt_sequence": receipt.sequence,
+                    "status": receipt.status,
+                    "disposition": receipt.disposition.value,
+                    "request_hash": receipt.request_hash,
+                    "executed": receipt.executed,
+                },
+                expectation_id,
+            )
+            self._conn.execute(
+                "INSERT INTO cl_actions VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    self.owner,
+                    receipt.action_id,
+                    receipt.sequence,
+                    expectation_id,
+                    receipt.status,
+                    receipt.request_hash,
+                ),
+            )
+
+    def actions(self, expectation_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT action_id, receipt_sequence, status FROM cl_actions"
+                " WHERE owner=? AND expectation_id=? ORDER BY receipt_sequence",
+                (self.owner, expectation_id),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def observe(self, observation: Observation) -> tuple[str, int]:
+        """Append one observation revision; a correction names what it supersedes."""
+        if not isinstance(observation, Observation):
+            raise TypeError("observe takes an Observation")
+        record = observation.to_dict()
+        encoded = dumps(record, limit=self._limit)
+        key = (observation.observation_id, observation.revision)
+        with self._transaction():
+            old = self._conn.execute(
+                "SELECT record_json FROM cl_observations"
+                " WHERE owner=? AND observation_id=? AND revision=?",
+                (self.owner, *key),
+            ).fetchone()
+            if old:
+                if old["record_json"] != encoded:
+                    raise IdReuseError(
+                        "this observation revision already binds different evidence"
+                    )
+                return key
+            latest = self._conn.execute(
+                "SELECT MAX(revision) FROM cl_observations WHERE owner=? AND observation_id=?",
+                (self.owner, observation.observation_id),
+            ).fetchone()[0]
+            if (
+                observation.revision != (latest or 0) + 1
+                or observation.supersedes != latest
+            ):
+                raise ValueError(
+                    f"revision {observation.revision} must follow revision {latest or 0}"
+                    f" and name supersedes={latest}"
+                )
+            seq = self._append("OBSERVATION_RECORDED", {"observation": record})
+            self._conn.execute(
+                "INSERT INTO cl_observations VALUES (?, ?, ?, ?, ?)",
+                (self.owner, *key, encoded, seq),
+            )
+        return key
+
+    def observations(self, observable: str | None = None) -> list[Observation]:
+        """The latest revision of every observation, in recording order."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT o.record_json FROM cl_observations o"
+                " WHERE o.owner=? AND o.revision = (SELECT MAX(revision) FROM cl_observations"
+                " WHERE owner=o.owner AND observation_id=o.observation_id)"
+                " ORDER BY o.recorded_seq",
+                (self.owner,),
+            ).fetchall()
+        out = [Observation.from_dict(json.loads(r[0])) for r in rows]
+        return [o for o in out if observable is None or o.observable == observable]
+
+    # --- evaluation ----------------------------------------------------------
+
+    def evaluate(
+        self,
+        expectation_id: str,
+        *,
+        task: TaskRef,
+        causes: tuple[CauseHypothesis, ...] | None = None,
+    ) -> Evaluation:
+        """Grade each criterion against admissible evidence, for these exact revisions.
+
+        The same evidence, comparators and policy return the same evaluation;
+        restating a cause without new evidence is not new evidence. Without
+        *causes* the current evaluation's hypotheses carry forward; ``()`` drops them.
+        """
+        expectation, committed_at = self.expectation(expectation_id)
+        if task != expectation.task:
+            raise ValueError("an evaluation is bound to the expectation's own task")
+        if causes is not None:
+            causes = tuple(causes)
+            if not all(isinstance(h, CauseHypothesis) for h in causes):
+                raise TypeError("causes must be CauseHypothesis records")
+        # Evidence is read under the write lock, so a slower caller can never
+        # supersede a revision built from newer readings.
+        with self._transaction():
+            self._refuse_revoked(expectation_id)
+            return self._evaluate(expectation, committed_at, causes)
+
+    def _evaluate(
+        self,
+        expectation: Expectation,
+        committed_at: datetime,
+        causes: tuple[CauseHypothesis, ...] | None,
+    ) -> Evaluation:
+        expectation_id = expectation.expectation_id
+        if causes is None:
+            current = self.current_evaluation(expectation_id)
+            causes = current.causes if current is not None else ()
+        observables = {c.observable for c in expectation.criteria}
+        latest = self.observations()
+        by_id = {o.observation_id: o for o in latest}
+        window = grading.grading_window(expectation, latest, self.policy)
+        relevant = [
+            o
+            for o in latest
+            if o.observable in observables
+            and window is not None
+            and grading.in_window(o, window)
+        ]
+        cited = {ref for h in causes for ref in h.support if ref in by_id}
+        inputs = sorted(
+            {(o.observation_id, o.revision) for o in relevant}
+            | {
+                (o.observation_id, o.revision)
+                for o in grading.event_readings(expectation, latest)
+            }
+            | {(ref, by_id[ref].revision) for ref in cited}
+        )
+        evaluation_id = _hash(
+            dumps(
+                [
+                    expectation_id,
+                    [list(i) for i in inputs],
+                    sorted(list(c.comparator) for c in expectation.criteria),
+                    self.policy.policy_version,
+                ]
+            )
+        )
+        old = self._evaluation_row(evaluation_id)
+        if old is not None:
+            return self._evaluation_from(old)
+        revision = (
+            self._conn.execute(
+                "SELECT COALESCE(MAX(revision), 0) FROM cl_evaluations"
+                " WHERE owner=? AND expectation_id=?",
+                (self.owner, expectation_id),
+            ).fetchone()[0]
+            + 1
+        )
+        if revision > self.policy.limits.max_revisions:
+            raise ResourceLimitError(
+                f"{expectation_id} reached {self.policy.limits.max_revisions} evaluation"
+                f" revisions; escalate: {self.policy.escalation}"
+            )
+        findings = tuple(
+            grading.grade_criterion(
+                expectation, committed_at, c, relevant, self.policy, window
+            )
+            for c in expectation.criteria
+        )
+        evaluation = Evaluation(
+            evaluation_id=evaluation_id,
+            expectation_id=expectation_id,
+            revision=revision,
+            findings=findings,
+            policy_version=self.policy.policy_version,
+            causes=causes,
+            attribution_supported=any(
+                h.support
+                and all(
+                    r in by_id
+                    and grading.admissible_support(by_id[r], expectation, self.policy)
+                    for r in h.support
+                )
+                for h in causes
+            ),
+            response=grading.response_for(findings),
+        )
+        record = evaluation.to_dict()
+        previous = self._conn.execute(
+            "SELECT evaluation_id FROM cl_evaluations"
+            " WHERE owner=? AND expectation_id=? AND superseded_by IS NULL",
+            (self.owner, expectation_id),
+        ).fetchone()
+        self._conn.execute(
+            "INSERT INTO cl_evaluations VALUES (?, ?, ?, ?, ?, NULL)",
+            (self.owner, evaluation_id, expectation_id, revision, dumps(record)),
+        )
+        self._append("EVALUATED", {"evaluation": record}, expectation_id)
+        for f in findings:
+            if f.comparison is not Comparison.UNRESOLVED:
+                self._close_proposals(expectation_id, f.criterion, evaluation_id)
+        if previous is not None:
+            # Marked, never deleted: the earlier finding stays readable.
+            self._conn.execute(
+                "UPDATE cl_evaluations SET superseded_by=? WHERE owner=? AND evaluation_id=?",
+                (evaluation_id, self.owner, previous[0]),
+            )
+            self._append(
+                "EVALUATION_SUPERSEDED",
+                {"superseded": previous[0], "by": evaluation_id},
+                expectation_id,
+            )
+        return evaluation
+
+    def current_evaluation(self, expectation_id: str) -> Evaluation | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM cl_evaluations"
+                " WHERE owner=? AND expectation_id=? AND superseded_by IS NULL",
+                (self.owner, expectation_id),
+            ).fetchone()
+        return None if row is None else self._evaluation_from(row)
+
+    def forecast_record(
+        self, predictor: str, *, version: str | None = None
+    ) -> list[ForecastRow]:
+        """Confirmation and error counts of current evaluations, per comparable case.
+
+        Retrospective findings are counted apart: they grade, but they were not forecasts.
+        """
+        rows: dict[tuple[Any, ...], dict[str, Any]] = {}
+        with self._lock:
+            current = self._conn.execute(
+                "SELECT e.record_json, v.record_json AS evaluation_json FROM cl_expectations e"
+                " JOIN cl_evaluations v ON v.owner=e.owner AND v.expectation_id=e.expectation_id"
+                " WHERE e.owner=? AND v.superseded_by IS NULL ORDER BY v.rowid",
+                (self.owner,),
+            ).fetchall()
+            kinds = {
+                (r["observation_id"], r["revision"]): json.loads(r["record_json"])[
+                    "kind"
+                ]
+                for r in self._conn.execute(
+                    "SELECT observation_id, revision, record_json FROM cl_observations WHERE owner=?",
+                    (self.owner,),
+                )
+            }
+        for row in current:
+            expectation = Expectation.from_dict(json.loads(row["record_json"]))
+            if expectation.predictor != predictor or version not in (
+                None,
+                expectation.predictor_version,
+            ):
+                continue
+            evaluation = Evaluation.from_dict(json.loads(row["evaluation_json"]))
+            h = expectation.horizon
+            for f in evaluation.findings:
+                c = expectation.criterion(f.criterion)
+                used_kinds = sorted({kinds[u] for u in f.used})
+                key = (
+                    expectation.predictor_version,
+                    c.observable,
+                    _hash(dumps(expectation.to_dict()["conditions"])),
+                    EvidenceKind(used_kinds[0]) if len(used_kinds) == 1 else None,
+                    grading.horizon_s(h),
+                    dumps(c.expected),
+                )
+                counts = rows.setdefault(
+                    key,
+                    {
+                        "n": 0,
+                        "match": 0,
+                        "miss": 0,
+                        "unresolved": 0,
+                        "conflict": 0,
+                        "retrospective": 0,
+                        "probabilities": [],
+                    },
+                )
+                if f.ordering is Ordering.RETROSPECTIVE:
+                    counts["retrospective"] += 1
+                    continue
+                counts["n"] += 1
+                counts[_COUNT[f.comparison]] += 1
+                if c.comparator[0] == "probabilistic" and f.comparison in _GRADED:
+                    counts["probabilities"].append(float(c.expected["probability"]))
+        return [
+            ForecastRow(
+                predictor=predictor,
+                predictor_version=k[0],
+                observable=k[1],
+                conditions_key=k[2],
+                evidence_kind=k[3],
+                horizon_s=k[4],
+                tolerance=k[5],
+                n=v["n"],
+                match=v["match"],
+                miss=v["miss"],
+                unresolved=v["unresolved"],
+                conflict=v["conflict"],
+                retrospective=v["retrospective"],
+                mean_probability=(
+                    sum(v["probabilities"]) / len(v["probabilities"])
+                    if v["probabilities"]
+                    else None
+                ),
+            )
+            for k, v in rows.items()
+        ]
+
+    def evaluation(self, evaluation_id: str) -> Evaluation:
+        with self._lock:
+            row = self._evaluation_row(_name(evaluation_id, "evaluation_id"))
+        if row is None:
+            raise KeyError(f"no evaluation {evaluation_id}")
+        return self._evaluation_from(row)
+
+    def _evaluation_row(self, evaluation_id: str) -> Row | None:
+        return self._conn.execute(
+            "SELECT * FROM cl_evaluations WHERE owner=? AND evaluation_id=?",
+            (self.owner, evaluation_id),
+        ).fetchone()
+
+    @staticmethod
+    def _evaluation_from(row: Row) -> Evaluation:
+        return Evaluation.from_dict(
+            json.loads(row["record_json"]), row["superseded_by"]
+        )
+
+    # --- learning ------------------------------------------------------------
+
+    def propose_learning(
+        self,
+        evaluation_id: str,
+        *,
+        task: TaskRef,
+        criterion: str,
+        target_kind: str,
+        target_id: str,
+        target_version: str,
+        change: dict[str, Any],
+        scope: str,
+        confidence: float,
+        route: Route,
+        evidence_kind: EvidenceKind,
+        interface_id: str | None = None,
+    ) -> LearningProposal:
+        """Name one target and a bounded change the evaluation supports.
+
+        Nothing is applied here: the owner's update path admits or rejects the
+        proposal and its receipts come back through ``record_update_receipt``.
+        """
+        _name(target_kind, "target_kind")
+        if (
+            target_kind in PROTECTED_TARGETS
+            or target_kind not in self.policy.learning_targets
+        ):
+            raise UnauthorizedChange(
+                f"{target_kind} is not an owner-admitted learning target"
+            )
+        _name(target_id, "target_id")
+        _name(target_version, "target_version")
+        _name(scope, "scope")
+        route, evidence_kind = Route(route), EvidenceKind(evidence_kind)
+        if type(confidence) not in (int, float) or not 0 <= confidence <= 1:
+            raise ValueError("confidence must be between 0 and 1")
+        if not isinstance(change, dict) or not change:
+            raise ValueError("a proposal names its change")
+        dumps(change, limit=self._limit)
+        evaluation = self.evaluation(evaluation_id)
+        expectation, _ = self.expectation(evaluation.expectation_id)
+        if task != expectation.task:
+            raise ValueError("a proposal is bound to the expectation's own task")
+        if evaluation.superseded_by is not None:
+            raise NotSupported(
+                "this evaluation was superseded; propose from the current one"
+            )
+        finding = evaluation.finding(criterion)
+        if finding.applicability is not Applicability.APPLICABLE:
+            raise NotSupported(
+                f"the finding is {finding.applicability.value}, not applicable"
+            )
+        if finding.comparison not in _GRADED:
+            raise NotSupported(f"the finding is {finding.comparison.value}")
+        if (
+            finding.comparison is Comparison.CONFIRMED_MISS
+            and not evaluation.attribution_supported
+        ):
+            raise NotSupported("attribution unresolved; the miss is retained")
+        if target_kind == "interface_calibration" and (
+            route is not Route.OWN_ACTION
+            or interface_id is None
+            or interface_id != expectation.interface_id
+        ):
+            raise NotSupported(
+                "only this interface's own action can calibrate this interface"
+            )
+        update_id = _hash(
+            dumps(
+                [
+                    expectation.expectation_id,
+                    criterion,
+                    target_kind,
+                    target_id,
+                    target_version,
+                    change,
+                ]
+            )
+        )
+        with self._transaction():
+            old = self._conn.execute(
+                "SELECT record_json FROM cl_updates WHERE owner=? AND update_id=?",
+                (self.owner, update_id),
+            ).fetchone()
+            if old is not None:
+                return LearningProposal.from_dict(json.loads(old[0]))
+            self._refuse_revoked(expectation.expectation_id)
+            same_target = (
+                self.owner,
+                expectation.expectation_id,
+                criterion,
+                target_kind,
+                target_id,
+            )
+            uncertain = self._conn.execute(
+                "SELECT update_id FROM cl_updates WHERE owner=? AND expectation_id=?"
+                " AND criterion=? AND target_kind=? AND target_id=? AND state=? LIMIT 1",
+                (*same_target, UpdateState.UNCERTAIN.value),
+            ).fetchone()
+            if uncertain is not None:
+                raise ReconcileFirst(
+                    f"update {uncertain[0]} has no application receipt"
+                )
+            prior = self._conn.execute(
+                "SELECT update_id, state FROM cl_updates WHERE owner=? AND expectation_id=?"
+                " AND criterion=? AND target_kind=? AND target_id=? ORDER BY rowid DESC LIMIT 1",
+                same_target,
+            ).fetchone()
+            reconciles = (
+                prior["update_id"]
+                if prior is not None and prior["state"] in _OPEN_OR_APPLIED
+                else None
+            )
+            proposal = LearningProposal(
+                update_id=update_id,
+                expectation_id=expectation.expectation_id,
+                evaluation_id=evaluation_id,
+                criterion=criterion,
+                target_kind=target_kind,
+                target_id=target_id,
+                target_version=target_version,
+                change=change,
+                scope=scope,
+                confidence=float(confidence),
+                route=route,
+                evidence_kind=evidence_kind,
+                interface_id=interface_id,
+                reconciles=reconciles,
+            )
+            record = proposal.to_dict()
+            self._conn.execute(
+                "INSERT INTO cl_updates VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    self.owner,
+                    update_id,
+                    expectation.expectation_id,
+                    criterion,
+                    target_kind,
+                    target_id,
+                    dumps(record),
+                    UpdateState.PROPOSED.value,
+                ),
+            )
+            self._append(
+                "LEARNING_PROPOSED", {"proposal": record}, expectation.expectation_id
+            )
+        return proposal
+
+    def update_state(self, update_id: str) -> UpdateState:
+        with self._lock:
+            return UpdateState(self._update_row(update_id)["state"])
+
+    def _update_row(self, update_id: str) -> Row:
+        row = self._conn.execute(
+            "SELECT * FROM cl_updates WHERE owner=? AND update_id=?",
+            (self.owner, _name(update_id, "update_id")),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"no proposal {update_id}")
+        return row
+
+    def record_update_receipt(
+        self,
+        update_id: str,
+        *,
+        admission: Admission,
+        application: Application | None = None,
+        controller_ref: str,
+    ) -> UpdateState:
+        """Append the owner's controller decision. Acceptance alone is UNCERTAIN, not applied."""
+        admission = Admission(admission)
+        application = None if application is None else Application(application)
+        _name(controller_ref, "controller_ref")
+        if admission is not Admission.ACCEPTED and application is not None:
+            raise ValueError(
+                "only an accepted proposal can carry an application receipt"
+            )
+        if admission is Admission.ACCEPTED:
+            new = (
+                UpdateState(application.value) if application else UpdateState.UNCERTAIN
+            )
+        else:
+            new = UpdateState(admission.value)
+        with self._transaction():
+            row = self._update_row(update_id)
+            current = UpdateState(row["state"])
+            if new is current:
+                return current
+            if new not in _NEXT[current]:
+                raise ValueError(f"a {new.value} receipt cannot follow {current.value}")
+            self._conn.execute(
+                "UPDATE cl_updates SET state=? WHERE owner=? AND update_id=?",
+                (new.value, self.owner, update_id),
+            )
+            self._append(
+                "UPDATE_RECEIPT",
+                {
+                    "update_id": update_id,
+                    "admission": admission.value,
+                    "application": None if application is None else application.value,
+                    "controller_ref": controller_ref,
+                    "state": new.value,
+                },
+                row["expectation_id"],
+            )
+        return new
+
+    # --- consequence accounts ------------------------------------------------
+
+    def record_consequence(self, entry: ConsequenceEntry) -> str:
+        """Append one account entry for a retained expectation."""
+        if not isinstance(entry, ConsequenceEntry):
+            raise TypeError("record_consequence takes a ConsequenceEntry")
+        self.expectation(entry.expectation_id)
+        record = entry.to_dict()
+        encoded = dumps(record, limit=self._limit)
+        with self._transaction():
+            old = self._conn.execute(
+                "SELECT record_json FROM cl_consequences WHERE owner=? AND entry_id=?",
+                (self.owner, entry.entry_id),
+            ).fetchone()
+            if old:
+                if old[0] != encoded:
+                    raise IdReuseError("entry_id already binds a different consequence")
+                return entry.entry_id
+            self._conn.execute(
+                "INSERT INTO cl_consequences VALUES (?, ?, ?, ?)",
+                (self.owner, entry.entry_id, entry.expectation_id, encoded),
+            )
+            self._append(
+                "CONSEQUENCE_RECORDED", {"entry": record}, entry.expectation_id
+            )
+        return entry.entry_id
+
+    def accounts(self, expectation_id: str) -> AccountSummary:
+        """Totals per account, unit and status. Combined only under the owner's rules."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT record_json FROM cl_consequences WHERE owner=? AND expectation_id=?"
+                " ORDER BY rowid",
+                (self.owner, expectation_id),
+            ).fetchall()
+        totals: dict[tuple[Account, str, QuantityStatus], Decimal] = {}
+        unknown: dict[Account, int] = {}
+        violated = False
+        units: set[str] = set()
+        for row in rows:
+            data = json.loads(row[0])
+            account, status = Account(data["account"]), QuantityStatus(data["status"])
+            violated = violated or data["boundary_violation"]
+            if data["quantity"] is None:
+                unknown[account] = unknown.get(account, 0) + 1
+                continue
+            key = (account, data["unit"], status)
+            totals[key] = totals.get(key, Decimal(0)) + Decimal(data["quantity"])
+            units.add(data["unit"])
+        rules = self.policy.exchange_rules
+        ordering = self.policy.priority_ordering
+        if ordering:
+            rank = {a: i for i, a in enumerate(ordering)}
+            totals = dict(
+                sorted(totals.items(), key=lambda kv: rank.get(kv[0][0], len(rank)))
+            )
+
+        def summary(combined: Decimal | None, reason: str) -> AccountSummary:
+            return AccountSummary(totals, unknown, combined, reason, ordering)
+
+        if not rows:
+            return summary(None, "no consequences recorded")
+        if violated:
+            return summary(None, "a hard boundary was violated")
+        if unknown:
+            return summary(None, "some quantities are unknown")
+        missing = sorted(units - set(rules or {}))
+        if rules is None or missing:
+            return summary(None, f"no owner exchange rule for {missing}")
+        return summary(
+            sum((q * rules[unit] for (_, unit, _), q in totals.items()), Decimal(0)), ""
+        )
+
+    def significance(self, expectation_id: str) -> Significance:
+        """Priority, persistence, reach and permitted interruption, for inspection."""
+        expectation, _ = self.expectation(expectation_id)
+        with self._lock:
+            responses = [
+                json.loads(r[0])["response"]
+                for r in self._conn.execute(
+                    "SELECT record_json FROM cl_evaluations WHERE owner=? AND expectation_id=?"
+                    " ORDER BY revision DESC",
+                    (self.owner, expectation_id),
+                )
+            ]
+            entries = [
+                json.loads(r[0])
+                for r in self._conn.execute(
+                    "SELECT record_json FROM cl_consequences WHERE owner=? AND expectation_id=?",
+                    (self.owner, expectation_id),
+                )
+            ]
+        persistence = 0
+        for response in responses:
+            if response == Response.CONTINUE.value:
+                break
+            persistence += 1
+        response = Response(responses[0]) if responses else None
+        with self._lock:
+            revoked = self._is_revoked(expectation_id)
+        priority = self.policy.priority(expectation.task.task_id)
+        threshold = self.policy.interruption_priority
+        return Significance(
+            expectation_id=expectation_id,
+            priority=priority,
+            response=response,
+            persistence=persistence,
+            reach=tuple(sorted({e["path"]["scope"] for e in entries if e.get("path")})),
+            interruption=(
+                not revoked
+                and threshold is not None
+                and priority >= threshold
+                and response not in (None, Response.CONTINUE)
+            ),
+            revoked=revoked,
+        )
+
+    # --- observation proposals -----------------------------------------------
+
+    def suggest_observation(
+        self, expectation_id: str, *, now: datetime | None = None
+    ) -> tuple[ObservationProposal, ...]:
+        """One proposal per unresolved criterion, coalesced and within owner limits.
+
+        It names sources and a deadline; it never requests an action.
+        """
+        expectation, _ = self.expectation(expectation_id)
+        now = self._now() if now is None else require_aware(now, "now")
+        evaluation = self.current_evaluation(expectation_id)
+        names = (
+            [
+                f.criterion
+                for f in evaluation.findings
+                if f.comparison is Comparison.UNRESOLVED
+            ]
+            if evaluation is not None
+            else [c.name for c in expectation.criteria]
+        )
+        limits = self.policy.limits
+        deadline = expectation.horizon.latest_decision_point
+        out = []
+        with self._transaction():
+            if self._is_revoked(expectation_id):
+                return ()
+            for name in names:
+                c = expectation.criterion(name)
+                proposal_id = _hash(
+                    dumps(
+                        [
+                            expectation_id,
+                            name,
+                            evaluation.evaluation_id if evaluation else "",
+                        ]
+                    )
+                )
+                old = self._conn.execute(
+                    "SELECT record_json, status FROM cl_proposals WHERE owner=? AND proposal_id=?",
+                    (self.owner, proposal_id),
+                ).fetchone()
+                if old is not None and now > deadline:
+                    self._close_proposals(expectation_id, name, "too late")
+                    out.append(
+                        ObservationProposal.from_dict(json.loads(old[0]), "TOO_LATE")
+                    )
+                    continue
+                if old is not None:
+                    out.append(
+                        ObservationProposal.from_dict(json.loads(old[0]), old[1])
+                    )
+                    continue
+                sources = [
+                    s for s in self.policy.sources if c.observable in s.observables
+                ]
+                ordered = len({(s.cost_unit, s.burden_unit) for s in sources}) == 1
+                if ordered:
+                    sources.sort(key=lambda s: (s.cost, s.burden, s.latency_s))
+                values = [
+                    grading.source_value(c, s, now, deadline, self.policy)
+                    for s in sources
+                ]
+                if values and all(v.net is not None for v in values):
+                    # On one owner basis the best net value goes first; otherwise
+                    # the qualitative order above stands.
+                    pairs = sorted(
+                        zip(sources, values), key=lambda p: -cast(Decimal, p[1].net)
+                    )
+                    sources, values = [p[0] for p in pairs], [p[1] for p in pairs]
+                    ordered = True
+                status: ProposalStatus
+                if now > deadline:
+                    status = "TOO_LATE"
+                elif self._count_proposals(
+                    expectation_id, name
+                ) >= limits.max_repeats or (
+                    self._count_outstanding(now) >= limits.max_outstanding
+                ):
+                    status = "EXHAUSTED"
+                else:
+                    status = "OPEN"
+                proposal = ObservationProposal(
+                    proposal_id=proposal_id,
+                    expectation_id=expectation_id,
+                    criterion=name,
+                    distinguishes=(
+                        Comparison.CONFIRMED_MATCH,
+                        Comparison.CONFIRMED_MISS,
+                    ),
+                    decision_ref=expectation.decision_ref,
+                    sources=tuple(sources),
+                    ordered=ordered,
+                    deadline=deadline,
+                    status=status,
+                    escalation=self.policy.escalation if status == "EXHAUSTED" else "",
+                    values=tuple(values),
+                )
+                if status == "TOO_LATE":
+                    out.append(proposal)
+                    continue
+                # A newer evaluation replaces the request made from an older one.
+                self._close_proposals(expectation_id, name, "replaced")
+                record = proposal.to_dict()
+                del record["status"]
+                self._conn.execute(
+                    "INSERT INTO cl_proposals VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        self.owner,
+                        proposal_id,
+                        expectation_id,
+                        name,
+                        status,
+                        dumps(record),
+                    ),
+                )
+                self._append(
+                    "OBSERVATION_PROPOSED",
+                    {"proposal": proposal.to_dict()},
+                    expectation_id,
+                )
+                out.append(proposal)
+        return tuple(out)
+
+    def _count_proposals(self, expectation_id: str, criterion: str) -> int:
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM cl_proposals WHERE owner=? AND expectation_id=? AND criterion=?",
+            (self.owner, expectation_id, criterion),
+        ).fetchone()[0]
+
+    def _count_outstanding(self, now: datetime) -> int:
+        """Open requests that can still help; one past its deadline holds no budget."""
+        rows = self._conn.execute(
+            "SELECT record_json FROM cl_proposals WHERE owner=? AND status='OPEN'",
+            (self.owner,),
+        ).fetchall()
+        return sum(
+            parse_datetime(json.loads(r[0])["deadline"], "deadline") >= now
+            for r in rows
+        )
+
+    def _close_proposals(
+        self, expectation_id: str, criterion: str, reason: str
+    ) -> None:
+        open_ids = [
+            r[0]
+            for r in self._conn.execute(
+                "SELECT proposal_id FROM cl_proposals"
+                " WHERE owner=? AND expectation_id=? AND criterion=? AND status='OPEN'",
+                (self.owner, expectation_id, criterion),
+            )
+        ]
+        for proposal_id in open_ids:
+            self._conn.execute(
+                "UPDATE cl_proposals SET status='CLOSED' WHERE owner=? AND proposal_id=?",
+                (self.owner, proposal_id),
+            )
+            self._append(
+                "OBSERVATION_PROPOSAL_CLOSED",
+                {"proposal_id": proposal_id, "by": reason},
+                expectation_id,
+            )
+
+    # --- revocations ---------------------------------------------------------
+
+    def revoke_expectation(
+        self, expectation_id: str, *, controller_ref: str, reason: str
+    ) -> None:
+        """The owner withdraws an expectation: no further evaluation or proposal.
+
+        Its records stay; observations, receipts and consequences still append.
+        """
+        self.expectation(expectation_id)
+        with self._transaction():
+            if self._revoke(
+                "expectation", expectation_id, expectation_id, controller_ref, reason
+            ):
+                for (criterion,) in self._conn.execute(
+                    "SELECT DISTINCT criterion FROM cl_proposals WHERE owner=? AND expectation_id=?",
+                    (self.owner, expectation_id),
+                ).fetchall():
+                    self._close_proposals(expectation_id, criterion, "revoked")
+
+    def revoke_update(
+        self, update_id: str, *, controller_ref: str, reason: str
+    ) -> UpdateState:
+        """Record that the owner's controller withdrew an applied update.
+
+        An update without an application receipt is reconciled first.
+        """
+        with self._transaction():
+            row = self._update_row(update_id)
+            state = UpdateState(row["state"])
+            if state is UpdateState.UNCERTAIN:
+                raise ReconcileFirst(f"update {update_id} has no application receipt")
+            if state not in (UpdateState.APPLIED, UpdateState.REVOKED):
+                raise ValueError(
+                    f"only an applied update can be revoked, not a {state.value} one"
+                )
+            if self._revoke(
+                "update", update_id, row["expectation_id"], controller_ref, reason
+            ):
+                self._conn.execute(
+                    "UPDATE cl_updates SET state=? WHERE owner=? AND update_id=?",
+                    (UpdateState.REVOKED.value, self.owner, update_id),
+                )
+        return UpdateState.REVOKED
+
+    def revocations(self, expectation_id: str | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT record_json FROM cl_revocations WHERE owner=?"
+        args: list[Any] = [self.owner]
+        if expectation_id is not None:
+            sql += " AND expectation_id=?"
+            args.append(_name(expectation_id, "expectation_id"))
+        with self._lock:
+            rows = self._conn.execute(sql + " ORDER BY rowid", args).fetchall()
+        return [json.loads(r[0]) for r in rows]
+
+    def _revoke(
+        self,
+        kind: str,
+        record_id: str,
+        expectation_id: str,
+        controller_ref: str,
+        reason: str,
+    ) -> bool:
+        """Append one revocation; False when the same one is already retained."""
+        _name(controller_ref, "controller_ref")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("a revocation states its reason")
+        record = {
+            "kind": kind,
+            "record_id": record_id,
+            "expectation_id": expectation_id,
+            "controller_ref": controller_ref,
+            "reason": reason,
+        }
+        old = self._conn.execute(
+            "SELECT record_json FROM cl_revocations WHERE owner=? AND kind=? AND record_id=?",
+            (self.owner, kind, record_id),
+        ).fetchone()
+        if old is not None:
+            if json.loads(old[0]) != record:
+                raise IdReuseError(f"this {kind} was already revoked differently")
+            return False
+        encoded = dumps(record, limit=self._limit)
+        self._conn.execute(
+            "INSERT INTO cl_revocations VALUES (?, ?, ?, ?, ?)",
+            (self.owner, kind, record_id, expectation_id, encoded),
+        )
+        self._append(f"{kind.upper()}_REVOKED", {"revocation": record}, expectation_id)
+        return True
+
+    def _is_revoked(self, expectation_id: str) -> bool:
+        return (
+            self._conn.execute(
+                "SELECT 1 FROM cl_revocations WHERE owner=? AND kind='expectation' AND record_id=?",
+                (self.owner, expectation_id),
+            ).fetchone()
+            is not None
+        )
+
+    def _refuse_revoked(self, expectation_id: str) -> None:
+        if self._is_revoked(expectation_id):
+            raise Revoked(f"{expectation_id} was revoked by the owner")
+
+    # --- history -------------------------------------------------------------
+
+    def history(
+        self,
+        expectation_id: str | None = None,
+        *,
+        after_sequence: int = 0,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Read bounded ordered evidence. Continue with the last sequence."""
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        if type(after_sequence) is not int or after_sequence < 0:
+            raise ValueError("after_sequence must be a nonnegative integer")
+        sql = "SELECT * FROM cl_events WHERE owner=? AND sequence>?"
+        args: list[Any] = [self.owner, after_sequence]
+        if expectation_id is not None:
+            sql += " AND expectation_id=?"
+            args.append(_name(expectation_id, "expectation_id"))
+        with self._lock:
+            rows = self._conn.execute(
+                sql + " ORDER BY sequence LIMIT ?", [*args, limit]
+            ).fetchall()
+        return [
+            {
+                "sequence": row["sequence"],
+                "expectation_id": row["expectation_id"],
+                "kind": row["kind"],
+                "payload": json.loads(row["payload_json"]),
+                "previous_hash": row["previous_hash"],
+                "event_hash": row["event_hash"],
+            }
+            for row in rows
+        ]
+
+    def verify_history(self) -> bool:
+        """Check the retained chain; this cannot detect privileged tail removal."""
+        with self._lock:
+            return verify_events(self._conn, "cl_events", self.owner, "consequence")

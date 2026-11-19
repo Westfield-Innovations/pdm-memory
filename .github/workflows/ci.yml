@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, develop]
   pull_request:
-    branches: [main]
+    branches: [main, "feat/**"]
   release:
     types: [published]
 
@@ -54,8 +54,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      - name: Lint, format and types of the ledgers
+        run: |
+          ruff check pdm_memory/_ledger pdm_memory/consequence pdm_memory/goal_loop tests/test_ledger_db.py tests/test_ledger_races.py tests/ledger_target.py tests/conftest.py tests/consequence_fixtures.py tests/test_consequence_*.py
+          ruff format --check pdm_memory/_ledger pdm_memory/consequence tests/test_ledger_db.py tests/test_ledger_races.py tests/ledger_target.py tests/conftest.py tests/consequence_fixtures.py tests/test_consequence_*.py
+          mypy
+
       - name: Run tests
         run: pytest tests/ -v --tb=short --cov=pdm_memory --cov-report=term-missing
+
+      - name: Ledgers on Postgres
+        env:
+          PDM_TEST_LEDGER_BACKEND: postgres
+        run: >-
+          pytest tests/test_ledger_db.py tests/test_goal_loop_store.py tests/test_guarded_effects.py
+          tests/test_consequence_*.py tests/test_ledger_races.py -q
 
       - name: Smoke-test benchmark
         run: python -m pdm_memory.bench --quick

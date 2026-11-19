@@ -19,6 +19,7 @@ from pdm_memory.guarded_effects import (
     Opening,
     ResourceLimitError,
 )
+from tests.ledger_target import ledger_target, sqlite_only
 
 
 def request(action_id="a1", **kwargs):
@@ -62,7 +63,7 @@ def guard(path, handler, *, check=None, max_dispatches=None, **kwargs):
 
 def test_staging_does_not_execute_and_handler_return_is_not_observation(tmp_path):
     calls = []
-    with guard(tmp_path / "g.db", lambda r: calls.append(r.parameters) or {"accepted": True}) as g:
+    with guard(ledger_target(tmp_path, "g.db"), lambda r: calls.append(r.parameters) or {"accepted": True}) as g:
         assert g.stage(request()).status == "HELD"
         assert calls == []
         receipt = g.release("a1")
@@ -73,6 +74,14 @@ def test_staging_does_not_execute_and_handler_return_is_not_observation(tmp_path
         assert calls == [{"running": True}]
         assert g.dispatch_count("set", "sim:pump") == 1
         assert g.verify_history()
+
+
+def test_each_dispatch_to_the_same_target_is_counted(tmp_path):
+    with guard(ledger_target(tmp_path, "g.db"), lambda r: {"accepted": True}) as g:
+        for action_id in ("a1", "a2", "a3"):
+            g.stage(request(action_id))
+            assert g.release(action_id).status == "RETURNED"
+        assert g.dispatch_count("set", "sim:pump") == 3
 
 
 def test_non_time_condition_is_rechecked_and_full_evidence_retained(tmp_path):
@@ -86,7 +95,7 @@ def test_non_time_condition_is_rechecked_and_full_evidence_retained(tmp_path):
             {"source": "owner", "revision": state["revision"]},
         )
 
-    with guard(tmp_path / "g.db", lambda r: calls.append(r.action_id), check=check) as g:
+    with guard(ledger_target(tmp_path, "g.db"), lambda r: calls.append(r.action_id), check=check) as g:
         g.stage(request())
         held = g.release("a1")
         assert held.status == "HELD" and held.disposition is CheckResult.UNKNOWN
@@ -109,7 +118,7 @@ def test_non_time_condition_is_rechecked_and_full_evidence_retained(tmp_path):
 )
 def test_dispositions_never_silently_authorize(tmp_path, result, status):
     calls = []
-    with guard(tmp_path / "g.db", lambda r: calls.append(r.action_id), check=lambda r: result) as g:
+    with guard(ledger_target(tmp_path, "g.db"), lambda r: calls.append(r.action_id), check=lambda r: result) as g:
         g.stage(request())
         assert g.release("a1").status == status
         assert calls == []
@@ -121,7 +130,7 @@ def test_condition_exception_holds_without_dispatch(tmp_path):
     def broken(r):
         raise RuntimeError("no current evidence")
 
-    with guard(tmp_path / "g.db", lambda r: pytest.fail("must not dispatch"), check=broken) as g:
+    with guard(ledger_target(tmp_path, "g.db"), lambda r: pytest.fail("must not dispatch"), check=broken) as g:
         g.stage(request())
         receipt = g.release("a1")
         assert receipt.status == "HELD"
@@ -138,7 +147,7 @@ def test_captured_request_cannot_be_changed_by_caller_or_check(tmp_path):
         return True
 
     with guard(
-        tmp_path / "g.db", lambda r: received.append(r.parameters["running"]), check=mutation
+        ledger_target(tmp_path, "g.db"), lambda r: received.append(r.parameters["running"]), check=mutation
     ) as g:
         r = request(parameters=params)
         g.stage(r)
@@ -161,7 +170,7 @@ def test_captured_request_cannot_be_changed_by_caller_or_check(tmp_path):
     ],
 )
 def test_stable_action_identity_binds_complete_request(tmp_path, changes):
-    with guard(tmp_path / "g.db", lambda r: None) as g:
+    with guard(ledger_target(tmp_path, "g.db"), lambda r: None) as g:
         g.stage(request())
         with pytest.raises(IdReuseError):
             g.stage(request(**changes))
@@ -179,13 +188,13 @@ def test_stable_action_identity_binds_complete_request(tmp_path, changes):
     ],
 )
 def test_wrong_scope_version_branch_or_parameters_rejected(tmp_path, changes):
-    with guard(tmp_path / "g.db", lambda r: pytest.fail("no dispatch")) as g:
+    with guard(ledger_target(tmp_path, "g.db"), lambda r: pytest.fail("no dispatch")) as g:
         assert g.stage(request(**changes)).status == "REJECTED"
         assert g.release("a1").status == "REJECTED"
 
 
 def test_two_instances_same_id_and_counter_reservation(tmp_path):
-    path = tmp_path / "g.db"
+    path = ledger_target(tmp_path, "g.db")
     entered, finish = threading.Event(), threading.Event()
     calls = []
 
@@ -211,7 +220,7 @@ def test_two_instances_same_id_and_counter_reservation(tmp_path):
 
 
 def test_concurrent_stage_has_one_immutable_reservation(tmp_path):
-    path = tmp_path / "g.db"
+    path = ledger_target(tmp_path, "g.db")
     with guard(path, lambda r: None) as a, guard(path, lambda r: None) as b:
         barrier = threading.Barrier(2)
 
@@ -226,7 +235,7 @@ def test_concurrent_stage_has_one_immutable_reservation(tmp_path):
 
 
 def test_raised_handler_is_uncertain_across_reopen_and_requires_reconciliation(tmp_path):
-    path = tmp_path / "g.db"
+    path = ledger_target(tmp_path, "g.db")
     calls = []
 
     def broken(r):
@@ -247,7 +256,7 @@ def test_raised_handler_is_uncertain_across_reopen_and_requires_reconciliation(t
 
 
 def test_dispatch_intent_left_by_interruption_is_not_retried(tmp_path):
-    path = tmp_path / "g.db"
+    path = ledger_target(tmp_path, "g.db")
     with guard(path, lambda r: None) as g:
         g.stage(request())
         # A persisted intent with no completion models interruption between
@@ -259,13 +268,13 @@ def test_dispatch_intent_left_by_interruption_is_not_retried(tmp_path):
 
 
 def test_invalid_handler_result_is_uncertain(tmp_path):
-    with guard(tmp_path / "g.db", lambda r: object()) as g:
+    with guard(ledger_target(tmp_path, "g.db"), lambda r: object()) as g:
         g.stage(request())
         assert g.release("a1").status == "UNCERTAIN"
 
 
 def test_recovery_preserves_verdict_counts_and_invalidates_old_branch(tmp_path):
-    path = tmp_path / "g.db"
+    path = ledger_target(tmp_path, "g.db")
     state = {"step": 0, "pending": []}
     with guard(path, lambda r: {"accepted": True}, max_dispatches=1) as g:
         g.checkpoint("cp1", branch_id="b1", state=state)
@@ -293,7 +302,7 @@ def test_recovery_preserves_verdict_counts_and_invalidates_old_branch(tmp_path):
 
 
 def test_recovery_does_not_reintroduce_old_policy_and_old_controller_is_fenced(tmp_path):
-    path = tmp_path / "g.db"
+    path = ledger_target(tmp_path, "g.db")
     a = guard(path, lambda r: pytest.fail("old controller must be fenced"))
     a.checkpoint("cp", branch_id="b1", state={"step": 1})
     a.stage(request())
@@ -317,7 +326,7 @@ def test_recovery_does_not_reintroduce_old_policy_and_old_controller_is_fenced(t
 
 
 def test_program_version_change_refuses_incompatible_checkpoint(tmp_path):
-    path = tmp_path / "g.db"
+    path = ledger_target(tmp_path, "g.db")
     with guard(path, lambda r: None) as g:
         g.checkpoint("cp", branch_id="b1", state={"step": 1})
     with GuardedEffects(
@@ -333,7 +342,7 @@ def test_program_version_change_refuses_incompatible_checkpoint(tmp_path):
 
 
 def test_config_replacement_is_explicit_and_fences_every_mutation(tmp_path):
-    path = tmp_path / "g.db"
+    path = ledger_target(tmp_path, "g.db")
     with guard(path, lambda r: None) as a:
         a.stage(request())
         a.checkpoint("cp", branch_id="b1", state={"step": 0})
@@ -391,7 +400,7 @@ def test_durable_controller_refuses_known_ephemeral_storage(path):
 
 def test_input_queue_checkpoint_and_result_bounds(tmp_path):
     with guard(
-        tmp_path / "g.db",
+        ledger_target(tmp_path, "g.db"),
         lambda r: "x" * 200,
         max_request_bytes=300,
         max_pending=1,
@@ -410,29 +419,29 @@ def test_input_queue_checkpoint_and_result_bounds(tmp_path):
 
 @pytest.mark.parametrize("bad", [{1: "bad"}, {"x": float("nan")}, {"x": object()}])
 def test_request_json_is_strict_and_lossless(tmp_path, bad):
-    with guard(tmp_path / "g.db", lambda r: None) as g:
+    with guard(ledger_target(tmp_path, "g.db"), lambda r: None) as g:
         with pytest.raises((TypeError, ValueError)):
             g.stage(request(parameters=bad))
 
 
 def test_history_and_checkpoint_records_have_sql_immutability_guards(tmp_path):
-    path = tmp_path / "g.db"
+    path = ledger_target(tmp_path, "g.db")
     with guard(path, lambda r: None) as g:
         g.checkpoint("cp", branch_id="b1", state={"step": 0})
         g.stage(request())
-        raw = sqlite3.connect(path)
-        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
-            raw.execute("DELETE FROM ge_events")
-        raw.rollback()
-        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
-            raw.execute("UPDATE ge_checkpoints SET state_json='{}'")
-        raw.close()
+        with pytest.raises(g._conn.Error, match="append-only"):
+            g._conn.execute("DELETE FROM ge_events")
+        with pytest.raises(g._conn.Error, match="immutable"):
+            g._conn.execute("UPDATE ge_checkpoints SET state_json='{}'")
         assert g.verify_history()
-        assert g._conn.execute("PRAGMA synchronous").fetchone()[0] == 2
+        if g._conn.dialect == "sqlite":
+            assert g._conn.execute("PRAGMA synchronous").fetchone()[0] == 2
+        else:
+            assert g._conn.execute("SHOW synchronous_commit").fetchone()[0] == "on"
 
 
 def test_owner_namespaces_are_separate(tmp_path):
-    path = tmp_path / "g.db"
+    path = ledger_target(tmp_path, "g.db")
     with guard(path, lambda r: None) as a:
         a.stage(request())
         with GuardedEffects(
@@ -461,7 +470,7 @@ def test_same_controller_rerelease_during_dispatch_does_not_mark_uncertain(tmp_p
         assert finish.wait(5)
         return "done"
 
-    with guard(tmp_path / "g.db", handler) as g:
+    with guard(ledger_target(tmp_path, "g.db"), handler) as g:
         g.stage(request())
         with ThreadPoolExecutor(max_workers=1) as pool:
             first = pool.submit(g.release, "a1")
@@ -474,7 +483,7 @@ def test_same_controller_rerelease_during_dispatch_does_not_mark_uncertain(tmp_p
 
 
 def test_unknown_reconciliation_of_returned_action_keeps_namespace_open(tmp_path):
-    with guard(tmp_path / "g.db", lambda r: {"accepted": True}) as g:
+    with guard(ledger_target(tmp_path, "g.db"), lambda r: {"accepted": True}) as g:
         g.stage(request())
         g.release("a1")
         noted = g.reconcile("a1", executed=None, evidence={"source": "receiver", "seen": False})
@@ -494,7 +503,7 @@ def test_unknown_reconciliation_of_returned_action_keeps_namespace_open(tmp_path
     ],
 )
 def test_changed_openings_require_explicit_config_replacement(tmp_path, changed):
-    path = tmp_path / "g.db"
+    path = ledger_target(tmp_path, "g.db")
     guard(path, lambda r: None).close()
     extra = changed.pop("extra", None)
     openings = [opening(lambda r: None, **changed)] + ([extra] if extra else [])
@@ -522,8 +531,9 @@ def _preview_ledger(path):
     raw.close()
 
 
+@sqlite_only
 def test_preview_ledger_is_migrated_and_keeps_its_epoch(tmp_path):
-    path = tmp_path / "g.db"
+    path = ledger_target(tmp_path, "g.db")
     _preview_ledger(path)
     with guard(path, lambda r: {"accepted": True}) as g:
         assert g._config_epoch == 3
@@ -544,8 +554,9 @@ def test_preview_ledger_is_migrated_and_keeps_its_epoch(tmp_path):
         )
 
 
+@sqlite_only
 def test_preview_ledger_with_other_versions_still_needs_replacement(tmp_path):
-    path = tmp_path / "g.db"
+    path = ledger_target(tmp_path, "g.db")
     _preview_ledger(path)
     kwargs = dict(
         owner="owner",

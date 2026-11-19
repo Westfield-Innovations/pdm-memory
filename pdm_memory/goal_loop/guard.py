@@ -20,7 +20,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
-from pdm_memory.core.alignment import CONFLICT_STATUS_THRESHOLD, TORSION_STATUS_THRESHOLD, verify
+from pdm_memory.core.alignment import (
+    CONFLICT_STATUS_THRESHOLD,
+    TORSION_STATUS_THRESHOLD,
+    verify,
+)
 from pdm_memory.goal_loop.contract import GoalContract
 from pdm_memory.goal_loop.job import ProposedStep
 

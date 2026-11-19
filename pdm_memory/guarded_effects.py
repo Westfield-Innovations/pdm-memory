@@ -18,10 +18,8 @@ retention; they are never silently decayed like ordinary memories.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
-import sqlite3
 import threading
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
@@ -30,6 +28,10 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+from pdm_memory._ledger.chain import _hash, append_event, verify_events
+from pdm_memory._ledger.db import Database, Row
+from pdm_memory._ledger.errors import ConfigurationError, LedgerIntegrityError
 
 __all__ = [
     "ActionReceipt",
@@ -62,16 +64,8 @@ class BranchError(ValueError):
     """A branch is absent, retired, or would replace current work implicitly."""
 
 
-class ConfigurationError(ValueError):
-    """An owner configuration needs explicit replacement or was superseded."""
-
-
 class ResourceLimitError(ValueError):
     """A declared input, queue or state bound was exceeded."""
-
-
-class LedgerIntegrityError(RuntimeError):
-    """Stored data does not match its captured content or history chain."""
 
 
 @dataclass(frozen=True)
@@ -185,10 +179,6 @@ def _json(value: Any, limit: int) -> str:
     return encoded
 
 
-def _hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
 def _openings_hash(openings: Mapping[tuple[str, str], Opening]) -> str:
     # Callables have no stable identity across processes, so the fingerprint
     # covers the declared scope: which openings exist, their allowance and
@@ -204,6 +194,60 @@ def _openings_hash(openings: Mapping[tuple[str, str], Opening]) -> str:
 
 
 _TERMINAL = {"REJECTED", "CANCELLED", "RETURNED", "OBSERVED"}
+
+
+_GE_SCHEMA = """
+        CREATE TABLE IF NOT EXISTS ge_owners (
+          owner TEXT PRIMARY KEY, active_branch TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS ge_config (
+          owner TEXT PRIMARY KEY, program_version TEXT NOT NULL,
+          policy_version TEXT NOT NULL, openings_hash TEXT NOT NULL,
+          epoch INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS ge_branches (
+          owner TEXT NOT NULL, branch_id TEXT NOT NULL, active INTEGER NOT NULL,
+          PRIMARY KEY(owner, branch_id));
+        CREATE TABLE IF NOT EXISTS ge_actions (
+          owner TEXT NOT NULL, action_id TEXT NOT NULL, request_json TEXT NOT NULL,
+          request_hash TEXT NOT NULL, branch_id TEXT NOT NULL, status TEXT NOT NULL,
+          disposition TEXT NOT NULL, reason TEXT NOT NULL, result_json TEXT,
+          evidence_json TEXT, executed INTEGER, last_sequence INTEGER NOT NULL,
+          config_epoch INTEGER NOT NULL,
+          PRIMARY KEY(owner, action_id));
+        CREATE TABLE IF NOT EXISTS ge_counts (
+          owner TEXT NOT NULL, operation TEXT NOT NULL, target TEXT NOT NULL,
+          dispatches INTEGER NOT NULL, PRIMARY KEY(owner, operation, target));
+        CREATE TABLE IF NOT EXISTS ge_events (
+          sequence INTEGER PRIMARY KEY, owner TEXT NOT NULL, action_id TEXT,
+          kind TEXT NOT NULL, payload_json TEXT NOT NULL, previous_hash TEXT NOT NULL,
+          event_hash TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS ge_events_owner ON ge_events(owner, sequence);
+        CREATE TABLE IF NOT EXISTS ge_checkpoints (
+          owner TEXT NOT NULL, checkpoint_id TEXT NOT NULL, branch_id TEXT NOT NULL,
+          program_version TEXT NOT NULL, policy_version TEXT NOT NULL,
+          state_json TEXT NOT NULL, state_hash TEXT NOT NULL, sequence INTEGER NOT NULL,
+          PRIMARY KEY(owner, checkpoint_id));
+        """
+
+
+def _ge_tables(db: Database) -> None:
+    db.create_tables(
+        _GE_SCHEMA,
+        append_only={
+            "ge_events": "guard history is append-only",
+            "ge_checkpoints": "guard checkpoints are immutable",
+        },
+    )
+
+
+def _ge_openings_hash(db: Database) -> None:
+    # Ledgers from the 0.2.6a1 preview predate the openings fingerprint; the
+    # first reopen records it (see GuardedEffects.__init__).
+    if "openings_hash" not in db.columns("ge_config"):
+        db.execute("ALTER TABLE ge_config ADD COLUMN openings_hash TEXT NOT NULL DEFAULT ''")
+
+
+# Append a step to change the schema; never edit a step that has shipped.
+_GE_MIGRATIONS = (_ge_tables, _ge_openings_hash)
 
 
 class GuardedEffects:
@@ -277,62 +321,14 @@ class GuardedEffects:
         self._openings_hash = _openings_hash(self._openings)
         self._lock = threading.RLock()
         self._in_flight: set[str] = set()
-        self._conn = sqlite3.connect(
-            str(path), timeout=30, isolation_level=None, check_same_thread=False
-        )
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=FULL")
-        self._conn.executescript("""
-        CREATE TABLE IF NOT EXISTS ge_owners (
-          owner TEXT PRIMARY KEY, active_branch TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS ge_config (
-          owner TEXT PRIMARY KEY, program_version TEXT NOT NULL,
-          policy_version TEXT NOT NULL, openings_hash TEXT NOT NULL,
-          epoch INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS ge_branches (
-          owner TEXT NOT NULL, branch_id TEXT NOT NULL, active INTEGER NOT NULL,
-          PRIMARY KEY(owner, branch_id));
-        CREATE TABLE IF NOT EXISTS ge_actions (
-          owner TEXT NOT NULL, action_id TEXT NOT NULL, request_json TEXT NOT NULL,
-          request_hash TEXT NOT NULL, branch_id TEXT NOT NULL, status TEXT NOT NULL,
-          disposition TEXT NOT NULL, reason TEXT NOT NULL, result_json TEXT,
-          evidence_json TEXT, executed INTEGER, last_sequence INTEGER NOT NULL,
-          config_epoch INTEGER NOT NULL,
-          PRIMARY KEY(owner, action_id));
-        CREATE TABLE IF NOT EXISTS ge_counts (
-          owner TEXT NOT NULL, operation TEXT NOT NULL, target TEXT NOT NULL,
-          dispatches INTEGER NOT NULL, PRIMARY KEY(owner, operation, target));
-        CREATE TABLE IF NOT EXISTS ge_events (
-          sequence INTEGER PRIMARY KEY, owner TEXT NOT NULL, action_id TEXT,
-          kind TEXT NOT NULL, payload_json TEXT NOT NULL, previous_hash TEXT NOT NULL,
-          event_hash TEXT NOT NULL);
-        CREATE INDEX IF NOT EXISTS ge_events_owner ON ge_events(owner, sequence);
-        CREATE TABLE IF NOT EXISTS ge_checkpoints (
-          owner TEXT NOT NULL, checkpoint_id TEXT NOT NULL, branch_id TEXT NOT NULL,
-          program_version TEXT NOT NULL, policy_version TEXT NOT NULL,
-          state_json TEXT NOT NULL, state_hash TEXT NOT NULL, sequence INTEGER NOT NULL,
-          PRIMARY KEY(owner, checkpoint_id));
-        CREATE TRIGGER IF NOT EXISTS ge_events_no_update BEFORE UPDATE ON ge_events
-          BEGIN SELECT RAISE(ABORT, 'guard history is append-only'); END;
-        CREATE TRIGGER IF NOT EXISTS ge_events_no_delete BEFORE DELETE ON ge_events
-          BEGIN SELECT RAISE(ABORT, 'guard history is append-only'); END;
-        CREATE TRIGGER IF NOT EXISTS ge_checkpoints_no_update BEFORE UPDATE ON ge_checkpoints
-          BEGIN SELECT RAISE(ABORT, 'guard checkpoints are immutable'); END;
-        CREATE TRIGGER IF NOT EXISTS ge_checkpoints_no_delete BEFORE DELETE ON ge_checkpoints
-          BEGIN SELECT RAISE(ABORT, 'guard checkpoints are immutable'); END;
-        """)
+        self._conn = Database(path, lock_key="pdm:ge")
+        try:
+            self._conn.migrate("ge", _GE_MIGRATIONS)
+        except BaseException:
+            self._conn.close()
+            raise
         try:
             with self._transaction():
-                columns = {
-                    row["name"] for row in self._conn.execute("PRAGMA table_info(ge_config)")
-                }
-                if "openings_hash" not in columns:
-                    # Ledgers from the 0.2.6a1 preview predate the openings
-                    # fingerprint; the first reopen records it (see below).
-                    self._conn.execute(
-                        "ALTER TABLE ge_config ADD COLUMN openings_hash TEXT NOT NULL DEFAULT ''"
-                    )
                 current = self._conn.execute(
                     "SELECT * FROM ge_config WHERE owner=?", (self.owner,)
                 ).fetchone()
@@ -403,7 +399,7 @@ class GuardedEffects:
     @contextmanager
     def _transaction(self):
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.begin()
             try:
                 yield
                 self._conn.commit()
@@ -422,29 +418,12 @@ class GuardedEffects:
         self.close()
 
     def _append(self, kind: str, payload: dict[str, Any], action_id: str | None = None) -> int:
-        sequence = self._conn.execute(
-            "SELECT COALESCE(MAX(sequence), 0)+1 FROM ge_events"
-        ).fetchone()[0]
-        prev = self._conn.execute(
-            "SELECT event_hash FROM ge_events WHERE owner=? ORDER BY sequence DESC LIMIT 1",
-            (self.owner,),
-        ).fetchone()
-        previous_hash = prev[0] if prev else ""
         # Payload sizes are bounded at their individual input boundaries.
         payload = {**payload, "recorded_at": datetime.now(timezone.utc).isoformat()}
         payload_json = json.dumps(
             payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
         )
-        body = json.dumps(
-            [sequence, self.owner, action_id, kind, payload_json, previous_hash],
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        self._conn.execute(
-            "INSERT INTO ge_events VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (sequence, self.owner, action_id, kind, payload_json, previous_hash, _hash(body)),
-        )
-        return sequence
+        return append_event(self._conn, "ge_events", self.owner, action_id, kind, payload_json)
 
     def start_branch(self, branch_id: str) -> None:
         """Start the initial branch; a retired name can never be reactivated."""
@@ -495,7 +474,7 @@ class GuardedEffects:
     def _request(encoded: str) -> EffectRequest:
         return EffectRequest(**json.loads(encoded))
 
-    def _row(self, action_id: str) -> sqlite3.Row:
+    def _row(self, action_id: str) -> Row:
         row = self._conn.execute(
             "SELECT * FROM ge_actions WHERE owner=? AND action_id=?", (self.owner, action_id)
         ).fetchone()
@@ -512,7 +491,7 @@ class GuardedEffects:
         return _hash(json.dumps([epoch, encoded], ensure_ascii=False, separators=(",", ":")))
 
     @staticmethod
-    def _receipt(row: sqlite3.Row) -> ActionReceipt:
+    def _receipt(row: Row) -> ActionReceipt:
         request = json.loads(row["request_json"])
         return ActionReceipt(
             row["action_id"],
@@ -786,7 +765,7 @@ class GuardedEffects:
                 )
             self._conn.execute(
                 """INSERT INTO ge_counts VALUES (?, ?, ?, 1)
-              ON CONFLICT(owner, operation, target) DO UPDATE SET dispatches=dispatches+1""",
+              ON CONFLICT(owner, operation, target) DO UPDATE SET dispatches=ge_counts.dispatches+1""",
                 (self.owner, request.operation, request.target),
             )
             self._set(
@@ -1067,24 +1046,4 @@ class GuardedEffects:
     def verify_history(self) -> bool:
         """Check the retained chain; this cannot detect privileged tail removal."""
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM ge_events WHERE owner=? ORDER BY sequence", (self.owner,)
-            )
-            previous = ""
-            for row in rows:
-                body = json.dumps(
-                    [
-                        row["sequence"],
-                        self.owner,
-                        row["action_id"],
-                        row["kind"],
-                        row["payload_json"],
-                        row["previous_hash"],
-                    ],
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-                if row["previous_hash"] != previous or _hash(body) != row["event_hash"]:
-                    raise LedgerIntegrityError("retained guard history chain is inconsistent")
-                previous = row["event_hash"]
-            return True
+            return verify_events(self._conn, "ge_events", self.owner, "guard")
