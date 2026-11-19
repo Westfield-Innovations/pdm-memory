@@ -12,7 +12,7 @@ import hashlib
 import re
 import sqlite3
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
@@ -180,6 +180,50 @@ class Database:
             return self._conn.in_transaction
         return self._conn.info.transaction_status != 0  # psycopg TransactionStatus.IDLE
 
+    def _begin_schema(self) -> None:
+        """The writer lock, plus one lock per Postgres schema for DDL shared by ledger kinds."""
+        self.begin()
+        if self.dialect == "postgres":
+            schema = self._conn.execute("SELECT current_schema()").fetchone()[0]
+            self._conn.execute(
+                "SELECT pg_advisory_xact_lock(%s)", (_lock_id(f"pdm:schema:{schema}"),)
+            )
+
+    def migrate(self, kind: str, steps: Sequence[Callable[[Database], None]]) -> int:
+        """Bring *kind*'s tables to ``len(steps)``, running each missing step once, in order.
+
+        A database a newer release already took further is refused, not misread.
+        """
+        _ident(kind)
+        self._begin_schema()
+        try:
+            self.execute(
+                "CREATE TABLE IF NOT EXISTS pdm_schema_versions"
+                " (kind TEXT PRIMARY KEY, version INTEGER NOT NULL)"
+            )
+            row = self.execute(
+                "SELECT version FROM pdm_schema_versions WHERE kind=?", (kind,)
+            ).fetchone()
+            current = row[0] if row else 0
+            if current > len(steps):
+                raise ConfigurationError(
+                    f"this {kind} database is at schema {current}, newer than the {len(steps)}"
+                    " this release knows; upgrade pdm-memory"
+                )
+            for step in steps[current:]:
+                step(self)
+            if current < len(steps):
+                self.execute(
+                    "INSERT INTO pdm_schema_versions VALUES (?, ?)"
+                    " ON CONFLICT(kind) DO UPDATE SET version=excluded.version",
+                    (kind, len(steps)),
+                )
+            self.commit()
+        except BaseException:
+            self.rollback()
+            raise
+        return len(steps)
+
     def create_schema(
         self,
         sql: str,
@@ -187,47 +231,59 @@ class Database:
         append_only: Mapping[str, str] | None = None,
         ordered: Sequence[str] = (),
     ) -> None:
-        """Create tables from SQLite DDL; *append_only* maps a table to its refusal message.
-
-        *ordered* tables are read back ``ORDER BY rowid``; Postgres gets that column last.
-        """
-        append_only = {_ident(t): _message(m) for t, m in (append_only or {}).items()}
-        ordered = [_ident(t) for t in ordered]
-        if self.dialect == "sqlite":
-            triggers = "".join(
-                f"CREATE TRIGGER IF NOT EXISTS {t}_no_{op} BEFORE {op.upper()} ON {t}"
-                f" BEGIN SELECT RAISE(ABORT, '{msg}'); END;\n"
-                for t, msg in append_only.items()
-                for op in ("update", "delete")
-            )
-            self._conn.executescript(sql + triggers)
-            return
-        self.begin()
+        """``create_tables`` in a transaction of its own."""
+        self._begin_schema()
         try:
-            self._conn.execute(re.sub(r"\bINTEGER\b", "BIGINT", sql))
-            for table in ordered:
-                self._conn.execute(
-                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS rowid"
-                    " BIGINT GENERATED ALWAYS AS IDENTITY"
-                )
-            if append_only:
-                self._conn.execute(_APPEND_ONLY_FN)
-            for table, msg in append_only.items():
-                for op, scope in (("update", "ROW"), ("delete", "ROW"), ("truncate", "STATEMENT")):
-                    name = f"{table}_no_{op}"
-                    exists = self._conn.execute(
-                        "SELECT 1 FROM pg_trigger WHERE tgname=%s AND tgrelid=to_regclass(%s)",
-                        (name, table),
-                    ).fetchone()
-                    if not exists:
-                        self._conn.execute(
-                            f"CREATE TRIGGER {name} BEFORE {op.upper()} ON {table}"
-                            f" FOR EACH {scope} EXECUTE PROCEDURE pdm_append_only('{msg}')"
-                        )
+            self.create_tables(sql, append_only=append_only, ordered=ordered)
             self.commit()
         except BaseException:
             self.rollback()
             raise
+
+    def create_tables(
+        self,
+        sql: str,
+        *,
+        append_only: Mapping[str, str] | None = None,
+        ordered: Sequence[str] = (),
+    ) -> None:
+        """Create tables from SQLite DDL inside the current transaction (a migration step).
+
+        *append_only* maps a table to its refusal message; *ordered* tables are read
+        back ``ORDER BY rowid``, which Postgres gets as an explicit last column.
+        """
+        append_only = {_ident(t): _message(m) for t, m in (append_only or {}).items()}
+        ordered = [_ident(t) for t in ordered]
+        postgres = self.dialect == "postgres"
+        for statement in filter(str.strip, sql.split(";")):
+            self._conn.execute(re.sub(r"\bINTEGER\b", "BIGINT", statement) if postgres else statement)
+        if not postgres:
+            for table, msg in append_only.items():
+                for op in ("update", "delete"):
+                    self._conn.execute(
+                        f"CREATE TRIGGER IF NOT EXISTS {table}_no_{op} BEFORE {op.upper()} ON {table}"
+                        f" BEGIN SELECT RAISE(ABORT, '{msg}'); END"
+                    )
+            return
+        for table in ordered:
+            self._conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS rowid"
+                " BIGINT GENERATED ALWAYS AS IDENTITY"
+            )
+        if append_only:
+            self._conn.execute(_APPEND_ONLY_FN)
+        for table, msg in append_only.items():
+            for op, scope in (("update", "ROW"), ("delete", "ROW"), ("truncate", "STATEMENT")):
+                name = f"{table}_no_{op}"
+                exists = self._conn.execute(
+                    "SELECT 1 FROM pg_trigger WHERE tgname=%s AND tgrelid=to_regclass(%s)",
+                    (name, table),
+                ).fetchone()
+                if not exists:
+                    self._conn.execute(
+                        f"CREATE TRIGGER {name} BEFORE {op.upper()} ON {table}"
+                        f" FOR EACH {scope} EXECUTE PROCEDURE pdm_append_only('{msg}')"
+                    )
 
     def columns(self, table: str) -> set[str]:
         _ident(table)

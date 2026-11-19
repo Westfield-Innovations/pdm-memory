@@ -264,3 +264,76 @@ def test_only_plain_identifiers_reach_ddl(db, name):
 def test_a_trigger_message_cannot_break_out_of_its_quotes(db, message):
     with pytest.raises(ValueError, match="trigger message"):
         db.create_schema(EVENTS, append_only={"events": message})
+
+
+def _step(name, log):
+    def run(db):
+        log.append(name)
+        db.create_tables(f"CREATE TABLE IF NOT EXISTS {name} (x TEXT);")
+
+    return run
+
+
+def test_migration_steps_run_once_in_order(target):
+    log = []
+    steps = [_step("m1", log), _step("m2", log)]
+    db = Database(target, lock_key="test")
+    assert db.migrate("k", steps) == 2
+    assert db.migrate("k", steps) == 2
+    assert log == ["m1", "m2"]
+    db.close()
+    again = Database(target, lock_key="test")
+    again.migrate("k", [*steps, _step("m3", log)])
+    assert log == ["m1", "m2", "m3"]
+    assert again.execute("SELECT version FROM pdm_schema_versions WHERE kind='k'").fetchone()[0] == 3
+    assert again.columns("m3") == {"x"}
+    again.close()
+
+
+def test_kinds_keep_their_own_versions(db):
+    log = []
+    db.migrate("a", [_step("a1", log)])
+    db.migrate("b", [_step("b1", log), _step("b2", log)])
+    rows = dict(db.execute("SELECT kind, version FROM pdm_schema_versions").fetchall())
+    assert rows == {"a": 1, "b": 2}
+
+
+def test_a_database_from_a_newer_release_is_refused(db):
+    log = []
+    db.migrate("k", [_step("m1", log), _step("m2", log)])
+    with pytest.raises(ConfigurationError, match="newer"):
+        db.migrate("k", [_step("m1", log)])
+    assert not db.in_transaction
+
+
+def test_a_failing_step_leaves_no_trace(db):
+    log = []
+
+    def broken(d):
+        d.create_tables("CREATE TABLE IF NOT EXISTS half (x TEXT);")
+        raise RuntimeError("step failed")
+
+    db.migrate("k", [_step("m1", log)])
+    with pytest.raises(RuntimeError, match="step failed"):
+        db.migrate("k", [_step("m1", log), broken])
+    assert db.columns("half") == set()
+    assert db.execute("SELECT version FROM pdm_schema_versions WHERE kind='k'").fetchone()[0] == 1
+    assert not db.in_transaction
+
+
+def _migrator(target, kind):
+    d = Database(target, lock_key=f"kind-{kind}")
+    d.migrate(kind, [lambda x: x.create_tables(EVENTS, append_only={"events": "append-only"})])
+    d.close()
+    return True
+
+
+def test_two_kinds_migrate_one_new_schema_at_once(target):
+    with _pool() as pool:
+        assert pool.starmap(_migrator, [(target, k) for k in ("ka", "kb", "ka", "kb")]) == [True] * 4
+    d = Database(target, lock_key="t")
+    assert dict(d.execute("SELECT kind, version FROM pdm_schema_versions").fetchall()) == {
+        "ka": 1,
+        "kb": 1,
+    }
+    d.close()

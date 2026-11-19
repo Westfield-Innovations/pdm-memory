@@ -133,6 +133,12 @@ CREATE INDEX IF NOT EXISTS cl_events_owner ON cl_events(owner, sequence);
 """
 # Tables read back ORDER BY rowid; Postgres gives them that column explicitly.
 _ORDERED = ("cl_evaluations", "cl_updates", "cl_consequences", "cl_revocations")
+# Append a step to change the schema; never edit a step that has shipped.
+_MIGRATIONS = (
+    lambda db: db.create_tables(
+        _SCHEMA, append_only={"cl_events": "consequence history is append-only"}, ordered=_ORDERED
+    ),
+)
 
 
 class ConsequenceLedger:
@@ -161,11 +167,11 @@ class ConsequenceLedger:
         self._limit = policy.limits.max_payload_bytes
         self._lock = threading.RLock()
         self._conn = Database(path, lock_key="pdm:cl")
-        self._conn.create_schema(
-            _SCHEMA,
-            append_only={"cl_events": "consequence history is append-only"},
-            ordered=_ORDERED,
-        )
+        try:
+            self._conn.migrate("cl", _MIGRATIONS)
+        except BaseException:
+            self._conn.close()
+            raise
 
     @contextmanager
     def _transaction(self):

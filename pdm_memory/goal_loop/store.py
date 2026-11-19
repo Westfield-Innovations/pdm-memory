@@ -221,14 +221,7 @@ def _utc_key(value: datetime | None) -> str | None:
     return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")
 
 
-class _SqlJobStore(JobStore):
-    """The SQL both durable stores share; see ``pdm_memory._sqldb``."""
-
-    def __init__(self, target: str | Path) -> None:
-        self._lock = threading.RLock()
-        self._conn = Database(target, lock_key="pdm:gl")
-        self._conn.create_schema(
-            """
+_GL_SCHEMA = """
             CREATE TABLE IF NOT EXISTS gl_jobs (
               job_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, active INTEGER NOT NULL,
               next_due_at TEXT, job_json TEXT NOT NULL);
@@ -239,7 +232,21 @@ class _SqlJobStore(JobStore):
               job_id TEXT NOT NULL, seq INTEGER NOT NULL, receipt_json TEXT NOT NULL,
               PRIMARY KEY(job_id, seq));
             """
-        )
+# Append a step to change the schema; never edit a step that has shipped.
+_GL_MIGRATIONS = (lambda db: db.create_tables(_GL_SCHEMA),)
+
+
+class _SqlJobStore(JobStore):
+    """The SQL both durable stores share; see ``pdm_memory._sqldb``."""
+
+    def __init__(self, target: str | Path) -> None:
+        self._lock = threading.RLock()
+        self._conn = Database(target, lock_key="pdm:gl")
+        try:
+            self._conn.migrate("gl", _GL_MIGRATIONS)
+        except BaseException:
+            self._conn.close()
+            raise
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:

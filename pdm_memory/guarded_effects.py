@@ -200,6 +200,60 @@ def _openings_hash(openings: Mapping[tuple[str, str], Opening]) -> str:
 _TERMINAL = {"REJECTED", "CANCELLED", "RETURNED", "OBSERVED"}
 
 
+_GE_SCHEMA = """
+        CREATE TABLE IF NOT EXISTS ge_owners (
+          owner TEXT PRIMARY KEY, active_branch TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS ge_config (
+          owner TEXT PRIMARY KEY, program_version TEXT NOT NULL,
+          policy_version TEXT NOT NULL, openings_hash TEXT NOT NULL,
+          epoch INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS ge_branches (
+          owner TEXT NOT NULL, branch_id TEXT NOT NULL, active INTEGER NOT NULL,
+          PRIMARY KEY(owner, branch_id));
+        CREATE TABLE IF NOT EXISTS ge_actions (
+          owner TEXT NOT NULL, action_id TEXT NOT NULL, request_json TEXT NOT NULL,
+          request_hash TEXT NOT NULL, branch_id TEXT NOT NULL, status TEXT NOT NULL,
+          disposition TEXT NOT NULL, reason TEXT NOT NULL, result_json TEXT,
+          evidence_json TEXT, executed INTEGER, last_sequence INTEGER NOT NULL,
+          config_epoch INTEGER NOT NULL,
+          PRIMARY KEY(owner, action_id));
+        CREATE TABLE IF NOT EXISTS ge_counts (
+          owner TEXT NOT NULL, operation TEXT NOT NULL, target TEXT NOT NULL,
+          dispatches INTEGER NOT NULL, PRIMARY KEY(owner, operation, target));
+        CREATE TABLE IF NOT EXISTS ge_events (
+          sequence INTEGER PRIMARY KEY, owner TEXT NOT NULL, action_id TEXT,
+          kind TEXT NOT NULL, payload_json TEXT NOT NULL, previous_hash TEXT NOT NULL,
+          event_hash TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS ge_events_owner ON ge_events(owner, sequence);
+        CREATE TABLE IF NOT EXISTS ge_checkpoints (
+          owner TEXT NOT NULL, checkpoint_id TEXT NOT NULL, branch_id TEXT NOT NULL,
+          program_version TEXT NOT NULL, policy_version TEXT NOT NULL,
+          state_json TEXT NOT NULL, state_hash TEXT NOT NULL, sequence INTEGER NOT NULL,
+          PRIMARY KEY(owner, checkpoint_id));
+        """
+
+
+def _ge_tables(db: Database) -> None:
+    db.create_tables(
+        _GE_SCHEMA,
+        append_only={
+            "ge_events": "guard history is append-only",
+            "ge_checkpoints": "guard checkpoints are immutable",
+        },
+    )
+
+
+def _ge_openings_hash(db: Database) -> None:
+    # Ledgers from the 0.2.6a1 preview predate the openings fingerprint; the
+    # first reopen records it (see GuardedEffects.__init__).
+    if "openings_hash" not in db.columns("ge_config"):
+        db.execute("ALTER TABLE ge_config ADD COLUMN openings_hash TEXT NOT NULL DEFAULT ''")
+
+
+# Append a step to change the schema; never edit a step that has shipped.
+_GE_MIGRATIONS = (_ge_tables, _ge_openings_hash)
+
+
 class GuardedEffects:
     """Dispatch registered effects after current checks and durable intent.
 
@@ -272,51 +326,13 @@ class GuardedEffects:
         self._lock = threading.RLock()
         self._in_flight: set[str] = set()
         self._conn = Database(path, lock_key="pdm:ge")
-        self._conn.create_schema(
-            """
-        CREATE TABLE IF NOT EXISTS ge_owners (
-          owner TEXT PRIMARY KEY, active_branch TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS ge_config (
-          owner TEXT PRIMARY KEY, program_version TEXT NOT NULL,
-          policy_version TEXT NOT NULL, openings_hash TEXT NOT NULL,
-          epoch INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS ge_branches (
-          owner TEXT NOT NULL, branch_id TEXT NOT NULL, active INTEGER NOT NULL,
-          PRIMARY KEY(owner, branch_id));
-        CREATE TABLE IF NOT EXISTS ge_actions (
-          owner TEXT NOT NULL, action_id TEXT NOT NULL, request_json TEXT NOT NULL,
-          request_hash TEXT NOT NULL, branch_id TEXT NOT NULL, status TEXT NOT NULL,
-          disposition TEXT NOT NULL, reason TEXT NOT NULL, result_json TEXT,
-          evidence_json TEXT, executed INTEGER, last_sequence INTEGER NOT NULL,
-          config_epoch INTEGER NOT NULL,
-          PRIMARY KEY(owner, action_id));
-        CREATE TABLE IF NOT EXISTS ge_counts (
-          owner TEXT NOT NULL, operation TEXT NOT NULL, target TEXT NOT NULL,
-          dispatches INTEGER NOT NULL, PRIMARY KEY(owner, operation, target));
-        CREATE TABLE IF NOT EXISTS ge_events (
-          sequence INTEGER PRIMARY KEY, owner TEXT NOT NULL, action_id TEXT,
-          kind TEXT NOT NULL, payload_json TEXT NOT NULL, previous_hash TEXT NOT NULL,
-          event_hash TEXT NOT NULL);
-        CREATE INDEX IF NOT EXISTS ge_events_owner ON ge_events(owner, sequence);
-        CREATE TABLE IF NOT EXISTS ge_checkpoints (
-          owner TEXT NOT NULL, checkpoint_id TEXT NOT NULL, branch_id TEXT NOT NULL,
-          program_version TEXT NOT NULL, policy_version TEXT NOT NULL,
-          state_json TEXT NOT NULL, state_hash TEXT NOT NULL, sequence INTEGER NOT NULL,
-          PRIMARY KEY(owner, checkpoint_id));
-        """,
-            append_only={
-                "ge_events": "guard history is append-only",
-                "ge_checkpoints": "guard checkpoints are immutable",
-            },
-        )
+        try:
+            self._conn.migrate("ge", _GE_MIGRATIONS)
+        except BaseException:
+            self._conn.close()
+            raise
         try:
             with self._transaction():
-                if "openings_hash" not in self._conn.columns("ge_config"):
-                    # Ledgers from the 0.2.6a1 preview predate the openings
-                    # fingerprint; the first reopen records it (see below).
-                    self._conn.execute(
-                        "ALTER TABLE ge_config ADD COLUMN openings_hash TEXT NOT NULL DEFAULT ''"
-                    )
                 current = self._conn.execute(
                     "SELECT * FROM ge_config WHERE owner=?", (self.owner,)
                 ).fetchone()

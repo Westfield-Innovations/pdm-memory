@@ -189,7 +189,9 @@ def test_another_owners_revocation_does_not_reach_this_one(tmp_path):
 def test_revocations_survive_a_reopen_and_an_older_file_gains_the_table(tmp_path):
     with _open(ledger_target(tmp_path, "c.db")) as led:
         led.prepare(VALVE)
-        led._conn.execute("DROP TABLE cl_revocations")  # a file from before revocations
+        # A file from before revocations, and from before schema versions.
+        led._conn.execute("DROP TABLE cl_revocations")
+        led._conn.execute("DROP TABLE pdm_schema_versions")
     with _open(ledger_target(tmp_path, "c.db")) as led:
         _revoke(led)
     with _open(ledger_target(tmp_path, "c.db")) as led:
