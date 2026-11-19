@@ -51,7 +51,13 @@ from pdm_memory.goal_loop.contract import (
 )
 from pdm_memory.goal_loop.executor import ActionResult, Executor, NotExecuted
 from pdm_memory.goal_loop.guard import DefaultGuard, Guard
-from pdm_memory.goal_loop.job import MAX_SEEN, Job, Observation, ProposedStep, StepTemplate
+from pdm_memory.goal_loop.job import (
+    MAX_SEEN,
+    Job,
+    Observation,
+    ProposedStep,
+    StepTemplate,
+)
 from pdm_memory.goal_loop.receipts import StepReceipt, verify_chain
 from pdm_memory.goal_loop.states import (
     TERMINAL,
@@ -336,12 +342,15 @@ class GoalLoopController:
     @staticmethod
     def _budget_reason(job: Job, contract: GoalContract, *, new_action: bool) -> str | None:
         budget = contract.budget
-        if new_action and budget.max_actions is not None:
-            if job.actions_dispatched >= budget.max_actions:
-                return (
-                    f"max_actions={budget.max_actions} reached "
-                    f"({job.actions_dispatched} dispatched)"
-                )
+        if (
+            new_action
+            and budget.max_actions is not None
+            and job.actions_dispatched >= budget.max_actions
+        ):
+            return (
+                f"max_actions={budget.max_actions} reached "
+                f"({job.actions_dispatched} dispatched)"
+            )
         if budget.max_cost is not None and job.cost_spent >= budget.max_cost:
             return f"max_cost={budget.max_cost} reached ({job.cost_spent} spent)"
         return None
@@ -652,7 +661,7 @@ class GoalLoopController:
         approved = job.approved_action_id == job.action_id
         try:
             decision = self._guard.check(contract, step, owner_approved=approved)
-        except Exception as exc:  # a broken guard fails closed: the step does not run
+        except Exception as exc:  # noqa: BLE001 - a broken guard fails closed: the step does not run
             self._guard_failed(tx, f"guard failed: {type(exc).__name__}: {exc}")
             return
         report = decision.to_dict()
@@ -732,7 +741,7 @@ class GoalLoopController:
                 result = executor(step, idempotency_key=step.action_id)
             except NotExecuted as exc:
                 outcome = ("not_executed", None, str(exc))
-            except Exception as exc:  # anything else: the step may have run
+            except Exception as exc:  # noqa: BLE001 - anything else: the step may have run
                 outcome = ("uncertain", None, f"{type(exc).__name__}: {exc}")
             else:
                 if isinstance(result, ActionResult):
@@ -848,7 +857,7 @@ class GoalLoopController:
             return ProofVerdict("NOT_YET", f"no checker is registered for proof source {source!r}")
         try:
             verdict = checker.check(contract, job.step, job.result, evidence, now)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a broken checker proves nothing yet
             return ProofVerdict("NOT_YET", f"checker failed: {type(exc).__name__}: {exc}")
         if not isinstance(verdict, ProofVerdict):
             return ProofVerdict("NOT_YET", f"checker returned {type(verdict).__name__}")

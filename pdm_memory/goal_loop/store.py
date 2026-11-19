@@ -126,7 +126,7 @@ class JobStore(ABC):
     def active(self) -> list[str]:
         """Ids of jobs that have not reached a terminal state."""
 
-    def close(self) -> None:  # noqa: B027 - optional hook
+    def close(self) -> None:
         """Release resources."""
 
 
