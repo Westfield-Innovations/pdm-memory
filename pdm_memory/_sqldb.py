@@ -136,7 +136,14 @@ class Database:
         except ImportError:
             raise ImportError("install pdm-memory[postgres] for a postgresql:// target") from None
         self.dialect, self.Error = "postgres", psycopg.Error
-        conn = psycopg.connect(target, autocommit=True, row_factory=_pg_row)
+        self._target, self._lock_key = str(target), lock_key
+        self._txn = self._closed = False
+        self._conn = self._connect()
+
+    def _connect(self) -> Any:
+        import psycopg
+
+        conn = psycopg.connect(self._target, autocommit=True, row_factory=_pg_row)
         try:
             if conn.execute("SHOW fsync").fetchone()[0] == "off":
                 raise ConfigurationError(
@@ -147,38 +154,68 @@ class Database:
             # schema plays the file, and a wait past 30 s raises instead of hanging.
             conn.execute("SET lock_timeout TO '30s'")
             schema = conn.execute("SELECT current_schema()").fetchone()[0]
-            self._lock_id = _lock_id(f"{lock_key}:{schema}")
+            self._lock_id = _lock_id(f"{self._lock_key}:{schema}")
         except BaseException:
             conn.close()
             raise
-        self._conn = conn
+        return conn
+
+    def _live(self) -> Any:
+        """The Postgres connection, reopened if it dropped while no transaction was open.
+
+        Inside a transaction a drop is an error for the caller: reconnecting there
+        would carry on outside the transaction it began.
+        """
+        if not self._txn and not self._closed and (self._conn.broken or self._conn.closed):
+            self._conn = self._connect()
+        return self._conn
 
     def execute(self, sql: str, params: Sequence[Any] = ()) -> Any:
         if self.dialect == "sqlite":
             return self._conn.execute(_checked(sql), params)
         # Postgres keeps bool and integer apart; SQLite stores a bool as 0 or 1.
         values = [int(p) if type(p) is bool else p for p in params]
-        return self._conn.execute(_to_postgres(sql), values)
+        return self._live().execute(_to_postgres(sql), values)
 
     def begin(self) -> None:
         if self.dialect == "sqlite":
             self._conn.execute("BEGIN IMMEDIATE")
             return
         # shortcut: one writer per ledger kind and schema, as SQLite has one per file; key it by owner if owners start waiting on each other.
-        self._conn.execute("BEGIN")
+        try:
+            self._live().execute("BEGIN")
+        except self.Error:
+            # An idle connection that died shows it only now. BEGIN changes
+            # nothing, so it is the one statement safe to send again.
+            if not self._conn.broken or self._closed:
+                raise
+            self._conn = self._connect()
+            self._conn.execute("BEGIN")
+        self._txn = True
         self._conn.execute("SELECT pg_advisory_xact_lock(%s)", (self._lock_id,))
 
     def commit(self) -> None:
-        self._conn.execute("COMMIT")
+        try:
+            self._conn.execute("COMMIT")
+        finally:
+            self._txn = False
 
     def rollback(self) -> None:
-        self._conn.execute("ROLLBACK")
+        if self.dialect == "sqlite":
+            self._conn.execute("ROLLBACK")
+            return
+        try:
+            # A dropped connection has no transaction left to roll back.
+            if not (self._conn.broken or self._conn.closed):
+                self._conn.execute("ROLLBACK")
+        finally:
+            self._txn = False
 
     @property
     def in_transaction(self) -> bool:
         if self.dialect == "sqlite":
             return self._conn.in_transaction
-        return self._conn.info.transaction_status != 0  # psycopg TransactionStatus.IDLE
+        return self._txn
 
     def _begin_schema(self) -> None:
         """The writer lock, plus one lock per Postgres schema for DDL shared by ledger kinds."""
@@ -297,4 +334,5 @@ class Database:
         return {r[0] for r in rows}
 
     def close(self) -> None:
+        self._closed = True
         self._conn.close()

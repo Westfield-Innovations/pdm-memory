@@ -164,9 +164,63 @@ def test_a_dropped_connection_loses_no_committed_record(pg_target):
         admin.execute("SELECT pg_terminate_backend(%s)", (pid,))
     with pytest.raises(psycopg.OperationalError):
         d.commit()
-    again = Database(pg_target, lock_key="test")
-    assert [r[0] for r in again.execute("SELECT a FROM t")] == ["kept"]
-    again.close()
+    d.rollback()  # what a ledger's transaction does on the way out; nothing left to undo
+    assert not d.in_transaction
+    # The same object reconnects for its next call, with its session settings.
+    assert [r[0] for r in d.execute("SELECT a FROM t")] == ["kept"]
+    assert d.execute("SHOW lock_timeout").fetchone()[0] == "30s"
+    d.begin()
+    d.execute("INSERT INTO t VALUES ('after', 3)")
+    d.commit()
+    assert sorted(r[0] for r in d.execute("SELECT a FROM t")) == ["after", "kept"]
+    d.close()
+
+
+def _terminate(d):
+    import psycopg
+
+    pid = d.execute("SELECT pg_backend_pid()").fetchone()[0]
+    with psycopg.connect(PG_URL, autocommit=True) as admin:
+        admin.execute("SELECT pg_terminate_backend(%s)", (pid,))
+
+
+def test_a_drop_inside_a_transaction_never_reconnects_silently(pg_target):
+    import psycopg
+
+    d = Database(pg_target, lock_key="test")
+    d.create_schema(SCHEMA)
+    d.begin()
+    _terminate(d)
+    with pytest.raises(psycopg.OperationalError):
+        d.execute("INSERT INTO t VALUES ('half', 1)")
+    # The connection is known dead now; the transaction's next write still must
+    # not run on a fresh connection, outside the transaction it belongs to.
+    with pytest.raises(psycopg.OperationalError):
+        d.execute("INSERT INTO t VALUES ('half', 2)")
+    d.rollback()
+    assert d.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 0
+    d.close()
+
+
+def test_a_closed_database_stays_closed(pg_target):
+    import psycopg
+
+    d = Database(pg_target, lock_key="test")
+    d.close()
+    with pytest.raises(psycopg.OperationalError):
+        d.execute("SELECT 1")
+
+
+def test_a_ledger_keeps_working_after_its_connection_drops(pg_target):
+    from pdm_memory import ConsequenceLedger
+    from tests.consequence_fixtures import POLICY, TASK, TEMP, VALVE
+
+    with ConsequenceLedger(pg_target, owner="o", policy=POLICY) as led:
+        led.prepare(VALVE)
+        _terminate(led._conn)
+        led.observe(TEMP)  # a write starts with BEGIN, which reconnects
+        assert led.evaluate("exp-valve-1", task=TASK).revision == 1
+        assert led.verify_history()
 
 
 def test_a_server_without_fsync_is_refused(pg_target, monkeypatch):
@@ -336,4 +390,16 @@ def test_two_kinds_migrate_one_new_schema_at_once(target):
         "ka": 1,
         "kb": 1,
     }
+    d.close()
+
+
+def test_a_read_after_an_idle_drop_fails_once_then_reconnects(pg_target):
+    import psycopg
+
+    d = Database(pg_target, lock_key="test")
+    _terminate(d)
+    # A statement other than BEGIN is never resent: it might have taken effect.
+    with pytest.raises(psycopg.OperationalError):
+        d.execute("SELECT 1")
+    assert d.execute("SELECT 1").fetchone()[0] == 1
     d.close()
