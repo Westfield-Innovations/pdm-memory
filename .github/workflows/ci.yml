@@ -56,8 +56,8 @@ jobs:
 
       - name: Lint, format and types of the ledgers
         run: |
-          ruff check pdm_memory/_sqldb.py pdm_memory/_chain.py pdm_memory/_errors.py pdm_memory/consequence pdm_memory/goal_loop tests/test_sqldb.py tests/test_ledger_races.py tests/ledger_target.py tests/consequence_fixtures.py tests/test_consequence_*.py
-          ruff format --check pdm_memory/_sqldb.py pdm_memory/_chain.py pdm_memory/_errors.py pdm_memory/consequence tests/test_sqldb.py tests/test_ledger_races.py tests/ledger_target.py tests/consequence_fixtures.py tests/test_consequence_*.py
+          ruff check pdm_memory/_sqldb.py pdm_memory/_chain.py pdm_memory/_errors.py pdm_memory/consequence pdm_memory/goal_loop tests/test_sqldb.py tests/test_ledger_races.py tests/ledger_target.py tests/conftest.py tests/consequence_fixtures.py tests/test_consequence_*.py
+          ruff format --check pdm_memory/_sqldb.py pdm_memory/_chain.py pdm_memory/_errors.py pdm_memory/consequence tests/test_sqldb.py tests/test_ledger_races.py tests/ledger_target.py tests/conftest.py tests/consequence_fixtures.py tests/test_consequence_*.py
           mypy
 
       - name: Run tests
