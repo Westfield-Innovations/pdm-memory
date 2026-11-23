@@ -219,6 +219,7 @@ def _nested(n):
         (float, True),
         (float, float("nan")),
         (float, float("inf")),
+        (float, 10**400),
         (Decimal, "NaN"),
         (str, 3),
         (bool, 1),

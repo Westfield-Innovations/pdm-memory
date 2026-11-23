@@ -144,9 +144,13 @@ def _decode(tp: Any, data: Any, depth: int) -> Any:
             return _need(type(data) is int, tp, data)
         if tp is float:
             _need(type(data) in (int, float), tp, data)
-            if not math.isfinite(data):
+            try:
+                number = float(data)
+            except OverflowError as exc:
+                raise WireError("integer too large for a float") from exc
+            if not math.isfinite(number):
                 raise WireError("float must be finite")
-            return float(data)
+            return number
         if tp is str:
             return _need(isinstance(data, str), tp, data)
         if tp is datetime:
