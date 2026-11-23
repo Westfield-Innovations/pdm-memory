@@ -9,7 +9,9 @@ import uuid
 
 import pytest
 
+from pdm_memory._ledger.chain import _body, _hash, verify_rows
 from pdm_memory._ledger.db import Database, Row, is_postgres
+from pdm_memory._ledger.errors import LedgerIntegrityError
 from pdm_memory.guarded_effects import ConfigurationError
 from tests.ledger_target import PG_URL, postgres_target
 
@@ -441,3 +443,21 @@ def test_a_read_after_an_idle_drop_fails_once_then_reconnects(pg_target):
         d.execute("SELECT 1")
     assert d.execute("SELECT 1").fetchone()[0] == 1
     d.close()
+
+
+def _chain(n):
+    rows, previous = [], ""
+    for sequence in range(1, n + 1):
+        body = (sequence, "o", "s", "K", f'{{"n":{sequence}}}', previous)
+        previous = _hash(_body(*body))
+        rows.append((*body, previous))
+    return rows
+
+
+def test_verify_rows_returns_the_head_and_detects_an_edit():
+    rows = _chain(3)
+    assert verify_rows(rows, "o", "guard") == rows[-1][6]
+    assert verify_rows([], "o", "guard", previous="h") == "h"
+    edited = [rows[0], (*rows[1][:4], '{"n":9}', *rows[1][5:]), rows[2]]
+    with pytest.raises(LedgerIntegrityError):
+        verify_rows(edited, "o", "guard")

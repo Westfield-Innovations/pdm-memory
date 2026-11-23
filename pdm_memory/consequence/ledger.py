@@ -190,6 +190,10 @@ class ConsequenceLedger:
     @contextmanager
     def _transaction(self):
         with self._lock:
+            if self._conn.in_transaction:
+                # Joined: the outer transaction's owner commits or rolls back.
+                yield
+                return
             self._conn.begin()
             try:
                 yield
