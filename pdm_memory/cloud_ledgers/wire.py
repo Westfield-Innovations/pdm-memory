@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import types
 import typing
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import MISSING, fields, is_dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -181,10 +181,11 @@ def _decode(tp: Any, data: Any, depth: int) -> Any:
         if len(args) != len(data):
             raise WireError(f"expected {len(args)} items, got {len(data)}")
         return tuple(_decode(a, v, depth + 1) for a, v in zip(args, data))
-    if base in (list, frozenset, set):
+    if base in (list, frozenset, set, Sequence):
         _need(isinstance(data, list), tp, data)
         item = args[0] if args else Any
-        return base(_decode(item, v, depth + 1) for v in data)
+        items = [_decode(item, v, depth + 1) for v in data]
+        return items if base is Sequence else base(items)
     if base in (dict, Mapping):
         return _mapping(args or (Any, Any), data, depth)
     raise TypeError(f"cannot decode {tp!r}")

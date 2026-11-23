@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
@@ -252,6 +253,7 @@ def test_unsupported_types_are_a_programming_error():
         decode(complex, 1)
     assert decode(float, 3) == 3.0 and decode(int | None, None) is None
     assert decode(Expectation, encode(VALVE)) == VALVE
+    assert decode(Sequence[int], [1, 2]) == [1, 2]
 
 
 def make(name):
