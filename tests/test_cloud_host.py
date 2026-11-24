@@ -655,3 +655,52 @@ def test_a_stale_epoch_leaves_the_cached_ledger_alone(host, target):
     )
     assert status == 409 and list(host._cache.values()) == cached
 
+
+def test_one_host_serves_two_targets_from_two_threads(tmp_path):
+    import threading
+
+    from pdm_memory.cloud_ledgers.client import CloudLedgers
+    from pdm_memory.cloud_ledgers.testing import InProcessTransport
+    from pdm_memory.guarded_effects import EffectRequest, Opening
+
+    host = LedgerHost(max_open=1)  # every call evicts the other thread's ledger
+    rounds, errors, calls = 8, [], {}
+
+    def work(name):
+        where = tmp_path / name if ON_CLOUD else ledger_target(tmp_path, name)
+        cloud = CloudLedgers(transport=InProcessTransport(host, lambda ns: where))
+        calls[name] = 0
+
+        def handler(r):
+            calls[name] += 1
+            return {"n": calls[name]}
+
+        try:
+            g = GuardedEffects(
+                cloud,
+                owner="o",
+                program_version="w-1",
+                policy_version="p-1",
+                openings=[Opening("open", "valve-3", handler, lambda r: True)],
+            )
+            g.start_branch("b1")
+            for i in range(rounds):
+                request = EffectRequest(
+                    f"A{i}", "b1", "w-1", "p-1", "open", "valve-3", {"i": i}
+                )
+                assert g.stage(request).status == "HELD"
+                assert g.release(f"A{i}").status == "RETURNED"
+                assert g.receipt(f"A{i}").status == "RETURNED"
+                g.history(f"A{i}")
+            assert g.dispatch_count("open", "valve-3") == rounds
+            assert g.verify_history()
+        except BaseException as exc:  # noqa: BLE001 - reported below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=work, args=(n,)) for n in ("a.db", "b.db")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    host.close()
+    assert errors == [] and calls == {"a.db": rounds, "b.db": rounds}
