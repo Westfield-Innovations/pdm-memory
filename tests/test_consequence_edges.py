@@ -36,7 +36,7 @@ from tests.consequence_fixtures import (
     TEMP,
     VALVE,
 )
-from tests.ledger_target import ledger_target
+from tests.ledger_target import ledger_target, local_only
 
 SUPPLY = replace(
     TEMP,
@@ -245,6 +245,7 @@ def test_exchange_rules_cannot_be_edited_in_place():
         policy.exchange_rules["s"] = 1000
 
 
+@local_only
 def test_evidence_is_read_under_the_write_lock(ledger):
     # No other writer can add a reading between the read and the new revision,
     # so a slower caller can never supersede a revision built from newer evidence.
@@ -319,6 +320,7 @@ def test_owners_sharing_a_file_are_isolated(tmp_path):
         assert a.verify_history() and b.verify_history()
 
 
+@local_only
 def test_a_tampered_event_is_detected(ledger):
     ledger.prepare(VALVE)
     ledger.observe(replace(TEMP, value=21.0))
@@ -334,6 +336,7 @@ def test_a_tampered_event_is_detected(ledger):
         ledger.verify_history()
 
 
+@local_only
 def test_triggers_refuse_edits(ledger):
     ledger.prepare(VALVE)
     for sql in ("UPDATE cl_events SET kind='X'", "DELETE FROM cl_events"):

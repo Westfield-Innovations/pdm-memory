@@ -10,6 +10,7 @@ whether an expectation was committed first.
 from __future__ import annotations
 
 import json
+import sys
 import threading
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -162,6 +163,19 @@ class ConsequenceLedger:
     is immutable once written: a correction is a new revision naming the one
     it supersedes.
     """
+
+    def __new__(cls, path: Any, *args: Any, **kwargs: Any) -> ConsequenceLedger:  # noqa: PYI034
+        # A CloudLedgers can only exist once its module is loaded; don't load it otherwise.
+        client = sys.modules.get("pdm_memory.cloud_ledgers.client")
+        if (
+            cls is ConsequenceLedger
+            and client
+            and isinstance(path, client.CloudLedgers)
+        ):
+            from pdm_memory.cloud_ledgers.consequence import CloudConsequenceLedger
+
+            return object.__new__(CloudConsequenceLedger)
+        return object.__new__(cls)
 
     def __init__(
         self,
