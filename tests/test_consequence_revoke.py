@@ -34,7 +34,7 @@ from tests.consequence_fixtures import (
     _guard,
     _request,
 )
-from tests.ledger_target import ledger_target, sqlite_only
+from tests.ledger_target import ledger_target, local_only, sqlite_only
 
 SUPPLY = replace(
     TEMP,
@@ -103,6 +103,7 @@ def test_a_revoked_expectation_takes_no_further_evaluation(ledger):
     assert ledger.current_evaluation("exp-valve-1") == first
 
 
+@local_only
 def test_revoking_closes_open_requests_and_stops_new_ones(ledger):
     ledger.evaluate("exp-valve-1", task=TASK)
     assert {p.status for p in ledger.suggest_observation("exp-valve-1")} == {"OPEN"}
@@ -232,6 +233,7 @@ def test_another_owners_revocation_does_not_reach_this_one(tmp_path):
 
 
 @sqlite_only
+@local_only
 def test_revocations_survive_a_reopen_and_an_older_file_gains_the_table(tmp_path):
     with _open(ledger_target(tmp_path, "c.db")) as led:
         led.prepare(VALVE)

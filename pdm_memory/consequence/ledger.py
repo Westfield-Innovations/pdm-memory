@@ -10,6 +10,7 @@ whether an expectation was committed first.
 from __future__ import annotations
 
 import json
+import sys
 import threading
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -163,9 +164,23 @@ class ConsequenceLedger:
     it supersedes.
     """
 
+    def __new__(cls, path: Any = None, *args: Any, **kwargs: Any) -> ConsequenceLedger:  # noqa: PYI034
+        # A CloudLedgers can only exist once its module is loaded; don't load it otherwise.
+        client = sys.modules.get("pdm_memory.cloud_ledgers.client")
+        if (
+            cls is ConsequenceLedger
+            and client
+            and isinstance(path, client.CloudLedgers)
+        ):
+            from pdm_memory.cloud_ledgers.consequence import CloudConsequenceLedger
+
+            return object.__new__(CloudConsequenceLedger)
+        return object.__new__(cls)
+
     def __init__(
         self,
-        path: str | Path,
+        # Or a CloudLedgers, which __new__ routes; naming it would import the cloud package.
+        path: str | Path | Any,
         *,
         owner: str,
         policy: OwnerPolicy,
@@ -190,6 +205,10 @@ class ConsequenceLedger:
     @contextmanager
     def _transaction(self):
         with self._lock:
+            if self._conn.in_transaction:
+                # Joined: the outer transaction's owner commits or rolls back.
+                yield
+                return
             self._conn.begin()
             try:
                 yield

@@ -55,6 +55,16 @@ from pdm_memory.goal_loop.store import (
 )
 from pdm_memory.goal_loop.triggers import TriggerState
 
+
+def __getattr__(name: str):
+    # Lazy: cloud_ledgers imports goal_loop.store, so an eager import would cycle.
+    if name == "CloudJobStore":
+        from pdm_memory.cloud_ledgers.jobs import CloudJobStore
+
+        return CloudJobStore
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = [
     "PROMISE_FIELDS",
     "ActionResult",
@@ -63,6 +73,7 @@ __all__ = [
     "Budget",
     "CallableChecker",
     "Checker",
+    "CloudJobStore",
     "ContractHistory",
     "DefaultGuard",
     "EndConditions",

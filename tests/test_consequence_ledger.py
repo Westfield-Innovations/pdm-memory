@@ -17,7 +17,7 @@ from tests.consequence_fixtures import (
     _policy,
     _request,
 )
-from tests.ledger_target import ledger_target
+from tests.ledger_target import ledger_target, local_only
 
 
 @pytest.fixture
@@ -130,6 +130,7 @@ def test_release_waits_for_a_retained_expectation(ledger, tmp_path):
         assert len(calls) == 1
 
 
+@local_only
 def test_history_is_append_only_and_chained(ledger):
     ledger.prepare(VALVE)
     ledger.observe(TEMP)

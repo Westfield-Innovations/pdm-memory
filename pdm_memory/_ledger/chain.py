@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterable, Sequence
+from typing import Any
 
 from pdm_memory._ledger.db import Database, _ident
 from pdm_memory._ledger.errors import LedgerIntegrityError
 
-__all__ = ["append_event", "verify_events"]
+__all__ = ["append_event", "verify_events", "verify_rows"]
 
 
 def _hash(text: str) -> str:
@@ -64,13 +66,11 @@ def append_event(
     return sequence
 
 
-def verify_events(db: Database, table: str, owner: str, name: str) -> bool:
-    """Check *owner*'s chain in *table*; this cannot detect privileged tail removal."""
-    _ident(table)
-    previous = ""
-    for row in db.execute(
-        f"SELECT * FROM {table} WHERE owner=? ORDER BY sequence", (owner,)
-    ):
+def verify_rows(
+    rows: Iterable[Sequence[Any]], owner: str, name: str, *, previous: str = ""
+) -> str:
+    """Check already-read event rows in sequence order and return the last hash."""
+    for row in rows:
         sequence, _, subject, kind, payload_json, previous_hash, event_hash = row[:7]
         expected = _hash(
             _body(sequence, owner, subject, kind, payload_json, previous_hash)
@@ -78,4 +78,15 @@ def verify_events(db: Database, table: str, owner: str, name: str) -> bool:
         if previous_hash != previous or expected != event_hash:
             raise LedgerIntegrityError(f"retained {name} history chain is inconsistent")
         previous = event_hash
+    return previous
+
+
+def verify_events(db: Database, table: str, owner: str, name: str) -> bool:
+    """Check *owner*'s chain in *table*; this cannot detect privileged tail removal."""
+    _ident(table)
+    verify_rows(
+        db.execute(f"SELECT * FROM {table} WHERE owner=? ORDER BY sequence", (owner,)),
+        owner,
+        name,
+    )
     return True

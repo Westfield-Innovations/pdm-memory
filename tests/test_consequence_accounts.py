@@ -29,7 +29,7 @@ from tests.consequence_fixtures import (
     VALVE,
     _source,
 )
-from tests.ledger_target import ledger_target
+from tests.ledger_target import ledger_target, local_only
 
 
 @pytest.fixture
@@ -251,6 +251,7 @@ def test_repeats_per_criterion_are_bounded(make):
     assert statuses == ["OPEN", "OPEN", "EXHAUSTED"]
 
 
+@local_only
 def test_a_resolving_evaluation_closes_the_proposal(ledger):
     _resolve_movement(ledger)
     (p,) = ledger.suggest_observation("exp-valve-1")

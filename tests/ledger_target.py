@@ -10,14 +10,18 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 PG_URL = os.environ.get("PDM_TEST_POSTGRES_URL")
 ON_POSTGRES = os.environ.get("PDM_TEST_LEDGER_BACKEND") == "postgres"
+ON_CLOUD = os.environ.get("PDM_TEST_LEDGER_BACKEND") == "cloud"
 _created: list[str] = []
 # For what only exists in a file: an older file's layout, a :memory: path.
 sqlite_only = pytest.mark.skipif(ON_POSTGRES, reason="exercises a SQLite file")
+# For what reads the ledger's own connection, which a cloud ledger does not have.
+local_only = pytest.mark.skipif(ON_CLOUD, reason="reads the ledger's own connection")
 
 
 def postgres_target(key: str) -> str:
@@ -32,7 +36,11 @@ def postgres_target(key: str) -> str:
     return f"{PG_URL}{'&' if '?' in PG_URL else '?'}options=-csearch_path%3D{schema}"
 
 
-def ledger_target(tmp_path: Path, name: str) -> str | Path:
+def ledger_target(tmp_path: Path, name: str) -> Any:
+    if ON_CLOUD:
+        from pdm_memory.cloud_ledgers.testing import in_process
+
+        return in_process(tmp_path / name)
     if not ON_POSTGRES:
         return tmp_path / name
     if not PG_URL:
@@ -44,6 +52,10 @@ def ledger_target(tmp_path: Path, name: str) -> str | Path:
 
 def drop_schemas() -> None:
     """Drop every schema this run created; tests/conftest.py calls it once at the end."""
+    if ON_CLOUD:
+        from pdm_memory.cloud_ledgers.testing import close_hosts
+
+        close_hosts()
     if not _created:
         return
     import psycopg

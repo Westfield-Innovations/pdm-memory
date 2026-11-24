@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 import threading
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
@@ -27,7 +28,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from pdm_memory._ledger.chain import _hash, append_event, verify_events
 from pdm_memory._ledger.db import Database, Row
@@ -195,6 +196,35 @@ def _openings_hash(openings: Mapping[tuple[str, str], Opening]) -> str:
 
 _TERMINAL = {"REJECTED", "CANCELLED", "RETURNED", "OBSERVED"}
 
+VALIDATOR = "parameter validator"
+CONDITION = "current condition"
+
+# (callback, encoded request, label) -> verdict; GuardedEffects._judge runs it in process.
+Judge = Callable[[Callable[[EffectRequest], Any] | None, str, str], ConditionVerdict]
+
+
+class _Dispatch(NamedTuple):
+    opening: Opening
+    encoded: str
+
+
+def _check_openings(openings: list[Opening]) -> dict[tuple[str, str], Opening]:
+    checked: dict[tuple[str, str], Opening] = {}
+    for opening in openings:
+        key = (_name(opening.operation, "operation"), _name(opening.target, "target"))
+        if key in checked:
+            raise ValueError(f"duplicate opening {key}")
+        if not callable(opening.handler) or not callable(opening.validate):
+            raise TypeError("each opening requires trusted handler and validate callables")
+        if opening.check is not None and not callable(opening.check):
+            raise TypeError("opening check must be callable")
+        if opening.max_dispatches is not None and (
+            type(opening.max_dispatches) is not int or opening.max_dispatches < 0
+        ):
+            raise ValueError("max_dispatches must be a nonnegative integer or None")
+        checked[key] = opening
+    return checked
+
 
 _GE_SCHEMA = """
         CREATE TABLE IF NOT EXISTS ge_owners (
@@ -273,9 +303,19 @@ class GuardedEffects:
     against an administrator replacing the database or deleting its tail.
     """
 
+    def __new__(cls, path: Any = None, *args: Any, **kwargs: Any) -> GuardedEffects:  # noqa: PYI034
+        # A CloudLedgers can only exist once its module is loaded; don't load it otherwise.
+        client = sys.modules.get("pdm_memory.cloud_ledgers.client")
+        if cls is GuardedEffects and client and isinstance(path, client.CloudLedgers):
+            from pdm_memory.cloud_ledgers.guard import CloudGuardedEffects
+
+            return object.__new__(CloudGuardedEffects)
+        return object.__new__(cls)
+
     def __init__(
         self,
-        path: str | Path,
+        # Or a CloudLedgers, which __new__ routes; naming it would import the cloud package.
+        path: str | Path | Any,
         *,
         owner: str,
         program_version: str,
@@ -304,20 +344,7 @@ class GuardedEffects:
                 raise ValueError(f"{label} must be a positive integer")
         self.max_request_bytes, self.max_pending = max_request_bytes, max_pending
         self.max_state_bytes, self.max_result_bytes = max_state_bytes, max_result_bytes
-        self._openings: dict[tuple[str, str], Opening] = {}
-        for opening in openings:
-            key = (_name(opening.operation, "operation"), _name(opening.target, "target"))
-            if key in self._openings:
-                raise ValueError(f"duplicate opening {key}")
-            if not callable(opening.handler) or not callable(opening.validate):
-                raise TypeError("each opening requires trusted handler and validate callables")
-            if opening.check is not None and not callable(opening.check):
-                raise TypeError("opening check must be callable")
-            if opening.max_dispatches is not None and (
-                type(opening.max_dispatches) is not int or opening.max_dispatches < 0
-            ):
-                raise ValueError("max_dispatches must be a nonnegative integer or None")
-            self._openings[key] = opening
+        self._openings = _check_openings(openings)
         self._openings_hash = _openings_hash(self._openings)
         self._lock = threading.RLock()
         self._in_flight: set[str] = set()
@@ -399,6 +426,10 @@ class GuardedEffects:
     @contextmanager
     def _transaction(self):
         with self._lock:
+            if self._conn.in_transaction:
+                # Joined: the outer transaction's owner commits or rolls back.
+                yield
+                return
             self._conn.begin()
             try:
                 yield
@@ -617,6 +648,9 @@ class GuardedEffects:
 
     def stage(self, request: EffectRequest) -> ActionReceipt:
         """Capture an immutable request. Staging is never execution permission."""
+        return self._stage(request, self._judge)
+
+    def _stage(self, request: EffectRequest, judge: Judge) -> ActionReceipt:
         encoded = self._capture(request)
         captured = self._request(encoded)
         with self._transaction():
@@ -633,10 +667,10 @@ class GuardedEffects:
             verdict = (
                 ConditionVerdict(CheckResult.CONTRADICTED, failure)
                 if failure
-                else self._judge(
+                else judge(
                     self._openings[(captured.operation, captured.target)].validate,
                     encoded,
-                    "parameter validator",
+                    VALIDATOR,
                 )
             )
             held = verdict.status != CheckResult.CONTRADICTED
@@ -704,25 +738,51 @@ class GuardedEffects:
         controller cannot tell that from an interruption and marks it UNCERTAIN.
         """
         action_id = _name(action_id, "action_id")
+        with self._lock:
+            receipt, dispatch = self._reserve(action_id, self._judge)
+            if dispatch is None:
+                return receipt
+            self._in_flight.add(action_id)
+        try:
+            # The reservation committed before any outward action is attempted.
+            try:
+                result = json.loads(
+                    _json(
+                        dispatch.opening.handler(self._request(dispatch.encoded)),
+                        self.max_result_bytes,
+                    )
+                )
+            except BaseException as exc:
+                receipt = self._complete(action_id, failure=f"{type(exc).__name__}: {str(exc)[:512]}")
+                if not isinstance(exc, Exception):
+                    raise
+                return receipt
+            return self._complete(action_id, result=result)
+        finally:
+            with self._lock:
+                self._in_flight.discard(action_id)
+
+    def _reserve(self, action_id: str, judge: Judge) -> tuple[ActionReceipt, _Dispatch | None]:
+        """Rejudge and commit the dispatch intent; a dispatch is returned only then."""
         with self._transaction():
             self._assert_current_config()
             row = self._row(action_id)
             if row["status"] in _TERMINAL or row["status"] == "UNCERTAIN":
-                return self._receipt(row)
+                return self._receipt(row), None
             if row["status"] == "DISPATCHING":
                 if action_id in self._in_flight:
-                    return self._receipt(row)
+                    return self._receipt(row), None
                 return self._set(
                     action_id,
                     "UNCERTAIN",
                     CheckResult.UNKNOWN,
                     "dispatch intent exists; delivery or completion must be reconciled",
-                )
+                ), None
             encoded = row["request_json"]
             request = self._request(encoded)
             failure = self._binding_failure(request, row["config_epoch"])
             if failure:
-                return self._set(action_id, "REJECTED", CheckResult.CONTRADICTED, failure)
+                return self._set(action_id, "REJECTED", CheckResult.CONTRADICTED, failure), None
             pending = self._conn.execute(
                 "SELECT action_id FROM ge_actions WHERE owner=? AND status IN ('DISPATCHING','UNCERTAIN') LIMIT 1",
                 (self.owner,),
@@ -734,9 +794,9 @@ class GuardedEffects:
                     CheckResult.UNKNOWN,
                     "another dispatch is still running or requires reconciliation",
                     evidence={"blocking_action_id": pending[0]},
-                )
+                ), None
             opening = self._openings[(request.operation, request.target)]
-            validation = self._judge(opening.validate, encoded, "parameter validator")
+            validation = judge(opening.validate, encoded, VALIDATOR)
             if validation.status != CheckResult.SATISFIED:
                 return self._set(
                     action_id,
@@ -744,8 +804,8 @@ class GuardedEffects:
                     validation.status,
                     validation.reason or "parameters not established",
                     evidence=validation.evidence,
-                )
-            verdict = self._judge(opening.check, encoded, "current condition")
+                ), None
+            verdict = judge(opening.check, encoded, CONDITION)
             if verdict.status != CheckResult.SATISFIED:
                 return self._set(
                     action_id,
@@ -753,7 +813,7 @@ class GuardedEffects:
                     verdict.status,
                     verdict.reason or "required condition not satisfied",
                     evidence=verdict.evidence,
-                )
+                ), None
             count = self.dispatch_count(request.operation, request.target)
             if opening.max_dispatches is not None and count >= opening.max_dispatches:
                 return self._set(
@@ -762,59 +822,55 @@ class GuardedEffects:
                     CheckResult.CONTRADICTED,
                     "owner opening dispatch limit reached",
                     evidence={"dispatch_count": count},
-                )
+                ), None
             self._conn.execute(
                 """INSERT INTO ge_counts VALUES (?, ?, ?, 1)
               ON CONFLICT(owner, operation, target) DO UPDATE SET dispatches=ge_counts.dispatches+1""",
                 (self.owner, request.operation, request.target),
             )
-            self._set(
+            receipt = self._set(
                 action_id,
                 "DISPATCHING",
                 CheckResult.SATISFIED,
                 verdict.reason or "current conditions satisfied; dispatch intent secured",
                 evidence=verdict.evidence,
             )
-            self._in_flight.add(action_id)
-        try:
-            return self._dispatch(action_id, opening, encoded, verdict)
-        finally:
-            with self._lock:
-                self._in_flight.discard(action_id)
+            return receipt, _Dispatch(opening, encoded)
 
-    def _dispatch(
-        self, action_id: str, opening: Opening, encoded: str, verdict: ConditionVerdict
+    def _complete(
+        self, action_id: str, *, result: Any = None, failure: str | None = None
     ) -> ActionReceipt:
-        # The transaction committed before any outward action is attempted.
-        try:
-            result_json = _json(opening.handler(self._request(encoded)), self.max_result_bytes)
-        except BaseException as exc:
+        """Record a reserved handler's return, or its failure as ``"<Type>: <message>"``."""
+        if failure is not None:
             with self._transaction():
                 row = self._row(action_id)
-                if row["status"] not in _TERMINAL:
-                    receipt = self._set(
-                        action_id,
-                        "UNCERTAIN",
-                        CheckResult.UNKNOWN,
-                        f"handler completion uncertain after {type(exc).__name__}: {str(exc)[:512]}",
-                    )
-                else:
-                    receipt = self._receipt(row)
-            if not isinstance(exc, Exception):
-                raise
-            return receipt
+                if row["status"] in _TERMINAL:
+                    return self._receipt(row)
+                return self._set(
+                    action_id,
+                    "UNCERTAIN",
+                    CheckResult.UNKNOWN,
+                    f"handler completion uncertain after {failure}",
+                )
+        result_json = _json(result, self.max_result_bytes)
         with self._transaction():
             row = self._row(action_id)
             if row["status"] in _TERMINAL:
                 self._append("LATE_HANDLER_RETURN", {"result": json.loads(result_json)}, action_id)
                 return self._receipt(row)
+            # The reservation's evidence, even if another controller since marked it UNCERTAIN.
+            reserved = self._conn.execute(
+                "SELECT payload_json FROM ge_events WHERE owner=? AND action_id=?"
+                " AND kind='DISPATCHING' ORDER BY sequence DESC LIMIT 1",
+                (self.owner, action_id),
+            ).fetchone()
             return self._set(
                 action_id,
                 "RETURNED",
                 CheckResult.SATISFIED,
                 "registered handler returned; physical outcome is not inferred",
                 result=json.loads(result_json),
-                evidence=verdict.evidence,
+                evidence=json.loads(reserved[0])["evidence"] if reserved else None,
             )
 
     def cancel(

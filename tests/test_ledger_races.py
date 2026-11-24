@@ -1,4 +1,4 @@
-"""Separate processes racing on one ledger, on SQLite and on Postgres.
+"""Separate processes racing on one ledger: SQLite, Postgres, or SQLite through the cloud protocol.
 
 Threads share one connection and its lock; these tests take the database's own
 single-writer lock, which is what several hosts or workers actually rely on.
@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import uuid
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from pathlib import Path
 
 import pytest
 
-from pdm_memory import ConsequenceLedger
+from pdm_memory import CloudLedgers, ConsequenceLedger
+from pdm_memory.cloud_ledgers import CloudJobStore
+from pdm_memory.cloud_ledgers.testing import in_process
 from pdm_memory.consequence import (
     Admission,
     Application,
@@ -55,10 +58,26 @@ SUPPLY = replace(
 )
 
 
-@pytest.fixture(params=["sqlite", pytest.param("postgres", marks=needs_pg)])
+@dataclass(frozen=True)
+class OnCloud:
+    """A ledger file reached through the protocol; each process opens its own host on it."""
+
+    path: Path
+
+    def open(self) -> CloudLedgers:
+        return in_process(self.path)
+
+
+def _where(target):
+    return target.open() if isinstance(target, OnCloud) else target
+
+
+@pytest.fixture(params=["sqlite", pytest.param("postgres", marks=needs_pg), "cloud"])
 def target(request, tmp_path):
     if request.param == "sqlite":
         return lambda name: tmp_path / name
+    if request.param == "cloud":
+        return lambda name: OnCloud(tmp_path / name)
     key = uuid.uuid4().hex
     return lambda name: postgres_target(f"{key}/{name}")
 
@@ -79,7 +98,7 @@ def _race(manager, fn, args_list):
 
 def _ledger(target):
     return ConsequenceLedger(
-        target, owner="owner-1", policy=ROOMY, clock=lambda: COMMIT
+        _where(target), owner="owner-1", policy=ROOMY, clock=lambda: COMMIT
     )
 
 
@@ -87,6 +106,8 @@ def _ledger(target):
 
 
 def _job_store(target):
+    if isinstance(target, OnCloud):
+        return CloudJobStore(target.open())
     return (
         PostgresJobStore(target) if isinstance(target, str) else SqliteJobStore(target)
     )
@@ -126,7 +147,7 @@ def test_job_commit_race_has_one_winner(manager, target):
 
 def _open_guard(target, handler, *, start=False):
     g = GuardedEffects(
-        target,
+        _where(target),
         owner="owner-1",
         program_version="worker-1",
         policy_version="policy-1",
@@ -286,11 +307,12 @@ def test_no_evaluation_lands_after_a_revocation(manager, target):
             e["sequence"] for e in history if e["kind"] == "EXPECTATION_REVOKED"
         ]
         assert all(e["sequence"] < revoked for e in history if e["kind"] == "EVALUATED")
-        revisions = [
-            r[0]
-            for r in led._conn.execute(
-                "SELECT revision FROM cl_evaluations ORDER BY revision"
-            )
-        ]
-        assert revisions == list(range(1, len(revisions) + 1))
+        if not isinstance(t, OnCloud):
+            revisions = [
+                r[0]
+                for r in led._conn.execute(
+                    "SELECT revision FROM cl_evaluations ORDER BY revision"
+                )
+            ]
+            assert revisions == list(range(1, len(revisions) + 1))
         assert led.verify_history()

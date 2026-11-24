@@ -17,9 +17,11 @@ def _auth() -> JWTAuth:
     import json
     import time
 
-    payload = base64.urlsafe_b64encode(
-        json.dumps({"exp": time.time() + 3600}).encode()
-    ).decode().rstrip("=")
+    payload = (
+        base64.urlsafe_b64encode(json.dumps({"exp": time.time() + 3600}).encode())
+        .decode()
+        .rstrip("=")
+    )
     token = f"x.{payload}.y"
     return JWTAuth(token=token)
 
@@ -704,9 +706,7 @@ class TestCloudBatchMethods:
         assert rec is not None
         assert rec.id == mid
         assert rec.idempotency_key == "pay-123"
-        assert mock_get.call_args.args[0].endswith(
-            "/signatures/by-idempotency-key"
-        )
+        assert mock_get.call_args.args[0].endswith("/signatures/by-idempotency-key")
         assert mock_get.call_args.kwargs["params"]["key"] == "pay-123"
 
     @patch("httpx.get")

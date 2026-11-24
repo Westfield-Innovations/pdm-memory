@@ -251,6 +251,10 @@ class _SqlJobStore(JobStore):
     @contextmanager
     def _transaction(self) -> Iterator[None]:
         with self._lock:
+            if self._conn.in_transaction:
+                # Joined: the outer transaction's owner commits or rolls back.
+                yield
+                return
             self._conn.begin()
             try:
                 yield
