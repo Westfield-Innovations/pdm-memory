@@ -8,6 +8,7 @@ import time
 import typing
 from typing import Any
 
+from pdm_memory._ledger.errors import ConfigurationError
 from pdm_memory.cloud_ledgers._chain import verify_served_chain
 from pdm_memory.cloud_ledgers.client import CloudLedgers
 from pdm_memory.cloud_ledgers.wire import decode, encode
@@ -210,7 +211,7 @@ class CloudGuardedEffects(GuardedEffects):
         args = {"action_id": action_id, "result": result, "failure": failure}
         try:
             body = self._cloud.call("guard", "complete", self._open, args)
-        except CloudStorageError as exc:
+        except (CloudStorageError, ConfigurationError) as exc:
             raise DispatchUnrecorded(action_id, result, error) from exc
         return decode(ActionReceipt, body["result"])
 

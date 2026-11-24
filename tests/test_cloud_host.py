@@ -533,3 +533,125 @@ def test_an_unknown_operation_and_a_wrong_protocol_are_refused(host, target):
     assert status == 422 and body["error"]["type"] == "WireError"
     status, body = call(host, target, "jobs", "open", open={"owner": "x"})
     assert status == 422
+
+
+def replace_policy(host, target, policy="p2"):
+    changed = {**GUARD, "replace_config": True, "policy_version": policy}
+    ok(call(host, target, "guard", "open", open=changed))
+
+
+def test_a_completion_after_the_owner_changed_policy_is_recorded(host, target):
+    epoch = ok(call(host, target, "guard", "open"))["result"]
+    old = {**GUARD, "config_epoch": epoch}
+    ok(call(host, target, "guard", "start_branch", args={"branch_id": "b1"}, open=old))
+    stage(host, target)
+    reserve(host, target)
+    replace_policy(host, target)  # while the handler runs
+    host.evict()  # the completion lands on a worker that never saw the client
+    args = {"action_id": "act-valve-1", "result": {"n": 1}}
+    receipt = ok(call(host, target, "guard", "complete", args=args, open=old))
+    assert receipt["result"]["status"] == "RETURNED"
+
+
+def test_a_superseded_client_still_reads_after_the_cache_is_evicted(host, target):
+    epoch = ok(call(host, target, "guard", "open"))["result"]
+    old = {**GUARD, "config_epoch": epoch}
+    ok(call(host, target, "guard", "start_branch", args={"branch_id": "b1"}, open=old))
+    stage(host, target)
+    replace_policy(host, target)
+    host.evict()
+    reads = {
+        "receipt": {"action_id": "act-valve-1"},
+        "dispatch_count": {"operation": "open", "target": "valve-3"},
+        "history": {},
+        "history_raw": {},
+    }
+    for op, args in reads.items():
+        ok(call(host, target, "guard", op, args=args, open=old))
+    status, body = call(
+        host, target, "guard", "cancel", args={"action_id": "act-valve-1"}, open=old
+    )
+    assert status == 409 and "superseded" in body["detail"]
+
+
+def test_a_retried_write_replays_after_the_owner_changed_policy(host, target):
+    ready(host, target)
+    stage(host, target)
+    args = {"action_id": "act-valve-1"}
+    first = call(host, target, "guard", "cancel", args=args, key="k-cancel-01")
+    replace_policy(host, target)
+    host.evict()
+    assert call(host, target, "guard", "cancel", args=args, key="k-cancel-01") == first
+
+
+@pytest.mark.parametrize("op", ["history", "history_raw"])
+def test_a_sequence_past_the_database_integer_is_refused(host, target, op):
+    ready(host, target)
+    status, body = call(host, target, "guard", op, args={"after_sequence": 10**30})
+    # Postgres compares it as a numeric and finds nothing; SQLite cannot bind it.
+    assert (status, body.get("result")) == (200, []) if ON_POSTGRES else status == 422
+
+
+def test_a_locked_database_answers_ledgers_unavailable(host, target, monkeypatch):
+    import sqlite3
+
+    def locked(self) -> list[str]:
+        raise sqlite3.OperationalError("database is locked")
+
+    ok(call(host, target, "jobs", "open"))
+    monkeypatch.setattr(_SqlJobStore, "active", locked)
+    status, body = call(host, target, "jobs", "active")
+    assert status == 503 and body["error_code"] == "LEDGERS_UNAVAILABLE"
+
+
+def test_the_same_key_on_another_operation_is_refused(host, target):
+    ready(host, target)
+    stage(host, target)
+    args = {"action_id": "act-valve-1"}
+    ok(call(host, target, "guard", "cancel", args=args, key="k-12345678"))
+    status, body = call(host, target, "guard", "release", args=args, key="k-12345678")
+    assert status == 422 and body["error_code"] == "IDEMPOTENCY_KEY_REUSED"
+
+
+def test_concurrent_retries_of_a_replacement_replace_once(host, target, monkeypatch):
+    import threading
+
+    ready(host, target)
+    both = threading.Barrier(2)
+    looked_up = LedgerHost._stored
+
+    def stored(self, *a):
+        found = looked_up(self, *a)
+        try:
+            both.wait(timeout=0.5)  # both retries past the lookup before either writes
+        except threading.BrokenBarrierError:
+            pass
+        return found
+
+    monkeypatch.setattr(LedgerHost, "_stored", stored)
+    replaced = {**GUARD, "replace_config": True}
+    out = []
+
+    def retry():
+        out.append(call(host, target, "guard", "open", open=replaced, key="k-rep-01"))
+
+    threads = [threading.Thread(target=retry) for _ in "ab"]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert out[0] == out[1] and out[0][0] == 200
+    assert kinds(target).count("CONFIGURATION_ACTIVATED") == 2
+
+
+def test_a_stale_epoch_leaves_the_cached_ledger_alone(host, target):
+    first = ok(call(host, target, "guard", "open"))["result"]
+    ok(call(host, target, "guard", "open", open={**GUARD, "replace_config": True}))
+    ok(call(host, target, "guard", "start_branch", args={"branch_id": "b1"}))
+    cached = list(host._cache.values())
+    old = {**GUARD, "config_epoch": first}
+    status, _ = call(
+        host, target, "guard", "start_branch", args={"branch_id": "b2"}, open=old
+    )
+    assert status == 409 and list(host._cache.values()) == cached
+

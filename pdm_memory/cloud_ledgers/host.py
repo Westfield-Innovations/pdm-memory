@@ -14,6 +14,8 @@ import hashlib
 import inspect
 import json
 import re
+import sqlite3
+import sys
 import threading
 import time
 import typing
@@ -38,6 +40,7 @@ from pdm_memory.consequence.ledger import ConsequenceLedger
 from pdm_memory.goal_loop._json import utc_now
 from pdm_memory.goal_loop.store import _SqlJobStore
 from pdm_memory.guarded_effects import (
+    _GE_MIGRATIONS,
     _TERMINAL,
     CONDITION,
     VALIDATOR,
@@ -45,8 +48,10 @@ from pdm_memory.guarded_effects import (
     EffectRequest,
     GuardedEffects,
     Opening,
+    _check_openings,
     _json,
     _name,
+    _openings_hash,
 )
 
 __all__ = ["OPERATIONS", "LedgerHost"]
@@ -78,6 +83,7 @@ _EVENTS = {
     "consequence": ("cl_events", "expectation_id"),
 }
 _BODY = {"protocol", "open", "args", "now"}
+_LOCK_KEYS = {"guard": "pdm:ge", "consequence": "pdm:cl", "jobs": "pdm:gl"}
 # Guard ops that local code fences with _assert_current_config.
 _FENCED = {
     "start_branch",
@@ -116,6 +122,24 @@ class _NeedVerdict(Exception):
 
 class _KeyReused(Exception):
     pass
+
+
+class _StaleEpoch(Exception):
+    """The client's epoch is old; the cached ledger itself is fine."""
+
+
+def _superseded() -> ConfigurationError:
+    return ConfigurationError(
+        "controller configuration has been superseded by the owner"
+    )
+
+
+def _unavailable(exc: Exception) -> bool:
+    """A lock wait that ran out or a dropped connection: worth a retry, not a bug."""
+    if isinstance(exc, sqlite3.OperationalError):
+        return str(exc).startswith(("database is locked", "database is busy"))
+    psycopg = sys.modules.get("psycopg")
+    return psycopg is not None and isinstance(exc, psycopg.OperationalError)
 
 
 def _refuse(request: EffectRequest) -> Any:
@@ -200,6 +224,49 @@ def _lookup(db: Database, kind: str, key: str, body_hash: str) -> dict[str, Any]
     return json.loads(row[1])
 
 
+def _attach(
+    target: str | Path,
+    openings: list[Opening],
+    kwargs: dict[str, Any],
+    epoch: int,
+) -> GuardedEffects:
+    """Join a superseded client's ledger without the constructor's configuration check.
+
+    The constructor already validated *kwargs* before refusing. A fenced op on this
+    instance still fails ``_assert_current_config``: its labels or epoch are not current.
+    """
+    ledger = object.__new__(GuardedEffects)
+    ledger.owner = kwargs["owner"]
+    ledger.program_version = kwargs["program_version"]
+    ledger.policy_version = kwargs["policy_version"]
+    for name in (
+        "max_request_bytes",
+        "max_pending",
+        "max_state_bytes",
+        "max_result_bytes",
+    ):
+        setattr(ledger, name, kwargs.get(name, _DEFAULTS[name]))
+    ledger._openings = _check_openings(openings)
+    ledger._openings_hash = _openings_hash(ledger._openings)
+    ledger._lock = threading.RLock()
+    ledger._in_flight = set()
+    ledger._config_epoch = epoch
+    ledger._conn = Database(target, lock_key="pdm:ge")
+    try:
+        ledger._conn.migrate("ge", _GE_MIGRATIONS)  # a newer schema is still refused
+    except BaseException:
+        ledger._conn.close()
+        raise
+    return ledger
+
+
+_DEFAULTS = {
+    n: p.default
+    for n, p in inspect.signature(GuardedEffects.__init__).parameters.items()
+    if n.startswith("max_")
+}
+
+
 class LedgerHost:
     """Serve ledger calls on targets (SQLite files or Postgres URLs) for remote clients.
 
@@ -224,6 +291,7 @@ class LedgerHost:
         self._max_open, self._idle_s = max_open, idle_s
         self._trust, self._clock = trust_client_clock, clock
         self._lock = threading.Lock()
+        self._replacing = threading.Lock()
         self._cache: OrderedDict[tuple[str, str, str], _Entry] = OrderedDict()
         self._writes = 0
 
@@ -264,7 +332,12 @@ class LedgerHost:
                 "this Idempotency-Key was used for another request",
             )
         except Exception as exc:
-            response = error_response(exc)
+            if _unavailable(exc):
+                return _refusal(503, "LEDGERS_UNAVAILABLE", "ledger database busy")
+            # An integer past what the database stores is bad input, not a bug.
+            response = error_response(
+                WireError(str(exc)) if isinstance(exc, OverflowError) else exc
+            )
             if response is None:
                 raise
             return response
@@ -284,7 +357,7 @@ class LedgerHost:
         args = decode(dict[str, Any], body.get("args", {}))
         now = decode(datetime | None, body.get("now"))
         body_hash = _sha(
-            _canonical({"open": open_, "args": args, "now": body.get("now")})
+            _canonical({"op": op, "open": open_, "args": args, "now": body.get("now")})
         )
         custom = kind == "consequence" and decode(
             bool, open_.get("custom_clock", False)
@@ -301,38 +374,65 @@ class LedgerHost:
                 kind == "guard" and op == "open" and open_.get("replace_config") is True
             )
             if replace and key is not None:
-                stored = self._stored(target, kind, key, body_hash)
-                if stored is not None:
-                    return 200, stored
-            retry_stale = True
-            while True:
-                try:
-                    cache_key, entry, built = self._entry(target, kind, open_, replace)
-                except ConfigurationError as exc:
-                    # A client holding an epoch was built under a configuration
-                    # that is no longer current: superseded, as locally.
-                    if "config_epoch" not in open_:
-                        raise
-                    raise ConfigurationError(
-                        "controller configuration has been superseded by the owner"
-                    ) from exc
-                replace = False
-                with entry.ledger._lock:
-                    if entry.closed:
-                        continue  # evicted between lookup and use
-                    try:
-                        return self._run(
-                            entry.ledger, kind, op, args, key, body_hash, open_
-                        )
-                    except ConfigurationError:
-                        self._drop(cache_key, entry)
-                        # A cached instance may predate another worker's replacement;
-                        # a fresh build still refuses a configuration that differs.
-                        if built or not retry_stale:
-                            raise
-                        retry_stale = False
+                # One at a time, so a retry racing its original finds its reply.
+                with self._replacing:
+                    stored = self._stored(target, kind, key, body_hash)
+                    if stored is not None:
+                        return 200, stored
+                    return self._serve(
+                        target, kind, op, open_, args, key, body_hash, True
+                    )
+            return self._serve(target, kind, op, open_, args, key, body_hash, False)
         finally:
             _NOW.reset(token)
+
+    def _serve(
+        self,
+        target: str | Path,
+        kind: str,
+        op: str,
+        open_: dict[str, Any],
+        args: dict[str, Any],
+        key: str | None,
+        body_hash: str,
+        replace: bool,
+    ) -> tuple[int, dict[str, Any]]:
+        # Complete and the reads work for a superseded client, as locally.
+        attach = kind == "guard" and op not in _FENCED and op != "open"
+        retry_stale = True
+        while True:
+            try:
+                cache_key, entry, built = self._entry(
+                    target, kind, open_, replace, attach
+                )
+            except ConfigurationError:
+                # A write that landed before the configuration changed still replays.
+                if key is not None and not replace:
+                    stored = self._stored(target, kind, key, body_hash)
+                    if stored is not None:
+                        return 200, stored
+                # A client holding an epoch was built under a configuration
+                # that is no longer current: superseded, as locally.
+                if "config_epoch" not in open_:
+                    raise
+                raise _superseded() from None
+            replace = False
+            with entry.ledger._lock:
+                if entry.closed:
+                    continue  # evicted between lookup and use
+                try:
+                    return self._run(
+                        entry.ledger, kind, op, args, key, body_hash, open_
+                    )
+                except _StaleEpoch:
+                    raise _superseded() from None
+                except ConfigurationError:
+                    self._drop(cache_key, entry)
+                    # A cached instance may predate another worker's replacement;
+                    # a fresh build still refuses a configuration that differs.
+                    if built or not retry_stale:
+                        raise
+                    retry_stale = False
 
     def _run(
         self,
@@ -377,16 +477,14 @@ class LedgerHost:
             "SELECT epoch FROM ge_config WHERE owner=?", (ledger.owner,)
         ).fetchone()
         if row is None or row[0] != epoch:
-            raise ConfigurationError(
-                "controller configuration has been superseded by the owner"
-            )
+            raise _StaleEpoch
 
     def _stored(
         self, target: str | Path, kind: str, key: str, body_hash: str
     ) -> dict[str, Any] | None:
-        # A replacing open writes in the guard's constructor, before any instance
-        # exists to join, so its replay is looked up on a connection of its own.
-        db = Database(target, lock_key="pdm:ge")
+        # A replacing open writes in the guard's constructor, and a build can
+        # refuse, before any instance exists to join: look up on a connection of its own.
+        db = Database(target, lock_key=_LOCK_KEYS[kind])
         try:
             db.migrate("rq", _RQ_MIGRATIONS)
             return _lookup(db, kind, key, body_hash)
@@ -483,7 +581,12 @@ class LedgerHost:
         return [list(r) for r in rows]
 
     def _build(
-        self, target: str | Path, kind: str, open_: dict[str, Any], replace: bool
+        self,
+        target: str | Path,
+        kind: str,
+        open_: dict[str, Any],
+        replace: bool,
+        attach: bool,
     ) -> Any:
         if kind == "guard":
             rest = {
@@ -503,7 +606,13 @@ class LedgerHost:
                 )
                 for s in specs
             ]
-            ledger: Any = GuardedEffects(target, openings=openings, **kwargs)
+            try:
+                ledger: Any = GuardedEffects(target, openings=openings, **kwargs)
+            except ConfigurationError:
+                if not attach:
+                    raise
+                epoch = decode(int, open_.get("config_epoch", 0))
+                ledger = _attach(target, openings, kwargs, epoch)
         elif kind == "consequence":
             rest = {k: v for k, v in open_.items() if k != "custom_clock"}
             kwargs = _bind(ConsequenceLedger.__init__, rest, skip=("path", "clock"))
@@ -519,7 +628,12 @@ class LedgerHost:
         return ledger
 
     def _entry(
-        self, target: str | Path, kind: str, open_: dict[str, Any], replace: bool
+        self,
+        target: str | Path,
+        kind: str,
+        open_: dict[str, Any],
+        replace: bool,
+        attach: bool,
     ) -> tuple[tuple[str, str, str], _Entry, bool]:
         same = {k: v for k, v in open_.items() if k not in _PER_CALL}
         cache_key = (str(target), kind, _sha(_canonical(same)))
@@ -534,7 +648,7 @@ class LedgerHost:
         self._close(dropped)
         if entry is not None:
             return cache_key, entry, False
-        built = _Entry(self._build(target, kind, open_, replace), now)
+        built = _Entry(self._build(target, kind, open_, replace, attach), now)
         with self._lock:
             entry = self._cache.pop(cache_key, None)
             if entry is not None and not replace:

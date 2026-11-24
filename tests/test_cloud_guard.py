@@ -286,3 +286,47 @@ def test_a_cloud_receipt_matches_the_local_one(tmp_path):
     )
     assert a.disposition is CheckResult.SATISFIED
     local.close()
+
+
+def test_a_completion_after_the_owner_changed_policy_is_recorded(tmp_path):
+    from pdm_memory.cloud_ledgers.testing import _hosts
+
+    path = tmp_path / "g.db"
+
+    def replaced_meanwhile(r):
+        GuardedEffects(
+            in_process(path),
+            owner="o",
+            program_version="w-1",
+            policy_version="p-2",
+            openings=[Opening("open", "valve-3", lambda r: 1, lambda r: True)],
+            replace_config=True,
+        )
+        for h in _hosts.values():
+            h.evict()  # the completion lands on a worker that never saw this client
+        return {"ok": 1}
+
+    owner = Owner(check=True)
+    owner.handler = replaced_meanwhile
+    g = guard(in_process(path), owner)
+    g.stage(request())
+    assert g.release("A").status == "RETURNED"
+    assert g.receipt("A").status == "RETURNED"
+
+
+def test_a_refused_completion_raises_dispatch_unrecorded(tmp_path):
+    def refuse(op, body, forward):
+        if op == "complete":
+            return 409, {
+                "error_code": "LEDGER_ERROR",
+                "detail": "superseded",
+                "error": {"type": "ConfigurationError", "message": "superseded"},
+            }
+        return forward()
+
+    g = guard(wrap(in_process(tmp_path / "g.db"), refuse))
+    g.stage(request())
+    with pytest.raises(DispatchUnrecorded) as caught:
+        g.release("A")
+    assert caught.value.result == {"opened": True}
+
