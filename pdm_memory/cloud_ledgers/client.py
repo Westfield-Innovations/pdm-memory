@@ -67,6 +67,9 @@ class HttpTransport:
             parsed = {}
         return resp.status_code, parsed if isinstance(parsed, dict) else {}
 
+    def close(self) -> None:
+        self._client.close()
+
     def _post(self, url: str, body: dict[str, Any], extra: dict[str, str]):
         return self._client.post(
             url, json=body, headers={**self._auth.headers(), **extra}
@@ -88,6 +91,7 @@ class CloudLedgers:
     ) -> None:
         if not _NAMESPACE.match(namespace):
             raise ValueError("namespace must match [A-Za-z0-9._-]{1,64}")
+        self._owns_transport = transport is None
         if transport is None:
             if auth is None:
                 raise ValueError("CloudLedgers needs an auth or a transport")
@@ -95,6 +99,11 @@ class CloudLedgers:
         self.namespace = namespace
         self.retry_deadline_s = retry_deadline_s
         self._transport = transport
+
+    def close(self) -> None:
+        """Close the transport this object built; a supplied one is the caller's."""
+        if self._owns_transport:
+            self._transport.close()  # type: ignore[attr-defined]
 
     @classmethod
     def from_driver(

@@ -10,6 +10,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from pdm_memory.cloud_ledgers import CloudJobStore
+from pdm_memory.cloud_ledgers.testing import in_process
 from pdm_memory.goal_loop import (
     InMemoryJobStore,
     JobState,
@@ -30,14 +32,18 @@ T0 = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
 
 
 @pytest.fixture(
-    params=["memory", "sqlite", pytest.param("postgres", marks=needs_pg)]
+    params=["memory", "sqlite", "cloud", pytest.param("postgres", marks=needs_pg)]
 )
 def factory(request, tmp_path):
     counter = itertools.count()
     if request.param == "memory":
         return InMemoryJobStore
     if request.param == "postgres":
-        return lambda: PostgresJobStore(postgres_target(f"{tmp_path}/jobs{next(counter)}"))
+        return lambda: PostgresJobStore(
+            postgres_target(f"{tmp_path}/jobs{next(counter)}")
+        )
+    if request.param == "cloud":
+        return lambda: CloudJobStore(in_process(tmp_path / f"jobs{next(counter)}.db"))
     return lambda: SqliteJobStore(tmp_path / f"jobs{next(counter)}.db")
 
 
@@ -79,14 +85,23 @@ def test_sqlite_due_compares_moments_not_text(tmp_path):
     east = timezone(timedelta(hours=14))
     west = timezone(timedelta(hours=-12))
     _start(
-        store, "east", state=JobState.WAITING, next_due_at=datetime(2026, 8, 18, 9, 0, tzinfo=east)
+        store,
+        "east",
+        state=JobState.WAITING,
+        next_due_at=datetime(2026, 8, 18, 9, 0, tzinfo=east),
     )
     _start(
-        store, "west", state=JobState.WAITING, next_due_at=datetime(2026, 8, 17, 21, 0, tzinfo=west)
+        store,
+        "west",
+        state=JobState.WAITING,
+        next_due_at=datetime(2026, 8, 17, 21, 0, tzinfo=west),
     )
     # 09:00+14:00 on the 18th is 19:00 UTC on the 17th; 21:00-12:00 is 09:00 UTC on the 18th.
     assert store.due(datetime(2026, 8, 17, 19, 0, tzinfo=timezone.utc)) == ["east"]
-    assert store.due(datetime(2026, 8, 18, 9, 0, tzinfo=timezone.utc)) == ["east", "west"]
+    assert store.due(datetime(2026, 8, 18, 9, 0, tzinfo=timezone.utc)) == [
+        "east",
+        "west",
+    ]
 
 
 def test_due_refuses_a_naive_time(factory):
@@ -110,7 +125,8 @@ def test_only_one_of_two_racing_commits_wins(factory):
             outcomes.append("stale")
 
     threads = [
-        threading.Thread(target=attempt, args=(s,)) for s in (JobState.APPROVED, JobState.CANCELLED)
+        threading.Thread(target=attempt, args=(s,))
+        for s in (JobState.APPROVED, JobState.CANCELLED)
     ]
     [t.start() for t in threads]
     [t.join() for t in threads]
@@ -124,7 +140,9 @@ def test_a_failed_commit_leaves_the_database_untouched(tmp_path):
     job, first = _start(store)
     moved, receipt = _next(job, first, JobState.APPROVED)
     with pytest.raises(ValueError):
-        store.commit(replace(moved, receipt_seq=9), [receipt], expected_revision=job.revision)
+        store.commit(
+            replace(moved, receipt_seq=9), [receipt], expected_revision=job.revision
+        )
     with sqlite3.connect(path) as db:
         assert db.execute("SELECT COUNT(*) FROM gl_receipts").fetchone()[0] == 1
         assert db.execute("SELECT revision FROM gl_jobs").fetchone()[0] == job.revision
