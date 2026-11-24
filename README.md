@@ -760,7 +760,7 @@ the SQL ledger and its history.
 ```python
 from pdm_memory import CloudLedgers, ConsequenceLedger
 from pdm_memory.auth import JWTAuth
-from pdm_memory.cloud_ledgers import CloudJobStore
+from pdm_memory.cloud_ledgers import CloudJobStore, DispatchUnrecorded
 from pdm_memory.guarded_effects import GuardedEffects
 
 cloud = CloudLedgers(JWTAuth(token="eyJ...", refresh_token="eyJ...", refresh_url="..."))
@@ -771,6 +771,11 @@ guard = GuardedEffects(cloud, owner="owner-1", program_version="v1",
                        policy_version="p1", openings=[...])
 ledger = ConsequenceLedger(cloud, owner="owner-1", policy=policy)
 jobs = CloudJobStore(cloud)  # beside SqliteJobStore and PostgresJobStore
+
+try:
+    guard.release("act-1")
+except DispatchUnrecorded as lost:  # the handler ran; record what you know
+    guard.reconcile(lost.action_id, executed=True, evidence={"result": lost.result})
 ```
 
 Validation, checks and handlers still run in your process; only the ledger is
@@ -788,8 +793,9 @@ records an event twice.
 - **Namespaces.** `namespace=` (`[A-Za-z0-9._-]{1,64}`, default `"default"`)
   separates ledgers on one host, the way separate files do locally.
 - **`verify_history()`** fetches the served history, re-checks the hash chain
-  and that it extends the chain verified last time, so a host that rewrites the
-  past is caught.
+  and that it extends the chain verified last time, so a change at or before the
+  last event this process verified is caught. A host that re-hashes everything
+  after that point is not.
 
 ### Goal Loop preview: the Goal Contract
 
