@@ -8,8 +8,7 @@ import time
 import typing
 from typing import Any
 
-from pdm_memory._ledger.chain import verify_rows
-from pdm_memory._ledger.errors import LedgerIntegrityError
+from pdm_memory.cloud_ledgers._chain import verify_served_chain
 from pdm_memory.cloud_ledgers.client import CloudLedgers
 from pdm_memory.cloud_ledgers.wire import decode, encode
 from pdm_memory.guarded_effects import (
@@ -28,8 +27,6 @@ from pdm_memory.guarded_effects import (
 from pdm_memory.storage.errors import CloudConflictError, CloudStorageError
 
 __all__ = ["CloudGuardedEffects", "DispatchUnrecorded"]
-
-_PAGE = 1000
 
 
 class DispatchUnrecorded(CloudStorageError):
@@ -256,28 +253,9 @@ class CloudGuardedEffects(GuardedEffects):
     def verify_history(self) -> bool:
         """Check the served chain; it must also extend the one verified last time."""
         with self._lock:
-            previous, after, seen = "", 0, None
-            mark = self._verified
-            while True:
-                body = self._cloud.call(
-                    "guard",
-                    "history_raw",
-                    self._open,
-                    {"after_sequence": after, "limit": _PAGE},
-                )
-                rows = decode(list[list[Any]], body["result"])
-                previous = verify_rows(rows, self.owner, "guard", previous=previous)
-                for row in rows:
-                    if mark is not None and row[0] == mark[0]:
-                        seen = row[6]
-                if rows:
-                    after = rows[-1][0]
-                if len(rows) < _PAGE:
-                    break
-            if mark is not None and seen != mark[1]:
-                raise LedgerIntegrityError(
-                    "retained guard history is shorter than, or differs from, the chain verified before"
-                )
-            if after:
-                self._verified = (after, previous)
+            anchor = verify_served_chain(
+                self._cloud, "guard", self._open, self.owner, self._verified
+            )
+            if anchor:
+                self._verified = anchor
             return True

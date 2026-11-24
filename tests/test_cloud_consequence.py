@@ -124,3 +124,16 @@ def test_prepared_check_works_as_a_cloud_guard_check(tmp_path):
     guard.stage(_request())
     led.prepare(VALVE)
     assert guard.release("act-valve-1").status == "RETURNED"
+
+
+def test_a_client_time_for_suggest_observation_is_refused_by_a_server_that_keeps_its_own(
+    tmp_path,
+):
+    led = ConsequenceLedger(
+        in_process(tmp_path / "c.db", trust_client_clock=False),
+        owner="owner-1",
+        policy=POLICY,
+    )
+    led.prepare(VALVE)
+    with pytest.raises(ConfigurationError):
+        led.suggest_observation("exp-valve-1", now=COMMIT)

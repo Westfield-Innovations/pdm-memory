@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import threading
 import typing
 from datetime import datetime
 from typing import Any
 
-from pdm_memory._ledger.chain import verify_rows
-from pdm_memory._ledger.errors import LedgerIntegrityError
+from pdm_memory.cloud_ledgers._chain import verify_served_chain
 from pdm_memory.cloud_ledgers.client import CloudLedgers
 from pdm_memory.cloud_ledgers.wire import decode, encode
 from pdm_memory.consequence.ledger import ConsequenceLedger
@@ -40,8 +40,6 @@ from pdm_memory.guarded_effects import (
 
 __all__ = ["CloudConsequenceLedger"]
 
-_PAGE = 1000
-
 
 class CloudConsequenceLedger(ConsequenceLedger):
     """The host keeps the ledger; a custom ``clock`` is sent as ``now`` and the host must trust it."""
@@ -61,6 +59,7 @@ class CloudConsequenceLedger(ConsequenceLedger):
         self._clock = clock
         self._custom_clock = clock is not utc_now
         self._cloud = cloud
+        self._lock = threading.RLock()
         self._verified: tuple[int, str] | None = None
         self._open: dict[str, Any] = {
             "owner": self.owner,
@@ -229,29 +228,15 @@ class CloudConsequenceLedger(ConsequenceLedger):
 
     def verify_history(self) -> bool:
         """Check the served chain; it must also extend the one verified last time."""
-        previous, after, seen = "", 0, None
-        mark = self._verified
-        while True:
-            body = self._cloud.call(
+        with self._lock:
+            anchor = verify_served_chain(
+                self._cloud,
                 "consequence",
-                "history_raw",
                 self._open,
-                {"after_sequence": after, "limit": _PAGE},
+                self.owner,
+                self._verified,
                 now=self._stamp(),
             )
-            rows = decode(list[list[Any]], body["result"])
-            previous = verify_rows(rows, self.owner, "consequence", previous=previous)
-            for row in rows:
-                if mark is not None and row[0] == mark[0]:
-                    seen = row[6]
-            if rows:
-                after = rows[-1][0]
-            if len(rows) < _PAGE:
-                break
-        if mark is not None and seen != mark[1]:
-            raise LedgerIntegrityError(
-                "retained consequence history is shorter than, or differs from, the chain verified before"
-            )
-        if after:
-            self._verified = (after, previous)
-        return True
+            if anchor:
+                self._verified = anchor
+            return True
