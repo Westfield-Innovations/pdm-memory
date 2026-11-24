@@ -137,9 +137,7 @@ class TestAddFieldMembership:
         assert exc.value.status_code == 409
 
     @patch("httpx.post")
-    def test_the_servers_reason_is_in_the_message_and_on_the_exception(
-        self, mock_post
-    ):
+    def test_the_servers_reason_is_in_the_message_and_on_the_exception(self, mock_post):
         mock_post.return_value = _resp(
             409, {"error_code": "MEMBERSHIP_REFUSED", "detail": "already live"}
         )

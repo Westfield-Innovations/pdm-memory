@@ -24,7 +24,9 @@ NOW = datetime(2026, 11, 10, 12, tzinfo=timezone.utc)
 
 def _driver() -> CloudDriver:
     claims = base64.urlsafe_b64encode(json.dumps({"exp": time.time() + 3600}).encode())
-    return CloudDriver(auth=JWTAuth(token=f"x.{claims.decode().rstrip('=')}.y"), base_url=BASE)
+    return CloudDriver(
+        auth=JWTAuth(token=f"x.{claims.decode().rstrip('=')}.y"), base_url=BASE
+    )
 
 
 def _row(sig_id: str, **extra) -> dict:
@@ -52,7 +54,9 @@ def mem():
 
 
 def test_cloud_touch_posts_the_ids(mem, router):
-    route = router.post(f"{API}/touch").mock(return_value=httpx.Response(200, json={"touched": 2}))
+    route = router.post(f"{API}/touch").mock(
+        return_value=httpx.Response(200, json={"touched": 2})
+    )
     patch = router.patch(url__startswith=f"{API}/signatures/")
     assert mem.touch(["a", "b", "a", ""]) == 2
     assert json.loads(route.calls.last.request.content) == {"ids": ["a", "b"]}
@@ -63,8 +67,15 @@ def test_cloud_save_sends_the_claim_and_support(mem, router):
     router.post(f"{API}/signatures/batch-get").mock(
         return_value=httpx.Response(200, json={"signatures": [_row("s1")]})
     )
-    ingest = router.post(f"{API}/ingest").mock(return_value=httpx.Response(201, json={"id": "c1"}))
-    claim = Claim("absent", NOW + timedelta(days=4), outcome_source="pressure-feed", watch_window_days=1.5)
+    ingest = router.post(f"{API}/ingest").mock(
+        return_value=httpx.Response(201, json={"id": "c1"})
+    )
+    claim = Claim(
+        "absent",
+        NOW + timedelta(days=4),
+        outcome_source="pressure-feed",
+        watch_window_days=1.5,
+    )
     mid = mem.save(
         "Tank 3 will not overpressure",
         tags=["tank", "pressure", "safety"],
@@ -74,7 +85,12 @@ def test_cloud_save_sends_the_claim_and_support(mem, router):
     )
     assert mid == "c1"
     body = json.loads(ingest.calls.last.request.content)
-    assert (body["direction"], body["due"], body["outcome_source"], body["watch_window_days"]) == (
+    assert (
+        body["direction"],
+        body["due"],
+        body["outcome_source"],
+        body["watch_window_days"],
+    ) == (
         "absent",
         (NOW + timedelta(days=4)).isoformat(),
         "pressure-feed",
@@ -84,10 +100,18 @@ def test_cloud_save_sends_the_claim_and_support(mem, router):
 
 
 def test_a_plain_cloud_save_sends_no_claim(mem, router):
-    ingest = router.post(f"{API}/ingest").mock(return_value=httpx.Response(201, json={"id": "p1"}))
+    ingest = router.post(f"{API}/ingest").mock(
+        return_value=httpx.Response(201, json={"id": "p1"})
+    )
     mem.save("Plain fact", tags=["a", "b", "c"], dedupe=False)
     body = json.loads(ingest.calls.last.request.content)
-    assert not {"direction", "due", "outcome_source", "watch_window_days", "rests_on"} & set(body)
+    assert not {
+        "direction",
+        "due",
+        "outcome_source",
+        "watch_window_days",
+        "rests_on",
+    } & set(body)
 
 
 def test_cloud_gap_and_silent_count(mem, router):
@@ -124,7 +148,8 @@ def test_cloud_observation_posts_to_the_claim(mem, router):
 def test_cloud_observation_that_changes_nothing_is_none(mem, router):
     router.post(f"{API}/claims/c1/observe").mock(
         return_value=httpx.Response(
-            200, json={"id": "c1", "verdict": "on_time", "changed": False, "reopened": 0}
+            200,
+            json={"id": "c1", "verdict": "on_time", "changed": False, "reopened": 0},
         )
     )
     assert mem.validate_claim("c1", "occurred") is None
@@ -148,7 +173,13 @@ def test_a_cloud_row_reads_its_status_and_claim_back():
     back = CloudDriver._payload_to_record(
         {**CloudDriver._record_to_payload(rec), "validation_status": "VALIDATED"}
     )
-    assert (back.validation_status, back.direction, back.due, back.outcome_source, back.watch_window) == (
+    assert (
+        back.validation_status,
+        back.direction,
+        back.due,
+        back.outcome_source,
+        back.watch_window,
+    ) == (
         "VALIDATED",
         "absent",
         NOW,
@@ -156,7 +187,11 @@ def test_a_cloud_row_reads_its_status_and_claim_back():
         2.0,
     )
     plain = CloudDriver._payload_to_record(_row("p1"))
-    assert (plain.validation_status, plain.direction, plain.due) == ("UNVALIDATED", "", None)
+    assert (plain.validation_status, plain.direction, plain.due) == (
+        "UNVALIDATED",
+        "",
+        None,
+    )
 
 
 def test_cloud_retrieve_writes_nothing_and_is_unvalidated_for_action(mem, router):
@@ -172,7 +207,11 @@ def test_cloud_retrieve_writes_nothing_and_is_unvalidated_for_action(mem, router
     ]
     result = mem.retrieve("north flare", as_of=NOW + timedelta(hours=1))
     (hit,) = result.hits
-    assert (hit.validation_status, hit.context, hit.support_in_doubt) == ("VALIDATED", None, None)
+    assert (hit.validation_status, hit.context, hit.support_in_doubt) == (
+        "VALIDATED",
+        None,
+        None,
+    )
     assert hit.action_status == "UNVALIDATED"
     mem.recall("north flare")
     assert [w.call_count for w in writes] == [0, 0, 0]

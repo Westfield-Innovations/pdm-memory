@@ -750,6 +750,47 @@ tables that refuse `UPDATE`, `DELETE` and `TRUNCATE`, and a commit that is durab
 when it returns (a server running with `fsync=off` is refused). Tables go into
 the connection's current schema, so `?options=-csearch_path%3Dledgers` picks one.
 
+### Ledgers in the cloud
+
+The three ledgers can also live on the AZUS Cloud instead of in your process.
+`CloudLedgers` is a connection to one namespace; hand it where a path or DSN
+would go, and the ledger's calls travel over HTTPS to a ledger host that keeps
+the SQL ledger and its history.
+
+```python
+from pdm_memory import CloudLedgers, ConsequenceLedger
+from pdm_memory.auth import JWTAuth
+from pdm_memory.cloud_ledgers import CloudJobStore
+from pdm_memory.guarded_effects import GuardedEffects
+
+cloud = CloudLedgers(JWTAuth(token="eyJ...", refresh_token="eyJ...", refresh_url="..."))
+# Or reuse a cloud driver you already have: CloudLedgers.from_driver(driver).
+# Memory keeps its driver private, so build the driver (or the auth) yourself.
+
+guard = GuardedEffects(cloud, owner="owner-1", program_version="v1",
+                       policy_version="p1", openings=[...])
+ledger = ConsequenceLedger(cloud, owner="owner-1", policy=policy)
+jobs = CloudJobStore(cloud)  # beside SqliteJobStore and PostgresJobStore
+```
+
+Validation, checks and handlers still run in your process; only the ledger is
+remote. Retries of a write carry one idempotency key, so a lost reply never
+records an event twice.
+
+- **The server keeps the clock.** Event time on a cloud ledger is the host's.
+  A `clock=` on `ConsequenceLedger` is refused unless the host was started to
+  trust client clocks, which only test hosts do.
+- **`DispatchUnrecorded`.** If a handler ran but its completion could not be
+  recorded (the host stayed unreachable past the retry deadline), `release`
+  raises this with the handler's `result` and `error`. The action did happen,
+  but the ledger still shows it dispatched without an outcome: reconcile it
+  yourself rather than releasing it again.
+- **Namespaces.** `namespace=` (`[A-Za-z0-9._-]{1,64}`, default `"default"`)
+  separates ledgers on one host, the way separate files do locally.
+- **`verify_history()`** fetches the served history, re-checks the hash chain
+  and that it extends the chain verified last time, so a host that rewrites the
+  past is caught.
+
 ### Goal Loop preview: the Goal Contract
 
 A Goal Loop job is written down once, as one `GoalContract` record that every
