@@ -46,7 +46,7 @@ class CloudConsequenceLedger(ConsequenceLedger):
 
     def __init__(
         self,
-        cloud: CloudLedgers,
+        path: CloudLedgers,
         *,
         owner: str,
         policy: OwnerPolicy,
@@ -58,7 +58,7 @@ class CloudConsequenceLedger(ConsequenceLedger):
         self.policy = policy
         self._clock = clock
         self._custom_clock = clock is not utc_now
-        self._cloud = cloud
+        self._cloud = cloud = path
         self._lock = threading.RLock()
         self._verified: tuple[int, str] | None = None
         self._open: dict[str, Any] = {

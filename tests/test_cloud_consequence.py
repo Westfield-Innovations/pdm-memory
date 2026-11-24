@@ -137,3 +137,15 @@ def test_a_client_time_for_suggest_observation_is_refused_by_a_server_that_keeps
     led.prepare(VALVE)
     with pytest.raises(ConfigurationError):
         led.suggest_observation("exp-valve-1", now=COMMIT)
+
+
+def test_the_cloud_target_may_be_passed_by_name(tmp_path):
+    import copy
+
+    led = ConsequenceLedger(
+        path=in_process(tmp_path / "c.db"), owner="o", policy=POLICY
+    )
+    assert type(led) is CloudConsequenceLedger
+    local = ConsequenceLedger(tmp_path / "l.db", owner="o", policy=POLICY)
+    assert type(copy.copy(local)) is ConsequenceLedger
+    local.close()

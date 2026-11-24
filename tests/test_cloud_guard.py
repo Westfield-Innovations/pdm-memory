@@ -330,3 +330,24 @@ def test_a_refused_completion_raises_dispatch_unrecorded(tmp_path):
         g.release("A")
     assert caught.value.result == {"opened": True}
 
+
+def test_the_cloud_target_may_be_passed_by_name(tmp_path):
+    import copy
+
+    g = GuardedEffects(
+        path=in_process(tmp_path / "g.db"),
+        owner="o",
+        program_version="w-1",
+        policy_version="p-1",
+        openings=[],
+    )
+    assert type(g) is CloudGuardedEffects
+    local = GuardedEffects(
+        tmp_path / "l.db",
+        owner="o",
+        program_version="w",
+        policy_version="p",
+        openings=[],
+    )
+    assert type(copy.copy(local)) is GuardedEffects
+    local.close()

@@ -56,7 +56,7 @@ class CloudGuardedEffects(GuardedEffects):
 
     def __init__(
         self,
-        cloud: CloudLedgers,
+        path: CloudLedgers,
         *,
         owner: str,
         program_version: str,
@@ -87,7 +87,7 @@ class CloudGuardedEffects(GuardedEffects):
         self._lock = threading.RLock()
         self._in_flight: set[str] = set()
         self._verified: tuple[int, str] | None = None
-        self._cloud = cloud
+        self._cloud = cloud = path
         self._open: dict[str, Any] = {
             "owner": self.owner,
             "program_version": self.program_version,

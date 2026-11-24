@@ -91,19 +91,19 @@ class CloudLedgers:
     ) -> None:
         if not _NAMESPACE.match(namespace):
             raise ValueError("namespace must match [A-Za-z0-9._-]{1,64}")
-        self._owns_transport = transport is None
+        self._owned: HttpTransport | None = None
         if transport is None:
             if auth is None:
                 raise ValueError("CloudLedgers needs an auth or a transport")
-            transport = HttpTransport(auth, base_url, timeout=timeout)
+            transport = self._owned = HttpTransport(auth, base_url, timeout=timeout)
         self.namespace = namespace
         self.retry_deadline_s = retry_deadline_s
         self._transport = transport
 
     def close(self) -> None:
         """Close the transport this object built; a supplied one is the caller's."""
-        if self._owns_transport:
-            self._transport.close()  # type: ignore[attr-defined]
+        if self._owned is not None:
+            self._owned.close()
 
     @classmethod
     def from_driver(

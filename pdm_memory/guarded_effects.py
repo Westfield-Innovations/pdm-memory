@@ -303,7 +303,7 @@ class GuardedEffects:
     against an administrator replacing the database or deleting its tail.
     """
 
-    def __new__(cls, path: Any, *args: Any, **kwargs: Any) -> GuardedEffects:  # noqa: PYI034
+    def __new__(cls, path: Any = None, *args: Any, **kwargs: Any) -> GuardedEffects:  # noqa: PYI034
         # A CloudLedgers can only exist once its module is loaded; don't load it otherwise.
         client = sys.modules.get("pdm_memory.cloud_ledgers.client")
         if cls is GuardedEffects and client and isinstance(path, client.CloudLedgers):
@@ -314,7 +314,8 @@ class GuardedEffects:
 
     def __init__(
         self,
-        path: str | Path,
+        # Or a CloudLedgers, which __new__ routes; naming it would import the cloud package.
+        path: str | Path | Any,
         *,
         owner: str,
         program_version: str,
