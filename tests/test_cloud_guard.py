@@ -233,6 +233,26 @@ def test_an_unreachable_completion_raises_dispatch_unrecorded_with_the_result(
     assert other.release("A").status == "UNCERTAIN"
 
 
+def test_an_interrupt_outlives_an_unreachable_completion(tmp_path, monkeypatch):
+    from pdm_memory.cloud_ledgers import client
+
+    monkeypatch.setattr(client, "_sleep", lambda s: None)
+
+    def unreachable(op, body, forward):
+        if op == "complete":
+            raise httpx.ConnectError("host gone")
+        return forward()
+
+    cloud = wrap(in_process(tmp_path / "g.db"), unreachable)
+    g = guard(cloud, Owner(result=KeyboardInterrupt("stop")))
+    cloud.retry_deadline_s = 0.5
+    g.stage(request())
+    with pytest.raises(KeyboardInterrupt) as caught:
+        g.release("A")
+    assert isinstance(caught.value.__context__, DispatchUnrecorded)
+    assert g.receipt("A").status == "DISPATCHING"
+
+
 def test_verify_history_notices_a_shortened_chain(tmp_path):
     cut = []
 

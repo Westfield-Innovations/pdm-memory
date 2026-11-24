@@ -33,7 +33,11 @@ _PAGE = 1000
 
 
 class DispatchUnrecorded(CloudStorageError):
-    """A handler ran, but its completion never reached the host; reconcile it."""
+    """A handler ran, but its completion never reached the host; reconcile it.
+
+    A handler's KeyboardInterrupt or SystemExit is re-raised instead, with this
+    error as its ``__context__``.
+    """
 
     def __init__(
         self, action_id: str, result: Any, error: BaseException | None
@@ -185,12 +189,15 @@ class CloudGuardedEffects(GuardedEffects):
                     _json(handler(self._request(encoded)), self.max_result_bytes)
                 )
             except BaseException as exc:
-                receipt = self._finish(
-                    action_id, None, f"{type(exc).__name__}: {str(exc)[:512]}", exc
-                )
+                failure = f"{type(exc).__name__}: {str(exc)[:512]}"
                 if not isinstance(exc, Exception):
+                    try:
+                        self._finish(action_id, None, failure, exc)
+                    except DispatchUnrecorded:
+                        # An interrupt outranks the lost record; it stays its __context__.
+                        raise exc
                     raise
-                return receipt
+                return self._finish(action_id, None, failure, exc)
             return self._finish(action_id, result, None, None)
         finally:
             with self._lock:
