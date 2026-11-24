@@ -1,3 +1,5 @@
 """Cloud (HTTP) backends for the ledgers."""
 
-__all__: list[str] = []
+from pdm_memory.cloud_ledgers.client import CloudLedgers
+
+__all__ = ["CloudLedgers"]
