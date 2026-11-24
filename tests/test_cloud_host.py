@@ -256,6 +256,23 @@ def test_another_workers_same_config_replacement_does_not_refuse_a_client(target
     w2.close()
 
 
+def test_a_same_config_replacement_fences_a_client_holding_the_old_epoch(host, target):
+    first = ok(call(host, target, "guard", "open"))["result"]
+    old = {**GUARD, "config_epoch": first}
+    ok(call(host, target, "guard", "start_branch", args={"branch_id": "b1"}, open=old))
+    replaced = {**GUARD, "replace_config": True}
+    current = ok(call(host, target, "guard", "open", open=replaced))["result"]
+    assert current == first + 1
+    status, body = call(
+        host, target, "guard", "start_branch", args={"branch_id": "b1"}, open=old
+    )
+    assert status == 409 and body["error"]["type"] == "ConfigurationError"
+    assert "superseded" in body["detail"]
+    new = {**GUARD, "config_epoch": current}
+    ok(call(host, target, "guard", "start_branch", args={"branch_id": "b1"}, open=new))
+    assert ok(call(host, target, "guard", "history_raw", open=old))["result"]
+
+
 def test_a_retried_write_with_the_same_key_replays_the_response(host, target):
     ready(host, target)
     request = encode(_request())

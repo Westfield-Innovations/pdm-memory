@@ -78,6 +78,18 @@ _EVENTS = {
     "consequence": ("cl_events", "expectation_id"),
 }
 _BODY = {"protocol", "open", "args", "now"}
+# Guard ops that local code fences with _assert_current_config.
+_FENCED = {
+    "start_branch",
+    "stage",
+    "release",
+    "cancel",
+    "reconcile",
+    "checkpoint",
+    "recover",
+}
+# Open fields that select no configuration, so they stay out of the cache key.
+_PER_CALL = ("replace_config", "config_epoch")
 _NOW: ContextVar[datetime] = ContextVar("pdm_ledger_now")
 _PRUNE_EVERY = 64
 _KEEP = timedelta(days=1)
@@ -294,13 +306,24 @@ class LedgerHost:
                     return 200, stored
             retry_stale = True
             while True:
-                cache_key, entry, built = self._entry(target, kind, open_, replace)
+                try:
+                    cache_key, entry, built = self._entry(target, kind, open_, replace)
+                except ConfigurationError as exc:
+                    # A client holding an epoch was built under a configuration
+                    # that is no longer current: superseded, as locally.
+                    if "config_epoch" not in open_:
+                        raise
+                    raise ConfigurationError(
+                        "controller configuration has been superseded by the owner"
+                    ) from exc
                 replace = False
                 with entry.ledger._lock:
                     if entry.closed:
                         continue  # evicted between lookup and use
                     try:
-                        return self._run(entry.ledger, kind, op, args, key, body_hash)
+                        return self._run(
+                            entry.ledger, kind, op, args, key, body_hash, open_
+                        )
                     except ConfigurationError:
                         self._drop(cache_key, entry)
                         # A cached instance may predate another worker's replacement;
@@ -319,6 +342,7 @@ class LedgerHost:
         args: dict[str, Any],
         key: str | None,
         body_hash: str,
+        open_: dict[str, Any],
     ) -> tuple[int, dict[str, Any]]:
         if key is None:
             return 200, self._call(ledger, kind, op, args)
@@ -329,6 +353,8 @@ class LedgerHost:
             stored = _lookup(conn, kind, key, body_hash)
             if stored is not None:
                 return 200, stored
+            if kind == "guard" and op in _FENCED and "config_epoch" in open_:
+                self._fence_epoch(ledger, decode(int, open_["config_epoch"]))
             text = _canonical(self._call(ledger, kind, op, args))
             moment = self._clock()
             conn.execute(
@@ -344,6 +370,16 @@ class LedgerHost:
                     (_stamp(moment - _KEEP),),
                 )
         return 200, json.loads(text)
+
+    @staticmethod
+    def _fence_epoch(ledger: GuardedEffects, epoch: int) -> None:
+        row = ledger._conn.execute(
+            "SELECT epoch FROM ge_config WHERE owner=?", (ledger.owner,)
+        ).fetchone()
+        if row is None or row[0] != epoch:
+            raise ConfigurationError(
+                "controller configuration has been superseded by the owner"
+            )
 
     def _stored(
         self, target: str | Path, kind: str, key: str, body_hash: str
@@ -361,7 +397,11 @@ class LedgerHost:
         self, ledger: Any, kind: str, op: str, args: dict[str, Any]
     ) -> dict[str, Any]:
         extra: dict[str, Any] = {}
-        if op == "open":
+        if op == "open" and kind == "guard":
+            # A stale cached instance raises here, so its rebuild reports the epoch.
+            ledger._assert_current_config()
+            result = ledger._config_epoch
+        elif op == "open":
             result = None
         elif op == "history_raw":
             result = self._history_raw(ledger, kind, args)
@@ -446,7 +486,9 @@ class LedgerHost:
         self, target: str | Path, kind: str, open_: dict[str, Any], replace: bool
     ) -> Any:
         if kind == "guard":
-            rest = {k: v for k, v in open_.items() if k != "openings"}
+            rest = {
+                k: v for k, v in open_.items() if k not in ("openings", "config_epoch")
+            }
             kwargs = _bind(GuardedEffects.__init__, rest, skip=("path", "openings"))
             kwargs["replace_config"] = replace
             specs = decode(list[_OpeningSpec], open_.get("openings", []))
@@ -479,7 +521,7 @@ class LedgerHost:
     def _entry(
         self, target: str | Path, kind: str, open_: dict[str, Any], replace: bool
     ) -> tuple[tuple[str, str, str], _Entry, bool]:
-        same = {k: v for k, v in open_.items() if k != "replace_config"}
+        same = {k: v for k, v in open_.items() if k not in _PER_CALL}
         cache_key = (str(target), kind, _sha(_canonical(same)))
         now = time.monotonic()
         with self._lock:
