@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 import threading
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
@@ -301,6 +302,15 @@ class GuardedEffects:
     the filesystem/hardware must honor those requests. This is not protection
     against an administrator replacing the database or deleting its tail.
     """
+
+    def __new__(cls, path: Any, *args: Any, **kwargs: Any) -> GuardedEffects:  # noqa: PYI034
+        # A CloudLedgers can only exist once its module is loaded; don't load it otherwise.
+        client = sys.modules.get("pdm_memory.cloud_ledgers.client")
+        if cls is GuardedEffects and client and isinstance(path, client.CloudLedgers):
+            from pdm_memory.cloud_ledgers.guard import CloudGuardedEffects
+
+            return object.__new__(CloudGuardedEffects)
+        return object.__new__(cls)
 
     def __init__(
         self,

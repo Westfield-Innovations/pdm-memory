@@ -19,7 +19,7 @@ from pdm_memory.guarded_effects import (
     Opening,
     ResourceLimitError,
 )
-from tests.ledger_target import ledger_target, sqlite_only
+from tests.ledger_target import ledger_target, local_only, sqlite_only
 
 
 def request(action_id="a1", **kwargs):
@@ -255,6 +255,7 @@ def test_raised_handler_is_uncertain_across_reopen_and_requires_reconciliation(t
         assert calls == ["a1"]
 
 
+@local_only
 def test_dispatch_intent_left_by_interruption_is_not_retried(tmp_path):
     path = ledger_target(tmp_path, "g.db")
     with guard(path, lambda r: None) as g:
@@ -424,6 +425,7 @@ def test_request_json_is_strict_and_lossless(tmp_path, bad):
             g.stage(request(parameters=bad))
 
 
+@local_only
 def test_history_and_checkpoint_records_have_sql_immutability_guards(tmp_path):
     path = ledger_target(tmp_path, "g.db")
     with guard(path, lambda r: None) as g:
@@ -531,6 +533,7 @@ def _preview_ledger(path):
     raw.close()
 
 
+@local_only
 @sqlite_only
 def test_preview_ledger_is_migrated_and_keeps_its_epoch(tmp_path):
     path = ledger_target(tmp_path, "g.db")
@@ -554,6 +557,7 @@ def test_preview_ledger_is_migrated_and_keeps_its_epoch(tmp_path):
         )
 
 
+@local_only
 @sqlite_only
 def test_preview_ledger_with_other_versions_still_needs_replacement(tmp_path):
     path = ledger_target(tmp_path, "g.db")
@@ -580,6 +584,7 @@ def _flaky(r):
     return {"accepted": True}
 
 
+@local_only
 def test_release_through_reserve_and_complete_writes_the_same_history(tmp_path):
     with (
         guard(ledger_target(tmp_path, "a.db"), _flaky) as a,
@@ -606,6 +611,7 @@ def test_release_through_reserve_and_complete_writes_the_same_history(tmp_path):
         assert a.receipt("a2").reason == b.receipt("a2").reason
 
 
+@local_only
 def test_a_transaction_opened_outside_is_joined_not_nested(tmp_path):
     with guard(ledger_target(tmp_path, "g.db"), lambda r: None) as g:
         with g._transaction():
@@ -614,6 +620,7 @@ def test_a_transaction_opened_outside_is_joined_not_nested(tmp_path):
         assert g.receipt("a1").status == "HELD"
 
 
+@local_only
 def test_a_failure_inside_a_joined_transaction_rolls_back_all_of_it(tmp_path):
     with guard(ledger_target(tmp_path, "g.db"), lambda r: None) as g:
         with pytest.raises(RuntimeError), g._transaction():
