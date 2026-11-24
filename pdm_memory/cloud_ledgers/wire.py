@@ -165,12 +165,12 @@ def _decode(tp: Any, data: Any, depth: int) -> Any:
         if tp is Decimal:
             _need(isinstance(data, str), tp, data)
             try:
-                number = Decimal(data)
+                amount = Decimal(data)
             except InvalidOperation as exc:
                 raise WireError(f"{data!r} is not a decimal") from exc
-            if not number.is_finite():
+            if not amount.is_finite():
                 raise WireError("decimal must be finite")
-            return number
+            return amount
         if is_dataclass(tp):
             return _record(tp, data, depth)
     base = origin or tp
