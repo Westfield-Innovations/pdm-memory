@@ -28,7 +28,7 @@ from tests.consequence_fixtures import (
     VALVE,
     _request,
 )
-from tests.ledger_target import ON_POSTGRES, ledger_target
+from tests.ledger_target import ON_CLOUD, ON_POSTGRES, ledger_target
 
 SAT = {"status": "SATISFIED", "reason": "ok", "evidence": {"seen": 1}}
 GUARD = {
@@ -63,7 +63,8 @@ def host():
 
 @pytest.fixture
 def target(tmp_path):
-    return ledger_target(tmp_path, "l.db")
+    # The host under test takes a file or DSN, never a cloud handle.
+    return tmp_path / "l.db" if ON_CLOUD else ledger_target(tmp_path, "l.db")
 
 
 def call(
