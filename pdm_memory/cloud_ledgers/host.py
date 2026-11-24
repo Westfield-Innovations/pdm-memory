@@ -292,8 +292,9 @@ class LedgerHost:
                 stored = self._stored(target, kind, key, body_hash)
                 if stored is not None:
                     return 200, stored
+            retry_stale = True
             while True:
-                cache_key, entry = self._entry(target, kind, open_, replace)
+                cache_key, entry, built = self._entry(target, kind, open_, replace)
                 replace = False
                 with entry.ledger._lock:
                     if entry.closed:
@@ -302,7 +303,11 @@ class LedgerHost:
                         return self._run(entry.ledger, kind, op, args, key, body_hash)
                     except ConfigurationError:
                         self._drop(cache_key, entry)
-                        raise
+                        # A cached instance may predate another worker's replacement;
+                        # a fresh build still refuses a configuration that differs.
+                        if built or not retry_stale:
+                            raise
+                        retry_stale = False
         finally:
             _NOW.reset(token)
 
@@ -410,10 +415,11 @@ class LedgerHost:
         kwargs = _bind(ledger._complete, args)
         action_id = _name(kwargs["action_id"], "action_id")
         failure = kwargs.get("failure")
-        row = ledger._row(action_id)
-        if row["status"] in _TERMINAL:
-            return ledger._receipt(row)  # a retried completion changes nothing
-        if row["status"] not in ("DISPATCHING", "UNCERTAIN"):
+        if failure is not None:
+            name, sep, message = failure.partition(": ")
+            failure = f"{name}: {message[:512]}" if sep else failure[:512]
+        status = ledger._row(action_id)["status"]
+        if status not in _TERMINAL and status not in ("DISPATCHING", "UNCERTAIN"):
             raise ValueError("only a dispatched action can be completed")
         if failure is None:
             try:
@@ -472,7 +478,7 @@ class LedgerHost:
 
     def _entry(
         self, target: str | Path, kind: str, open_: dict[str, Any], replace: bool
-    ) -> tuple[tuple[str, str, str], _Entry]:
+    ) -> tuple[tuple[str, str, str], _Entry, bool]:
         same = {k: v for k, v in open_.items() if k != "replace_config"}
         cache_key = (str(target), kind, _sha(_canonical(same)))
         now = time.monotonic()
@@ -485,7 +491,7 @@ class LedgerHost:
                 entry.used = now
         self._close(dropped)
         if entry is not None:
-            return cache_key, entry
+            return cache_key, entry, False
         built = _Entry(self._build(target, kind, open_, replace), now)
         with self._lock:
             entry = self._cache.pop(cache_key, None)
@@ -498,7 +504,7 @@ class LedgerHost:
             while len(self._cache) > self._max_open:
                 dropped.append(self._cache.popitem(last=False)[1])
         self._close(dropped)
-        return cache_key, entry
+        return cache_key, entry, entry is built
 
     def _drop(self, cache_key: tuple[str, str, str], entry: _Entry) -> None:
         with self._lock:

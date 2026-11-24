@@ -132,10 +132,9 @@ def reserve(host, target, action_id="act-valve-1"):
     )
 
 
-def complete(host, target, action_id="act-valve-1", **args):
-    return call(
-        host, target, "guard", "complete", args={"action_id": action_id, **args}
-    )
+def complete(host, target, action_id="act-valve-1", key="auto", **args):
+    args = {"action_id": action_id, **args}
+    return call(host, target, "guard", "complete", args=args, key=key)
 
 
 def test_a_staged_request_needs_a_verdict_and_writes_nothing_until_given_one(
@@ -218,16 +217,43 @@ def test_a_result_the_ledger_cannot_keep_is_recorded_as_a_failure(host, target):
     )
 
 
-def test_complete_refuses_a_held_action_and_leaves_a_finished_one_alone(host, target):
+def test_complete_refuses_a_held_action_and_records_a_late_return(host, target):
     ready(host, target)
     stage(host, target)
     status, body = complete(host, target, result={})
     assert status == 422 and body["error"]["type"] == "ValueError"
     reserve(host, target)
     first = ok(complete(host, target, result={"n": 1}))["result"]
+    late = [complete(host, target, result={"n": 2}, key="k-late-0001") for _ in "ab"]
+    assert late[0] == late[1] and ok(late[0])["result"] == first
+    assert kinds(target).count("LATE_HANDLER_RETURN") == 1
     before = head(target)
-    assert ok(complete(host, target, result={"n": 2}))["result"] == first
-    assert head(target) == before and "LATE_HANDLER_RETURN" not in kinds(target)
+    assert ok(complete(host, target, failure="RuntimeError: x"))["result"] == first
+    assert head(target) == before
+
+
+def test_a_client_failure_is_cut_to_the_local_format(host, target):
+    ready(host, target)
+    stage(host, target)
+    reserve(host, target)
+    receipt = ok(complete(host, target, failure="RuntimeError: " + "y" * 2000))
+    reason = receipt["result"]["reason"]
+    assert reason.endswith("RuntimeError: " + "y" * 512)
+
+
+def test_another_workers_same_config_replacement_does_not_refuse_a_client(target):
+    w1, w2 = LedgerHost(), LedgerHost()
+    ready(w1, target)
+    stage(w2, target)  # w2 caches an instance under the same open
+    ok(call(w1, target, "guard", "open", open={**GUARD, "replace_config": True}))
+    receipt = ok(call(w2, target, "guard", "cancel", args={"action_id": "act-valve-1"}))
+    assert receipt["result"]["status"] == "CANCELLED"
+    changed = {**GUARD, "replace_config": True, "policy_version": "p2"}
+    ok(call(w1, target, "guard", "open", open=changed))
+    status, body = call(w2, target, "guard", "start_branch", args={"branch_id": "b1"})
+    assert status == 409 and body["error"]["type"] == "ConfigurationError"
+    w1.close()
+    w2.close()
 
 
 def test_a_retried_write_with_the_same_key_replays_the_response(host, target):
